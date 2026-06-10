@@ -102,6 +102,10 @@ pub struct MomentumConfig {
     pub max_wallet_concentration: f64,
     pub scale_out_targets: Vec<f64>,
     pub slippage_bps: u64,
+    /// Allow buying a token again (after the exit cooldown) if it re-pumps.
+    pub allow_reentry: bool,
+    /// Seconds to wait after an exit before the same token may be re-entered.
+    pub reentry_cooldown_secs: u64,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -140,6 +144,10 @@ impl MomentumConfig {
                 scale_out_targets
             },
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
+            allow_reentry: std::env::var("MOMENTUM_ALLOW_REENTRY")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            reentry_cooldown_secs: env_u64("MOMENTUM_REENTRY_COOLDOWN_SECS", 300),
         }
     }
 
@@ -242,13 +250,17 @@ struct TradeLogEvent<'a> {
 fn log_trade_event(ev: &TradeLogEvent) {
     use std::io::Write;
 
-    // Update running tallies for the live summary.
+    // Update running tallies for the live summary. SELL_ACTUAL rows are
+    // reconciliation entries; their tally adjustment is applied separately so we
+    // don't double-count against the estimate already recorded at sell time.
     if let Ok(mut tally) = PNL_TALLY.lock() {
-        if ev.event == "BUY" {
-            tally.1 += 1;
-        } else {
-            tally.0 += ev.est_realized_pnl_sol;
-            tally.2 += 1;
+        match ev.event {
+            "BUY" => tally.1 += 1,
+            "SELL_PARTIAL" | "SELL_FULL" => {
+                tally.0 += ev.est_realized_pnl_sol;
+                tally.2 += 1;
+            }
+            _ => {}
         }
     }
 
@@ -289,6 +301,42 @@ fn mcap_from_reserves(vsol: u64, vtok: u64) -> Option<f64> {
     let price_sol_per_token = (vsol as f64 / LAMPORTS_PER_SOL) / (vtok as f64 / TOKEN_DECIMALS);
     let supply = TOKEN_TOTAL_SUPPLY as f64 / TOKEN_DECIMALS;
     Some(price_sol_per_token * supply)
+}
+
+/// Fetch the actual net SOL delta of the wallet (fee payer, account index 0) for
+/// a confirmed transaction, in SOL. This is the true realized cash flow for a
+/// sell: proceeds minus network fees and the priority/zeroslot tip. Retries a
+/// few times because the tx may not be queryable immediately after landing.
+async fn fetch_actual_sol_delta(app_state: &AppState, signature: &str) -> Option<f64> {
+    use anchor_client::solana_client::rpc_config::RpcTransactionConfig;
+    use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
+    use solana_transaction_status::UiTransactionEncoding;
+    use std::str::FromStr;
+
+    let sig = anchor_client::solana_sdk::signature::Signature::from_str(signature).ok()?;
+    let cfg = RpcTransactionConfig {
+        encoding: Some(UiTransactionEncoding::Json),
+        commitment: Some(CommitmentConfig::confirmed()),
+        max_supported_transaction_version: Some(0),
+    };
+
+    for _ in 0..5 {
+        if let Ok(tx) = app_state
+            .rpc_nonblocking_client
+            .get_transaction_with_config(&sig, cfg.clone())
+            .await
+        {
+            if let Some(meta) = tx.transaction.meta {
+                if !meta.pre_balances.is_empty() && !meta.post_balances.is_empty() {
+                    let delta = meta.post_balances[0] as i128 - meta.pre_balances[0] as i128;
+                    return Some(delta as f64 / LAMPORTS_PER_SOL);
+                }
+            }
+            return None;
+        }
+        time::sleep(Duration::from_secs(3)).await;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -464,10 +512,10 @@ fn position_slots_available(cfg: &MomentumConfig) -> bool {
     held + in_flight < cfg.max_positions
 }
 
-fn is_on_cooldown(mint: &str, now: u64) -> bool {
+fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     if let Some(ts) = RECENTLY_EXITED.get(mint) {
-        // Re-allow after 5 minutes; momentum can return, but avoid instant churn.
-        return now.saturating_sub(*ts) < 300;
+        // Re-allow after the cooldown; momentum can return, but avoid instant churn.
+        return now.saturating_sub(*ts) < cooldown_secs;
     }
     false
 }
@@ -482,7 +530,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     if POSITIONS.contains_key(&mint) || BOUGHT_TOKEN_LIST.contains_key(&mint) {
         return;
     }
-    if is_on_cooldown(&mint, now) {
+    if is_on_cooldown(&mint, now, cfg.reentry_cooldown_secs) {
         return;
     }
     if !position_slots_available(&cfg) {
@@ -490,6 +538,13 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     }
     if signal.current_mcap <= 0.0 {
         return;
+    }
+
+    // Allow re-entry on a fresh pump: clear the bot's permanent buy blacklist for
+    // this mint (it was added on a prior buy). The exit cooldown above still
+    // prevents instant churn.
+    if cfg.allow_reentry {
+        crate::processor::sniper_bot::clear_bought_blacklist(&mint);
     }
 
     // Reserve a slot before the async buy to prevent overshooting max positions.
@@ -718,24 +773,30 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     let price_ratio = if decision.entry_mcap > 0.0 { decision.current_mcap / decision.entry_mcap } else { 1.0 };
     let est_proceeds = decision.frac_of_original * decision.entry_size_sol * price_ratio;
     let est_realized_pnl = decision.frac_of_original * decision.entry_size_sol * (price_ratio - 1.0);
+    let cost_basis = decision.frac_of_original * decision.entry_size_sol;
+    let recon_app = app_state.clone();
 
     match decision.action {
         ExitAction::None => {}
         ExitAction::Partial => {
             match momentum_sell(&mint, decision.frac_of_current, app_state, &cfg, &decision.reason, &logger).await {
-                Ok(sig) => log_trade_event(&TradeLogEvent {
-                    event: "SELL_PARTIAL",
-                    mint: &mint,
-                    reason: &decision.reason,
-                    score: signal.score,
-                    entry_mcap: decision.entry_mcap,
-                    current_mcap: decision.current_mcap,
-                    pnl_pct: decision.pnl,
-                    fraction_of_original: decision.frac_of_original,
-                    est_sol: est_proceeds,
-                    est_realized_pnl_sol: est_realized_pnl,
-                    signature: &sig,
-                }),
+                Ok(sig) => {
+                    log_trade_event(&TradeLogEvent {
+                        event: "SELL_PARTIAL",
+                        mint: &mint,
+                        reason: &decision.reason,
+                        score: signal.score,
+                        entry_mcap: decision.entry_mcap,
+                        current_mcap: decision.current_mcap,
+                        pnl_pct: decision.pnl,
+                        fraction_of_original: decision.frac_of_original,
+                        est_sol: est_proceeds,
+                        est_realized_pnl_sol: est_realized_pnl,
+                        signature: &sig,
+                    });
+                    spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
+                        est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
+                }
                 Err(e) => {
                     logger.log(format!("Partial sell error {}: {}", mint, e).red().to_string());
                     if let Some(mut p) = POSITIONS.get_mut(&mint) {
@@ -760,6 +821,8 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                         est_realized_pnl_sol: est_realized_pnl,
                         signature: &sig,
                     });
+                    spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
+                        est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
                     finalize_exit(&mint);
                 }
                 Err(e) => {
@@ -771,6 +834,49 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             }
         }
     }
+}
+
+/// Fetch the real on-chain SOL proceeds for a sell in the background and append a
+/// `SELL_ACTUAL` reconciliation row, nudging the running realized-PnL tally from
+/// the mark-to-curve estimate toward the true figure.
+#[allow(clippy::too_many_arguments)]
+fn spawn_reconcile(
+    app_state: Arc<AppState>,
+    mint: String,
+    signature: String,
+    frac_of_original: f64,
+    cost_basis: f64,
+    est_realized: f64,
+    score: f64,
+    entry_mcap: f64,
+    current_mcap: f64,
+    pnl: f64,
+    reason: String,
+) {
+    if signature.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Some(proceeds) = fetch_actual_sol_delta(&app_state, &signature).await {
+            let actual_realized = proceeds - cost_basis;
+            if let Ok(mut t) = PNL_TALLY.lock() {
+                t.0 += actual_realized - est_realized;
+            }
+            log_trade_event(&TradeLogEvent {
+                event: "SELL_ACTUAL",
+                mint: &mint,
+                reason: &reason,
+                score,
+                entry_mcap,
+                current_mcap,
+                pnl_pct: pnl,
+                fraction_of_original: frac_of_original,
+                est_sol: proceeds,
+                est_realized_pnl_sol: actual_realized,
+                signature: &signature,
+            });
+        }
+    });
 }
 
 /// What the exit policy decided to do for a position this tick.

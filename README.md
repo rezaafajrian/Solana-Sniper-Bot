@@ -42,9 +42,20 @@ columns: timestamp, event (`BUY`/`SELL_PARTIAL`/`SELL_FULL`), mint, reason,
 score, entry/current market cap, PnL %, fraction of original sold, estimated SOL
 proceeds, estimated realized PnL (SOL), and the tx signature. A live summary
 line (cumulative realized PnL, buys/sells, open positions) is logged to the
-console roughly every 60s. Use the CSV to measure real performance and tune the
-thresholds — the realized-PnL column is a mark-to-curve estimate (pre-fees/slippage),
-so reconcile against on-chain fills for exact numbers.
+console roughly every 60s.
+
+Each sell is recorded twice: an immediate `SELL_PARTIAL`/`SELL_FULL` row with a
+mark-to-curve **estimate**, then — once the transaction is confirmable — a
+background `SELL_ACTUAL` row carrying the **true on-chain SOL proceeds** (the
+wallet's net balance delta, i.e. proceeds minus fees and the priority/zeroslot
+tip). The running realized-PnL tally is nudged from the estimate toward the
+actual as reconciliation lands, so the live summary converges to real numbers.
+
+**Re-entry.** Because the philosophy is to buy strength regardless of age, the
+bot can re-buy a token that re-pumps after you've exited it. `MOMENTUM_ALLOW_REENTRY`
+(default `true`) clears the mint from the permanent buy-blacklist after the
+`MOMENTUM_REENTRY_COOLDOWN_SECS` cooldown; set it to `false` to keep the
+original "never rebuy" behavior.
 
 See `src/env.example` for every momentum tunable. Implementation: `src/processor/momentum.rs`.
 

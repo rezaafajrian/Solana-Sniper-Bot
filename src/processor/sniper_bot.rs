@@ -694,6 +694,12 @@ async fn verify_transaction(
     Err("Transaction verification failed after retries".to_string())
 }
 
+/// Remove a mint from the permanent "already bought" blacklist so it can be
+/// bought again. Used by momentum mode to allow re-entry on a fresh pump.
+pub fn clear_bought_blacklist(mint: &str) {
+    BOUGHT_TOKENS_BLACKLIST.remove(mint);
+}
+
 /// Execute buy operation based on detected transaction
 pub async fn execute_buy(
     trade_info: transaction_parser::TradeInfoFromToken,
