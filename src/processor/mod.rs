@@ -1,4 +1,5 @@
 pub mod sniper_bot;
+pub mod momentum;
 pub mod monitor;
 pub mod risk_management;
 pub mod selling_strategy;

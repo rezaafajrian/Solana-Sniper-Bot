@@ -571,6 +571,30 @@ async fn main() {
         }
     }
 
+    // Momentum mode: pump.fun sniper that buys strength, not age. No copy-trading.
+    let monitoring_mode = std::env::var("MONITORING_MODE")
+        .unwrap_or_else(|_| "copy".to_string())
+        .to_lowercase();
+    if monitoring_mode == "momentum" {
+        let protocol_preference = SwapProtocol::PumpFun;
+        let momentum_config = SniperConfig {
+            yellowstone_grpc_http: config.yellowstone_grpc_http.clone(),
+            yellowstone_grpc_token: config.yellowstone_grpc_token.clone(),
+            app_state: config.app_state.clone(),
+            swap_config: config.swap_config.clone(),
+            counter_limit: config.counter_limit as u64,
+            target_addresses: Vec::new(),
+            excluded_addresses: Vec::new(),
+            protocol_preference,
+        };
+        println!("🚀 Starting MOMENTUM sniper (pump.fun, buy-strength-not-age)...");
+        match solana_vntr_sniper::processor::momentum::start_momentum_monitoring(momentum_config).await {
+            Ok(_) => println!("✅ Momentum monitoring completed"),
+            Err(e) => eprintln!("❌ Momentum monitoring error: {}", e),
+        }
+        return;
+    }
+
     // Get copy trading target addresses from environment
     let copy_trading_target_address = std::env::var("COPY_TRADING_TARGET_ADDRESS").ok();
     let is_multi_copy_trading = std::env::var("IS_MULTI_COPY_TRADING")

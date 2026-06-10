@@ -6,10 +6,41 @@ High-performance Rust bot that monitors wallets and DEX activity on Solana and a
 
 - **Real-time monitoring**: Yellowstone gRPC stream, parallel task processing
 - **Protocols**: PumpFun (trade), PumpSwap (notify-only by default)
-- **Copy trading**: Follow one or many target wallets with exclusions
+- **Two modes** (`MONITORING_MODE`):
+  - `momentum` — pump.fun **momentum sniper** that buys *strength, not age* (no copy-trading)
+  - `copy` — original target-wallet copy-trading / sniper
 - **Risk & selling**: Take profit, stop loss, dynamic trailing stop, copy-selling of existing balances
 - **Tx landing**: Zeroslot or normal mode, configurable priority fees
 - **Utilities**: Wrap/unwrap SOL, close empty token accounts, sell all tokens via Jupiter
+
+---
+
+### Momentum mode (`MONITORING_MODE=momentum`)
+
+A pump.fun engine that ignores token age, bonding stage, and migration status. It
+streams every pump.fun trade, aggregates a rolling per-token picture, and scores
+each token's **continuation probability (0..100)** from:
+
+- accelerating buy pressure (buy-volume rate now vs. recent baseline)
+- raw buy volume and breadth (unique buyers)
+- positive market-cap velocity
+- healthy holder distribution (penalizes a single wallet dominating buys)
+- a coordinated-dump veto (sells overwhelming buys)
+
+When a token clears `MOMENTUM_ENTRY_SCORE` and a slot is free, it buys
+`MOMENTUM_POSITION_SIZE_SOL` (up to `MOMENTUM_MAX_POSITIONS` concurrent). Exits
+optimize for **asymmetric returns**, not win rate:
+
+- Hard stop at `MOMENTUM_HARD_STOP_PCT` (default −35%).
+- Scale out 20% of the original at each of +100/+200/+300/+400%, keeping a 20% **runner**.
+- Cut failed momentum fast: if the score collapses below `MOMENTUM_COLLAPSE_SCORE`
+  or sells significantly exceed buys, exit the remainder regardless of rung.
+
+See `src/env.example` for every momentum tunable. Implementation: `src/processor/momentum.rs`.
+
+> ⚠️ Profitability is **not** guaranteed. The thresholds are sensible starting
+> points, not backtested optimums — paper-test with tiny size first and tune
+> from real fills.
 
 ---
 
