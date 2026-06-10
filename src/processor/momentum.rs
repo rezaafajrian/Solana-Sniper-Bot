@@ -142,6 +142,17 @@ pub struct MomentumConfig {
     pub conviction_sizing: bool,
     /// Maximum size multiple at very high scores.
     pub conviction_max_mult: f64,
+
+    // ---- Risk controls ----
+    /// Hard cap on total SOL deployed across all open positions. New entries are
+    /// blocked (or trimmed) so concurrent + conviction sizing can't overspend.
+    pub max_deployed_sol: f64,
+    /// Estimated entry-leg cost (fees + tip + slippage) as a fraction of size,
+    /// folded into the cost basis so realized PnL isn't optimistic about the buy.
+    pub buy_cost_fraction: f64,
+    /// Minimum number of *distinct* reputable wallets required before smart-money
+    /// boost applies — guards against a single farmed wallet baiting the bot.
+    pub smart_money_min_distinct: usize,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -210,6 +221,10 @@ impl MomentumConfig {
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
             conviction_max_mult: env_f64("MOMENTUM_CONVICTION_MAX_MULT", 2.0),
+
+            max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
+            buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
+            smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
         }
     }
 
@@ -232,10 +247,14 @@ impl MomentumConfig {
         ));
         logger.log(format!("Scale-out rungs (20% each): {:?}% PnL, then 20% runner", self.scale_out_targets));
         logger.log(format!(
-            "Edge: smart-money {} (boost <= {:.0} pts) | leader-dump exit {} (>= {} SOL) | conviction sizing {} (<= {:.1}x)",
-            if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max,
+            "Edge: smart-money {} (boost <= {:.0} pts, >= {} distinct) | leader-dump exit {} (>= {} SOL) | conviction sizing {} (<= {:.1}x)",
+            if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max, self.smart_money_min_distinct,
             if self.leader_dump_exit_enabled { "on" } else { "off" }, self.leader_dump_sol,
             if self.conviction_sizing { "on" } else { "off" }, self.conviction_max_mult,
+        ));
+        logger.log(format!(
+            "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}%",
+            self.max_deployed_sol, self.buy_cost_fraction * 100.0,
         ));
         logger.log("------------------------------".cyan().bold().to_string());
     }
@@ -277,8 +296,11 @@ pub struct MomentumSignal {
 /// An open position managed by the momentum exit policy.
 struct MomentumPosition {
     entry_mcap: f64,
-    /// SOL committed at entry (cost basis for realized-PnL estimates).
+    /// SOL actually sent on the buy (the swap amount_in).
     entry_size_sol: f64,
+    /// True cost basis in SOL = entry_size + estimated entry cost (fees/tip/slippage),
+    /// so realized PnL isn't optimistic about the buy leg.
+    cost_basis_sol: f64,
     /// Fraction of the original position still held (1.0 -> 0.2 runner).
     remaining_fraction: f64,
     /// Which scale-out rungs have already been taken.
@@ -324,17 +346,28 @@ struct PendingAttr {
 const ATTR_QUEUE_MAX: usize = 100_000;
 
 /// Sum the positive reputations of the given buyers into bonus score points.
+///
+/// Poisoning guards: a single wallet's contribution is capped (so one farmed
+/// high-rep wallet can't max the boost), and the boost only applies once at least
+/// `smart_money_min_distinct` reputable wallets are buying together.
 fn smart_money_boost<'a>(buyers: impl Iterator<Item = &'a str>, cfg: &MomentumConfig) -> f64 {
     if !cfg.smart_money_enabled {
         return 0.0;
     }
+    // No single wallet may contribute more than its even share of the cap.
+    let per_wallet_cap = cfg.smart_money_boost_scale.max(1e-9) / cfg.smart_money_min_distinct.max(1) as f64;
     let mut sum = 0.0;
+    let mut distinct = 0usize;
     for b in buyers {
         if let Some(r) = WALLET_REP.get(b) {
             if r.samples >= cfg.smart_money_min_samples && r.score > 0.0 {
-                sum += r.score;
+                sum += r.score.min(per_wallet_cap);
+                distinct += 1;
             }
         }
+    }
+    if distinct < cfg.smart_money_min_distinct {
+        return 0.0;
     }
     (cfg.smart_money_boost_max * clamp01(sum / cfg.smart_money_boost_scale.max(1e-9))).min(cfg.smart_money_boost_max)
 }
@@ -730,6 +763,11 @@ fn position_slots_available(cfg: &MomentumConfig) -> bool {
     held + in_flight < cfg.max_positions
 }
 
+/// SOL currently exposed across open positions (committed size x fraction still held).
+fn deployed_sol() -> f64 {
+    POSITIONS.iter().map(|p| p.entry_size_sol * p.remaining_fraction).sum()
+}
+
 fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     if let Some(ts) = RECENTLY_EXITED.get(mint) {
         // Re-allow after the cooldown; momentum can return, but avoid instant churn.
@@ -813,12 +851,29 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     }
 
     // Conviction sizing: scale up with how far the score clears the entry bar.
-    let entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
+    let mut entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
         let mult = (signal.score / cfg.entry_score).clamp(1.0, cfg.conviction_max_mult);
         cfg.position_size_sol * mult
     } else {
         cfg.position_size_sol
     };
+
+    // Global capital cap: never let total exposure exceed the budget. Trim the
+    // last entry to the remaining headroom; skip if there isn't enough room.
+    let headroom = cfg.max_deployed_sol - deployed_sol();
+    if headroom < cfg.position_size_sol.min(entry_size) * 0.5 {
+        logger.log(format!(
+            "⛔ Skipping {} — capital cap reached ({:.3}/{:.3} SOL deployed)",
+            mint, deployed_sol(), cfg.max_deployed_sol,
+        ).yellow().to_string());
+        return;
+    }
+    if entry_size > headroom {
+        entry_size = headroom;
+    }
+
+    // True cost basis includes the estimated entry-leg cost so PnL isn't optimistic.
+    let cost_basis_sol = entry_size * (1.0 + cfg.buy_cost_fraction);
 
     // Build the tracked-wallet set for the insider/leader-dump exit: the creator
     // plus the largest early buyers (by short-window volume).
@@ -861,6 +916,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             POSITIONS.insert(mint.clone(), MomentumPosition {
                 entry_mcap: signal.current_mcap,
                 entry_size_sol: entry_size,
+                cost_basis_sol,
                 remaining_fraction: 1.0,
                 rungs_hit: vec![false; cfg.scale_out_targets.len()],
                 peak_pnl: 0.0,
@@ -876,7 +932,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 current_mcap: signal.current_mcap,
                 pnl_pct: 0.0,
                 fraction_of_original: 1.0,
-                est_sol: -entry_size,
+                est_sol: -cost_basis_sol,
                 est_realized_pnl_sol: 0.0,
                 signature: "",
             });
@@ -1019,23 +1075,26 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
 
         let entry_mcap = pos.entry_mcap;
         let entry_size_sol = pos.entry_size_sol;
+        let cost_basis_sol = pos.cost_basis_sol;
 
         // 0. Insider/leader distribution -> exit immediately, ahead of everything.
         if cfg.leader_dump_exit_enabled && leader_sell >= cfg.leader_dump_sol {
             pos.selling = true;
-            Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
+            Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
         // 1. Hard stop.
         else if pnl <= cfg.hard_stop_pct {
             pos.selling = true;
-            Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
+            Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
         // 2. Momentum collapse / dump -> cut remaining regardless of rung.
         else if signal.score < cfg.collapse_score || signal.sell_volume_short > signal.buy_volume_short * 1.5 {
             pos.selling = true;
-            Decision::full(pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
+            Decision::full(pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
         // 3. Scale-out ladder: take 20% of the original at the next uncleared rung.
+        // NOTE: the rung is NOT marked hit here — that happens only after the sell
+        // confirms, so a failed sell never silently consumes a rung.
         else {
             let mut chosen: Option<(usize, f64)> = None;
             for (i, target) in cfg.scale_out_targets.iter().enumerate() {
@@ -1048,18 +1107,19 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             }
             match chosen {
                 Some((i, frac_of_current)) => {
-                    pos.rungs_hit[i] = true;
-                    pos.remaining_fraction = (pos.remaining_fraction - 0.2).max(0.0);
+                    pos.selling = true; // lock the position while the sell is in flight
                     let tgt = cfg.scale_out_targets[i];
                     Decision {
                         action: ExitAction::Partial,
                         frac_of_current,
                         frac_of_original: 0.2,
+                        rung_index: Some(i),
                         reason: format!("scale-out +{:.0}% (pnl {:.1}%)", tgt, pnl),
                         pnl,
                         entry_mcap,
                         current_mcap: signal.current_mcap,
                         entry_size_sol,
+                        cost_basis_sol,
                     }
                 }
                 None => Decision::none(),
@@ -1073,16 +1133,39 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         ExitAction::Full => ("SELL_FULL", 1.0, true),
     };
 
-    // Estimated SOL value of the chunk sold and its realized PnL (mark-to-curve, pre-fees).
+    // Mark-to-curve proceeds (gross market value of the chunk) and realized PnL
+    // against the true cost basis (which includes the buy-leg cost).
     let price_ratio = if decision.entry_mcap > 0.0 { decision.current_mcap / decision.entry_mcap } else { 1.0 };
     let est_proceeds = decision.frac_of_original * decision.entry_size_sol * price_ratio;
-    let est_realized_pnl = decision.frac_of_original * decision.entry_size_sol * (price_ratio - 1.0);
-    let cost_basis = decision.frac_of_original * decision.entry_size_sol;
+    let cost_basis = decision.frac_of_original * decision.cost_basis_sol;
+    let est_realized_pnl = est_proceeds - cost_basis;
+
+    // Apply the bookkeeping that should only happen once a sell actually succeeds:
+    // mark the scale-out rung hit and reduce the remaining fraction, or finalize
+    // a full exit. On a partial, also release the `selling` lock.
+    let commit_sell = |succeeded: bool| {
+        if !succeeded {
+            if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                p.selling = false;
+            }
+            return;
+        }
+        if is_full {
+            finalize_exit(&mint);
+        } else if let Some(mut p) = POSITIONS.get_mut(&mint) {
+            if let Some(i) = decision.rung_index {
+                if i < p.rungs_hit.len() {
+                    p.rungs_hit[i] = true;
+                }
+            }
+            p.remaining_fraction = (p.remaining_fraction - decision.frac_of_original).max(0.0);
+            p.selling = false;
+        }
+    };
 
     if cfg.dry_run {
         // Paper trade: assume the chunk fills at current mcap, minus a simulated
-        // round-trip cost (fees + tip + slippage). These figures are the truth in
-        // dry-run, so no on-chain reconciliation is needed.
+        // sell-side cost (fees + tip + slippage). Truth in dry-run; no reconciliation.
         let sim_proceeds = est_proceeds * (1.0 - cfg.sim_cost_fraction);
         let sim_realized = sim_proceeds - cost_basis;
         log_trade_event(&TradeLogEvent {
@@ -1102,9 +1185,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             "📝 [DRY] {} {:.0}% of {} ({}) | sim proceeds {:.4} SOL | sim PnL {:+.4} SOL",
             event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
         ).yellow().to_string());
-        if is_full {
-            finalize_exit(&mint);
-        }
+        commit_sell(true);
         return;
     }
 
@@ -1124,17 +1205,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 est_realized_pnl_sol: est_realized_pnl,
                 signature: &sig,
             });
-            spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
-                est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
-            if is_full {
-                finalize_exit(&mint);
-            }
+            commit_sell(true);
+            spawn_reconcile(recon_app, mint.clone(), sig, cost_basis,
+                est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.frac_of_original, decision.reason.clone());
         }
         Err(e) => {
             logger.log(format!("Sell error {}: {}", mint, e).red().to_string());
-            if let Some(mut p) = POSITIONS.get_mut(&mint) {
-                p.selling = false;
-            }
+            commit_sell(false);
         }
     }
 }
@@ -1147,13 +1224,13 @@ fn spawn_reconcile(
     app_state: Arc<AppState>,
     mint: String,
     signature: String,
-    frac_of_original: f64,
     cost_basis: f64,
     est_realized: f64,
     score: f64,
     entry_mcap: f64,
     current_mcap: f64,
     pnl: f64,
+    frac_of_original: f64,
     reason: String,
 ) {
     if signature.is_empty() {
@@ -1189,11 +1266,17 @@ struct Decision {
     frac_of_current: f64,
     /// Fraction of the *original* position this represents (for PnL math).
     frac_of_original: f64,
+    /// For a partial scale-out, which rung this clears (applied only after a
+    /// confirmed sell, so a failed sell doesn't consume the rung).
+    rung_index: Option<usize>,
     reason: String,
     pnl: f64,
     entry_mcap: f64,
     current_mcap: f64,
+    /// SOL value bought at entry (for mark-to-curve proceeds estimate).
     entry_size_sol: f64,
+    /// Cost basis (SOL) of the whole original position, including entry costs.
+    cost_basis_sol: f64,
 }
 
 impl Decision {
@@ -1202,24 +1285,28 @@ impl Decision {
             action: ExitAction::None,
             frac_of_current: 0.0,
             frac_of_original: 0.0,
+            rung_index: None,
             reason: String::new(),
             pnl: 0.0,
             entry_mcap: 0.0,
             current_mcap: 0.0,
             entry_size_sol: 0.0,
+            cost_basis_sol: 0.0,
         }
     }
 
-    fn full(remaining_fraction: f64, reason: String, pnl: f64, entry_mcap: f64, current_mcap: f64, entry_size_sol: f64) -> Self {
+    fn full(remaining_fraction: f64, reason: String, pnl: f64, entry_mcap: f64, current_mcap: f64, entry_size_sol: f64, cost_basis_sol: f64) -> Self {
         Decision {
             action: ExitAction::Full,
             frac_of_current: 1.0,
             frac_of_original: remaining_fraction,
+            rung_index: None,
             reason,
             pnl,
             entry_mcap,
             current_mcap,
             entry_size_sol,
+            cost_basis_sol,
         }
     }
 }

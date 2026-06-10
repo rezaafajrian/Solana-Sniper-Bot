@@ -62,6 +62,21 @@ of these is actually earning its keep.
 > in dry run: compare total PnL and the insider-exit category with the features
 > on vs off.
 
+**Risk controls.**
+- **Global capital cap** (`MOMENTUM_MAX_DEPLOYED_SOL`, default 1.0): total SOL
+  exposed across all open positions can never exceed this, even with conviction
+  sizing and 5 concurrent slots. The last entry is trimmed to the remaining
+  headroom, or skipped if there isn't enough.
+- **Honest cost basis** (`MOMENTUM_BUY_COST_FRACTION`, default 1.5%): the entry-leg
+  cost is folded into each position's cost basis, so realized PnL doesn't flatter
+  the buy. Combined with on-chain sell reconciliation, PnL is conservative on both legs.
+- **Scale-out integrity**: a profit rung is marked taken and the remaining
+  fraction reduced *only after* the sell confirms — a failed sell never silently
+  consumes a rung or corrupts position size.
+- **Reputation-poisoning guard** (`MOMENTUM_SMART_MONEY_MIN_DISTINCT`, default 2):
+  smart-money boost requires several distinct reputable wallets and caps any single
+  wallet's contribution, so one farmed high-rep wallet can't bait the bot into a dump.
+
 **Trade logging / PnL report.** Every buy and sell is appended to an
 append-only CSV (`MOMENTUM_TRADE_LOG`, default `momentum_trades.csv`) with
 columns: timestamp, event (`BUY`/`SELL_PARTIAL`/`SELL_FULL`), mint, reason,
