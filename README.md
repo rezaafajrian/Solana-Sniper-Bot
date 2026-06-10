@@ -105,9 +105,21 @@ winners/losers, whether higher entry scores actually predict better outcomes
 estimated and on-chain-actual proceeds. It correctly prefers `SELL_ACTUAL` rows
 over estimates in live mode and reads the simulated truth in dry-run mode.
 
+**A/B the edges.** To prove the edge mechanisms help (rather than assume it),
+run two dry sessions over comparable windows with different `MOMENTUM_TRADE_LOG`
+files — one with the edges on, one off — then compare side by side:
+
+```bash
+python3 scripts/compare_momentum.py on.csv off.csv --labels "edges on" "edges off"
+```
+
+It prints total PnL, win rate, and per-exit-reason PnL for both, plus the delta,
+so the question "did this change move expected value?" becomes a number.
+
 > **Recommended workflow:** run dry for a few hundred trades → analyze →
-> if PnL is positive and scores are predictive, tune and go live at *tiny* size
-> (0.02 SOL) → analyze the real fills → only then consider scaling.
+> A/B the edges on vs off → if PnL is positive, scores are predictive, and the
+> edges help, tune and go live at *tiny* size (0.02 SOL) → analyze the real
+> fills → only then consider scaling.
 
 See `src/env.example` for every momentum tunable. Implementation: `src/processor/momentum.rs`.
 

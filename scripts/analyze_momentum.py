@@ -53,6 +53,51 @@ def realized_rows(rows):
             yield r["mint"], f(r, "est_realized_pnl_sol"), r
 
 
+def categorize(reason):
+    r = reason.lower()
+    if "insider" in r or "leader" in r:
+        return "insider/leader-dump exit"
+    if "hard stop" in r:
+        return "hard stop"
+    if "collapse" in r:
+        return "momentum collapse"
+    if "scale-out" in r:
+        return "scale-out (profit)"
+    return "other"
+
+
+def summarize(rows):
+    """Compute the headline metrics for a trade log into a flat dict.
+    Shared by the single-log report and the A/B comparison helper."""
+    per_token = defaultdict(float)
+    total = 0.0
+    sells = 0
+    cat_pnl = defaultdict(float)
+    for mint, pnl, row in realized_rows(rows):
+        per_token[mint] += pnl
+        total += pnl
+        sells += 1
+        cat_pnl[categorize(row["reason"])] += pnl
+
+    closed = dict(per_token)
+    winners = [v for v in closed.values() if v > 0]
+    losers = [v for v in closed.values() if v < 0]
+    buys = sum(1 for r in rows if r["event"] == "BUY")
+    n = len(closed)
+    return {
+        "total": total,
+        "buys": buys,
+        "sells": sells,
+        "tokens": n,
+        "avg_per_token": total / n if n else 0.0,
+        "win_rate": 100.0 * len(winners) / n if n else 0.0,
+        "winners_sum": sum(winners),
+        "losers_sum": sum(losers),
+        "cat_pnl": dict(cat_pnl),
+        "dry": any(r["signature"] == "DRY_RUN" for r in rows),
+    }
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "momentum_trades.csv"
     try:
