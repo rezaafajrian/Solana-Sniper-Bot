@@ -152,7 +152,46 @@ def main():
     else:
         print("   Not enough closed winners and losers yet to judge.")
 
-    print("\n4. COST DRAG (estimate minus on-chain actual)")
+    print("\n4. EXIT REASONS (is each edge earning its keep?)")
+    # Categorize every counted sell by reason, summing realized PnL per category.
+    cat_pnl = defaultdict(float)
+    cat_n = defaultdict(int)
+    for _mint, pnl, row in realized_rows(rows):
+        r = row["reason"].lower()
+        if "insider" in r or "leader" in r:
+            cat = "insider/leader-dump exit"
+        elif "hard stop" in r:
+            cat = "hard stop"
+        elif "collapse" in r:
+            cat = "momentum collapse"
+        elif "scale-out" in r:
+            cat = "scale-out (profit)"
+        else:
+            cat = "other"
+        cat_pnl[cat] += pnl
+        cat_n[cat] += 1
+    if cat_n:
+        for cat in sorted(cat_pnl, key=lambda c: cat_pnl[c], reverse=True):
+            print(f"   {cat:<26} {cat_n[cat]:>4} sells   {cat_pnl[cat]:+.4f} SOL")
+    else:
+        print("   No sells recorded yet.")
+
+    # Smart-money reputation snapshot, if present.
+    print("\n5. SMART-MONEY MEMORY")
+    rep_path = "momentum_wallet_rep.csv"
+    try:
+        rep = load(rep_path)
+        scored = [(r["wallet"], float(r["score"]), int(r["samples"])) for r in rep]
+        ranked = sorted([w for w in scored if w[2] >= 3], key=lambda w: w[1], reverse=True)
+        print(f"   Wallets with reputation : {len(scored)} ({len(ranked)} with >=3 samples)")
+        if ranked:
+            print("   Top smart-money wallets:")
+            for w, s, n in ranked[:5]:
+                print(f"      {w[:44]:<44} rep {s:+.3f}  ({n} samples)")
+    except FileNotFoundError:
+        print(f"   No reputation file at '{rep_path}' yet (builds as the bot runs).")
+
+    print("\n6. COST DRAG (estimate minus on-chain actual)")
     if dry:
         print("   Dry run — costs are already baked into MOMENTUM_SIM_COST_FRACTION.")
     elif drag_n:

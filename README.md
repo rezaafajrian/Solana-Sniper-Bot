@@ -36,6 +36,32 @@ optimize for **asymmetric returns**, not win rate:
 - Cut failed momentum fast: if the score collapses below `MOMENTUM_COLLAPSE_SCORE`
   or sells significantly exceed buys, exit the remainder regardless of rung.
 
+**Edge mechanisms.** Beyond raw momentum, three features actively push expected
+value (all toggleable in `src/env.example`):
+
+- **Smart-money memory** (`MOMENTUM_SMART_MONEY`): the bot watches every pump.fun
+  trade and grades wallets on the forward return of tokens they bought, building
+  a persistent per-wallet reputation (`momentum_wallet_rep.csv`) that **compounds
+  across runs**. Entries get a score boost when proven-good wallets are buying —
+  the "strong wallet participation" signal, learned from real outcomes rather
+  than assumed. The boost is scaled by the dump veto so it can't rescue a token
+  that's being sold.
+- **Insider / leader-dump exit** (`MOMENTUM_LEADER_DUMP_EXIT`): each position
+  tracks the creator plus its largest early buyers; the moment those wallets
+  start distributing (selling ≥ `MOMENTUM_LEADER_DUMP_SOL` in the short window),
+  the bot exits *immediately*, ahead of the hard stop — shrinking losers by
+  front-running the people most likely to rug.
+- **Conviction sizing** (`MOMENTUM_CONVICTION_SIZING`, off by default): scales
+  position size up with how far the entry score clears the bar, capped at
+  `MOMENTUM_CONVICTION_MAX_MULT`.
+
+The analyzer's "exit reasons" and "smart-money memory" sections show whether each
+of these is actually earning its keep.
+
+> These improve the EV *mechanisms* — they don't guarantee profit. Validate them
+> in dry run: compare total PnL and the insider-exit category with the features
+> on vs off.
+
 **Trade logging / PnL report.** Every buy and sell is appended to an
 append-only CSV (`MOMENTUM_TRADE_LOG`, default `momentum_trades.csv`) with
 columns: timestamp, event (`BUY`/`SELL_PARTIAL`/`SELL_FULL`), mint, reason,

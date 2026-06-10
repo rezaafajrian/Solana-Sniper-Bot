@@ -111,6 +111,37 @@ pub struct MomentumConfig {
     /// Simulated round-trip cost as a fraction of fill value (fees + tip + slippage),
     /// applied to each simulated buy and sell so paper PnL reflects reality.
     pub sim_cost_fraction: f64,
+
+    // ---- Edge: smart-money memory ----
+    /// Build per-wallet reputation from observed outcomes and bias entries toward
+    /// tokens that proven wallets are buying.
+    pub smart_money_enabled: bool,
+    /// Minimum buy size (SOL) for a wallet's participation to be tracked/scored.
+    pub smart_money_min_sol: f64,
+    /// Seconds after a tracked buy at which we grade the wallet on the outcome.
+    pub smart_money_horizon_secs: u64,
+    /// Reputation samples a wallet needs before it can influence scoring.
+    pub smart_money_min_samples: u32,
+    /// Max additive score points smart-money confirmation can add (0..100 scale).
+    pub smart_money_boost_max: f64,
+    /// Sum of buyer reputations that earns the full boost.
+    pub smart_money_boost_scale: f64,
+    /// File to persist wallet reputation across restarts (compounding edge).
+    pub wallet_rep_file: String,
+
+    // ---- Edge: insider / leader-dump exit ----
+    /// Exit immediately when the creator or top early buyers start distributing.
+    pub leader_dump_exit_enabled: bool,
+    /// How many top early buyers (by volume) to track per position, plus the creator.
+    pub leader_track_top_n: usize,
+    /// If tracked wallets sell at least this many SOL in the short window, exit.
+    pub leader_dump_sol: f64,
+
+    // ---- Edge: conviction-based sizing ----
+    /// Scale position size up with the entry score (higher conviction = bigger size).
+    pub conviction_sizing: bool,
+    /// Maximum size multiple at very high scores.
+    pub conviction_max_mult: f64,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -157,6 +188,28 @@ impl MomentumConfig {
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
             sim_cost_fraction: env_f64("MOMENTUM_SIM_COST_FRACTION", 0.03),
+
+            smart_money_enabled: std::env::var("MOMENTUM_SMART_MONEY")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            smart_money_min_sol: env_f64("MOMENTUM_SMART_MONEY_MIN_SOL", 0.5),
+            smart_money_horizon_secs: env_u64("MOMENTUM_SMART_MONEY_HORIZON_SECS", 120),
+            smart_money_min_samples: env_u64("MOMENTUM_SMART_MONEY_MIN_SAMPLES", 3) as u32,
+            smart_money_boost_max: env_f64("MOMENTUM_SMART_MONEY_BOOST_MAX", 15.0),
+            smart_money_boost_scale: env_f64("MOMENTUM_SMART_MONEY_BOOST_SCALE", 1.0),
+            wallet_rep_file: std::env::var("MOMENTUM_REP_FILE")
+                .unwrap_or_else(|_| "momentum_wallet_rep.csv".to_string()),
+
+            leader_dump_exit_enabled: std::env::var("MOMENTUM_LEADER_DUMP_EXIT")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            leader_track_top_n: env_usize("MOMENTUM_LEADER_TRACK_TOP_N", 5),
+            leader_dump_sol: env_f64("MOMENTUM_LEADER_DUMP_SOL", 1.0),
+
+            conviction_sizing: std::env::var("MOMENTUM_CONVICTION_SIZING")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+            conviction_max_mult: env_f64("MOMENTUM_CONVICTION_MAX_MULT", 2.0),
         }
     }
 
@@ -178,6 +231,12 @@ impl MomentumConfig {
             self.min_buy_volume_sol, self.target_unique_buyers, self.target_mcap_growth * 100.0, self.max_wallet_concentration * 100.0,
         ));
         logger.log(format!("Scale-out rungs (20% each): {:?}% PnL, then 20% runner", self.scale_out_targets));
+        logger.log(format!(
+            "Edge: smart-money {} (boost <= {:.0} pts) | leader-dump exit {} (>= {} SOL) | conviction sizing {} (<= {:.1}x)",
+            if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max,
+            if self.leader_dump_exit_enabled { "on" } else { "off" }, self.leader_dump_sol,
+            if self.conviction_sizing { "on" } else { "off" }, self.conviction_max_mult,
+        ));
         logger.log("------------------------------".cyan().bold().to_string());
     }
 }
@@ -211,6 +270,8 @@ pub struct MomentumSignal {
     pub unique_buyers_short: usize,
     pub mcap_velocity: f64,
     pub current_mcap: f64,
+    /// Additive points contributed by smart-money confirmation (already in `score`).
+    pub smart_money_boost: f64,
 }
 
 /// An open position managed by the momentum exit policy.
@@ -224,6 +285,8 @@ struct MomentumPosition {
     rungs_hit: Vec<bool>,
     peak_pnl: f64,
     selling: bool,
+    /// Creator + top early buyers; if these distribute, exit immediately.
+    tracked_wallets: HashSet<String>,
 }
 
 lazy_static! {
@@ -236,6 +299,125 @@ lazy_static! {
     static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
     static ref PNL_TALLY: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
+    /// Per-wallet reputation learned from observed outcomes (the smart-money edge).
+    static ref WALLET_REP: DashMap<String, WalletRep> = DashMap::new();
+    /// Pending outcome evaluations for tracked buys, ordered by due time.
+    static ref ATTR_QUEUE: std::sync::Mutex<VecDeque<PendingAttr>> = std::sync::Mutex::new(VecDeque::new());
+}
+
+/// Reputation for a wallet: an EMA of the clamped forward returns of tokens it
+/// bought. Positive means its buys tend to precede pumps.
+#[derive(Clone, Default)]
+struct WalletRep {
+    score: f64,
+    samples: u32,
+}
+
+/// A buy awaiting outcome grading at `eval_at`.
+struct PendingAttr {
+    wallet: String,
+    mint: String,
+    entry_mcap: f64,
+    eval_at: u64,
+}
+
+const ATTR_QUEUE_MAX: usize = 100_000;
+
+/// Sum the positive reputations of the given buyers into bonus score points.
+fn smart_money_boost<'a>(buyers: impl Iterator<Item = &'a str>, cfg: &MomentumConfig) -> f64 {
+    if !cfg.smart_money_enabled {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for b in buyers {
+        if let Some(r) = WALLET_REP.get(b) {
+            if r.samples >= cfg.smart_money_min_samples && r.score > 0.0 {
+                sum += r.score;
+            }
+        }
+    }
+    (cfg.smart_money_boost_max * clamp01(sum / cfg.smart_money_boost_scale.max(1e-9))).min(cfg.smart_money_boost_max)
+}
+
+/// Queue a buy for later outcome grading (smart-money learning).
+fn enqueue_attribution(wallet: String, mint: String, entry_mcap: f64, eval_at: u64) {
+    if let Ok(mut q) = ATTR_QUEUE.lock() {
+        if q.len() >= ATTR_QUEUE_MAX {
+            q.pop_front();
+        }
+        q.push_back(PendingAttr { wallet, mint, entry_mcap, eval_at });
+    }
+}
+
+/// Background task: grade due buys on the token's forward return and update the
+/// buyer's reputation. A token that died (no longer tracked / zero mcap) grades
+/// as a loss, which is exactly the signal we want against rug-prone wallets.
+async fn run_attribution(cfg: Arc<MomentumConfig>) {
+    let mut interval = time::interval(Duration::from_secs(5));
+    let mut since_save: u64 = 0;
+    while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
+        interval.tick().await;
+        let now = now_secs();
+
+        let mut due: Vec<PendingAttr> = Vec::new();
+        if let Ok(mut q) = ATTR_QUEUE.lock() {
+            while q.front().map(|f| f.eval_at <= now).unwrap_or(false) {
+                if let Some(item) = q.pop_front() {
+                    due.push(item);
+                }
+            }
+        }
+
+        for a in due {
+            let cur = TOKEN_STATE.get(&a.mint).map(|s| s.last_mcap).unwrap_or(0.0);
+            let ret = if a.entry_mcap > 0.0 && cur > 0.0 {
+                ((cur - a.entry_mcap) / a.entry_mcap).clamp(-1.0, 3.0)
+            } else {
+                -1.0 // token went cold / untracked: treat as a loss
+            };
+            let mut r = WALLET_REP.entry(a.wallet).or_default();
+            let alpha = 0.1;
+            r.score = (1.0 - alpha) * r.score + alpha * ret;
+            r.samples += 1;
+        }
+
+        // Persist reputation roughly every 60s so the edge compounds across runs.
+        since_save += 5;
+        if since_save >= 60 {
+            since_save = 0;
+            save_wallet_rep(&cfg.wallet_rep_file);
+        }
+    }
+}
+
+fn load_wallet_rep(path: &str) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines().skip(1) {
+        let mut it = line.split(',');
+        if let (Some(w), Some(s), Some(n)) = (it.next(), it.next(), it.next()) {
+            if let (Ok(score), Ok(samples)) = (s.parse::<f64>(), n.parse::<u32>()) {
+                WALLET_REP.insert(w.to_string(), WalletRep { score, samples });
+            }
+        }
+    }
+}
+
+fn save_wallet_rep(path: &str) {
+    use std::io::Write;
+    let tmp = format!("{}.tmp", path);
+    let file = std::fs::File::create(&tmp);
+    let mut file = match file {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = writeln!(file, "wallet,score,samples");
+    for e in WALLET_REP.iter() {
+        let _ = writeln!(file, "{},{:.6},{}", e.key(), e.value().score, e.value().samples);
+    }
+    let _ = std::fs::rename(&tmp, path);
 }
 
 fn now_secs() -> u64 {
@@ -458,7 +640,12 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         1.0
     };
 
-    let score = (weighted * 100.0) * dump_factor;
+    let base_score = (weighted * 100.0) * dump_factor;
+
+    // Smart-money edge: add points when proven-good wallets are among the buyers.
+    // Scaled by the dump factor so it can't rescue a token that's being dumped.
+    let boost = smart_money_boost(per_wallet_buy.keys().copied(), cfg) * dump_factor;
+    let score = base_score + boost;
 
     MomentumSignal {
         score,
@@ -467,6 +654,7 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         unique_buyers_short: unique_buyers.len(),
         mcap_velocity,
         current_mcap: last_mcap_s.or(Some(state.last_mcap)).unwrap_or(0.0),
+        smart_money_boost: boost,
     }
 }
 
@@ -500,10 +688,22 @@ fn ingest_trade(parsed: &TradeInfoFromToken, trader: String, now: u64, cfg: &Mom
     entry.last_trade_info = parsed.clone();
 
     let tick_mcap = entry.last_mcap;
+    let tick_sol = parsed.sol_change.abs();
+
+    // Smart-money learning: queue meaningful buys for later outcome grading.
+    if cfg.smart_money_enabled
+        && parsed.is_buy
+        && tick_sol >= cfg.smart_money_min_sol
+        && !trader.is_empty()
+        && tick_mcap > 0.0
+    {
+        enqueue_attribution(trader.clone(), parsed.mint.clone(), tick_mcap, now + cfg.smart_money_horizon_secs);
+    }
+
     entry.ticks.push_back(TradeTick {
         ts: now,
         is_buy: parsed.is_buy,
-        sol: parsed.sol_change.abs(),
+        sol: tick_sol,
         trader,
         mcap: tick_mcap,
     });
@@ -538,6 +738,53 @@ fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     false
 }
 
+/// Creator + top early buyers (by short-window volume) — the wallets whose
+/// selling is the strongest early warning of a rug/distribution.
+fn build_tracked_wallets(parsed: &TradeInfoFromToken, mint: &str, now: u64, cfg: &MomentumConfig) -> HashSet<String> {
+    let mut tracked = HashSet::new();
+    if !cfg.leader_dump_exit_enabled {
+        return tracked;
+    }
+    if let Some(creator) = &parsed.coin_creator {
+        if !creator.is_empty() {
+            tracked.insert(creator.clone());
+        }
+    }
+    if let Some(state) = TOKEN_STATE.get(mint) {
+        let cut = now.saturating_sub(cfg.short_window_secs);
+        let mut vol: HashMap<String, f64> = HashMap::new();
+        for t in state.ticks.iter() {
+            if t.is_buy && t.ts >= cut && !t.trader.is_empty() {
+                *vol.entry(t.trader.clone()).or_insert(0.0) += t.sol;
+            }
+        }
+        let mut ranked: Vec<(String, f64)> = vol.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (w, _) in ranked.into_iter().take(cfg.leader_track_top_n) {
+            tracked.insert(w);
+        }
+    }
+    tracked
+}
+
+/// SOL sold by tracked wallets within the short window — the insider-dump signal.
+fn tracked_wallet_sell_volume(mint: &str, tracked: &HashSet<String>, now: u64, cfg: &MomentumConfig) -> f64 {
+    if tracked.is_empty() {
+        return 0.0;
+    }
+    let cut = now.saturating_sub(cfg.short_window_secs);
+    TOKEN_STATE
+        .get(mint)
+        .map(|s| {
+            s.ticks
+                .iter()
+                .filter(|t| !t.is_buy && t.ts >= cut && tracked.contains(&t.trader))
+                .map(|t| t.sol)
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<MomentumConfig>, sniper: Arc<SniperConfig>, logger: Logger) {
     let mint = parsed.mint.clone();
     let now = now_secs();
@@ -565,12 +812,24 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         crate::processor::sniper_bot::clear_bought_blacklist(&mint);
     }
 
+    // Conviction sizing: scale up with how far the score clears the entry bar.
+    let entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
+        let mult = (signal.score / cfg.entry_score).clamp(1.0, cfg.conviction_max_mult);
+        cfg.position_size_sol * mult
+    } else {
+        cfg.position_size_sol
+    };
+
+    // Build the tracked-wallet set for the insider/leader-dump exit: the creator
+    // plus the largest early buyers (by short-window volume).
+    let tracked_wallets = build_tracked_wallets(&parsed, &mint, now, &cfg);
+
     // Reserve a slot before the async buy to prevent overshooting max positions.
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
     logger.log(format!(
-        "🟢 ENTRY {} | score {:.1} | buyvol {:.2} SOL | {} buyers | mcap-vel {:.0}% | mcap {:.1} SOL",
-        mint, signal.score, signal.buy_volume_short, signal.unique_buyers_short, signal.mcap_velocity * 100.0, signal.current_mcap,
+        "🟢 ENTRY {} | score {:.1} (smart +{:.1}) | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
+        mint, signal.score, signal.smart_money_boost, entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
     ).green().bold().to_string());
 
     let result: Result<(), String> = if cfg.dry_run {
@@ -580,7 +839,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         let mut buy_config = sniper.swap_config.clone();
         buy_config.swap_direction = SwapDirection::Buy;
         buy_config.in_type = SwapInType::Qty;
-        buy_config.amount_in = cfg.position_size_sol;
+        buy_config.amount_in = entry_size;
         buy_config.slippage = cfg.slippage_bps;
 
         let app_state = Arc::new(sniper.app_state.clone());
@@ -601,11 +860,12 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         Ok(_) => {
             POSITIONS.insert(mint.clone(), MomentumPosition {
                 entry_mcap: signal.current_mcap,
-                entry_size_sol: cfg.position_size_sol,
+                entry_size_sol: entry_size,
                 remaining_fraction: 1.0,
                 rungs_hit: vec![false; cfg.scale_out_targets.len()],
                 peak_pnl: 0.0,
                 selling: false,
+                tracked_wallets,
             });
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
@@ -616,7 +876,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 current_mcap: signal.current_mcap,
                 pnl_pct: 0.0,
                 fraction_of_original: 1.0,
-                est_sol: -cfg.position_size_sol,
+                est_sol: -entry_size,
                 est_realized_pnl_sol: 0.0,
                 signature: "",
             });
@@ -730,6 +990,15 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         None => return,
     };
 
+    // Insider/leader-dump signal (read-only) computed before locking the position.
+    let leader_sell = {
+        let tracked = POSITIONS.get(&mint).map(|p| p.tracked_wallets.clone());
+        match tracked {
+            Some(t) => tracked_wallet_sell_volume(&mint, &t, now, &cfg),
+            None => return,
+        }
+    };
+
     // Read + update position bookkeeping without holding the lock across awaits.
     let decision = {
         let mut pos = match POSITIONS.get_mut(&mint) {
@@ -751,8 +1020,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         let entry_mcap = pos.entry_mcap;
         let entry_size_sol = pos.entry_size_sol;
 
+        // 0. Insider/leader distribution -> exit immediately, ahead of everything.
+        if cfg.leader_dump_exit_enabled && leader_sell >= cfg.leader_dump_sol {
+            pos.selling = true;
+            Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
+        }
         // 1. Hard stop.
-        if pnl <= cfg.hard_stop_pct {
+        else if pnl <= cfg.hard_stop_pct {
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
         }
@@ -1020,12 +1294,24 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
     let app_state = Arc::new(sniper.app_state.clone());
     let sniper = Arc::new(sniper);
 
+    // Load persisted wallet reputation so the smart-money edge compounds across runs.
+    if cfg.smart_money_enabled {
+        load_wallet_rep(&cfg.wallet_rep_file);
+        logger.log(format!("🧠 Loaded reputation for {} wallets from {}", WALLET_REP.len(), cfg.wallet_rep_file).cyan().to_string());
+    }
+
     // Exit monitor in the background.
     {
         let app_state = app_state.clone();
         let cfg = cfg.clone();
         let logger = logger.clone();
         tokio::spawn(async move { run_exit_monitor(app_state, cfg, logger).await });
+    }
+
+    // Smart-money attribution learner in the background.
+    if cfg.smart_money_enabled {
+        let cfg = cfg.clone();
+        tokio::spawn(async move { run_attribution(cfg).await });
     }
 
     // Connect to Yellowstone gRPC.
