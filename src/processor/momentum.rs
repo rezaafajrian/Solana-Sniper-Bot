@@ -191,6 +191,8 @@ pub struct MomentumSignal {
 /// An open position managed by the momentum exit policy.
 struct MomentumPosition {
     entry_mcap: f64,
+    /// SOL committed at entry (cost basis for realized-PnL estimates).
+    entry_size_sol: f64,
     /// Fraction of the original position still held (1.0 -> 0.2 runner).
     remaining_fraction: f64,
     /// Which scale-out rungs have already been taken.
@@ -205,10 +207,78 @@ lazy_static! {
     static ref RECENTLY_EXITED: DashMap<String, u64> = DashMap::new();
     static ref IN_FLIGHT_BUYS: AtomicUsize = AtomicUsize::new(0);
     static ref MOMENTUM_RUNNING: AtomicBool = AtomicBool::new(true);
+    /// Serializes appends to the trade-log CSV.
+    static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
+    static ref PNL_TALLY: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
 }
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn trade_log_path() -> String {
+    std::env::var("MOMENTUM_TRADE_LOG").unwrap_or_else(|_| "momentum_trades.csv".to_string())
+}
+
+/// One recorded trade event (a buy or a scale-out / exit sell).
+struct TradeLogEvent<'a> {
+    event: &'a str,
+    mint: &'a str,
+    reason: &'a str,
+    score: f64,
+    entry_mcap: f64,
+    current_mcap: f64,
+    pnl_pct: f64,
+    fraction_of_original: f64,
+    /// Estimated SOL proceeds (sells) or cost (negative, buys).
+    est_sol: f64,
+    /// Estimated realized PnL in SOL for this event.
+    est_realized_pnl_sol: f64,
+    signature: &'a str,
+}
+
+/// Append a trade event to the CSV log (best-effort: never panics, never blocks trading).
+fn log_trade_event(ev: &TradeLogEvent) {
+    use std::io::Write;
+
+    // Update running tallies for the live summary.
+    if let Ok(mut tally) = PNL_TALLY.lock() {
+        if ev.event == "BUY" {
+            tally.1 += 1;
+        } else {
+            tally.0 += ev.est_realized_pnl_sol;
+            tally.2 += 1;
+        }
+    }
+
+    let path = trade_log_path();
+    let _guard = match TRADE_LOG_LOCK.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let need_header = !std::path::Path::new(&path).exists();
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    let mut file = match file {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if need_header {
+        let _ = writeln!(
+            file,
+            "timestamp_unix,iso_time,event,mint,reason,score,entry_mcap_sol,current_mcap_sol,pnl_pct,fraction_of_original,est_sol,est_realized_pnl_sol,signature"
+        );
+    }
+    let iso = chrono::Utc::now().to_rfc3339();
+    // CSV-escape the human-written reason field.
+    let reason = ev.reason.replace('"', "'").replace(',', ";");
+    let _ = writeln!(
+        file,
+        "{},{},{},{},{},{:.2},{:.6},{:.6},{:.2},{:.3},{:.6},{:.6},{}",
+        now_secs(), iso, ev.event, ev.mint, reason, ev.score,
+        ev.entry_mcap, ev.current_mcap, ev.pnl_pct, ev.fraction_of_original,
+        ev.est_sol, ev.est_realized_pnl_sol, ev.signature,
+    );
 }
 
 /// Market cap in SOL implied by the bonding-curve virtual reserves.
@@ -453,10 +523,24 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         Ok(_) => {
             POSITIONS.insert(mint.clone(), MomentumPosition {
                 entry_mcap: signal.current_mcap,
+                entry_size_sol: cfg.position_size_sol,
                 remaining_fraction: 1.0,
                 rungs_hit: vec![false; cfg.scale_out_targets.len()],
                 peak_pnl: 0.0,
                 selling: false,
+            });
+            log_trade_event(&TradeLogEvent {
+                event: "BUY",
+                mint: &mint,
+                reason: "momentum entry",
+                score: signal.score,
+                entry_mcap: signal.current_mcap,
+                current_mcap: signal.current_mcap,
+                pnl_pct: 0.0,
+                fraction_of_original: 1.0,
+                est_sol: -cfg.position_size_sol,
+                est_realized_pnl_sol: 0.0,
+                signature: "",
             });
             logger.log(format!("✅ Bought {} at mcap {:.2} SOL", mint, signal.current_mcap).green().to_string());
         }
@@ -478,10 +562,10 @@ async fn momentum_sell(
     cfg: &MomentumConfig,
     reason: &str,
     logger: &Logger,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let fraction = fraction.max(0.0).min(1.0);
     if fraction <= 0.0 {
-        return Ok(());
+        return Ok(String::new());
     }
 
     let trade_info = TOKEN_STATE
@@ -541,13 +625,13 @@ async fn momentum_sell(
     .await
     .map_err(|e| format!("send sell failed: {}", e))?;
 
+    let signature = sigs.first().cloned().unwrap_or_default();
     logger.log(format!(
         "🔴 SELL {:.0}% of {} ({}) at price {} | sig {}",
-        fraction * 100.0, mint, reason, price,
-        sigs.first().cloned().unwrap_or_default(),
+        fraction * 100.0, mint, reason, price, signature,
     ).red().bold().to_string());
 
-    Ok(())
+    Ok(signature)
 }
 
 fn finalize_exit(mint: &str) {
@@ -568,7 +652,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     };
 
     // Read + update position bookkeeping without holding the lock across awaits.
-    let (action, fraction, reason) = {
+    let decision = {
         let mut pos = match POSITIONS.get_mut(&mint) {
             Some(p) => p,
             None => return,
@@ -585,15 +669,18 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             pos.peak_pnl = pnl;
         }
 
+        let entry_mcap = pos.entry_mcap;
+        let entry_size_sol = pos.entry_size_sol;
+
         // 1. Hard stop.
         if pnl <= cfg.hard_stop_pct {
             pos.selling = true;
-            (ExitAction::Full, pos.remaining_fraction, format!("hard stop {:.1}%", pnl))
+            Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
         }
         // 2. Momentum collapse / dump -> cut remaining regardless of rung.
         else if signal.score < cfg.collapse_score || signal.sell_volume_short > signal.buy_volume_short * 1.5 {
             pos.selling = true;
-            (ExitAction::Full, pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl))
+            Decision::full(pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol)
         }
         // 3. Scale-out ladder: take 20% of the original at the next uncleared rung.
         else {
@@ -611,32 +698,119 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                     pos.rungs_hit[i] = true;
                     pos.remaining_fraction = (pos.remaining_fraction - 0.2).max(0.0);
                     let tgt = cfg.scale_out_targets[i];
-                    (ExitAction::Partial, frac_of_current, format!("scale-out +{:.0}% (pnl {:.1}%)", tgt, pnl))
+                    Decision {
+                        action: ExitAction::Partial,
+                        frac_of_current,
+                        frac_of_original: 0.2,
+                        reason: format!("scale-out +{:.0}% (pnl {:.1}%)", tgt, pnl),
+                        pnl,
+                        entry_mcap,
+                        current_mcap: signal.current_mcap,
+                        entry_size_sol,
+                    }
                 }
-                None => (ExitAction::None, 0.0, String::new()),
+                None => Decision::none(),
             }
         }
     };
 
-    match action {
+    // Estimated SOL value of the chunk sold and its realized PnL (mark-to-curve, pre-fees).
+    let price_ratio = if decision.entry_mcap > 0.0 { decision.current_mcap / decision.entry_mcap } else { 1.0 };
+    let est_proceeds = decision.frac_of_original * decision.entry_size_sol * price_ratio;
+    let est_realized_pnl = decision.frac_of_original * decision.entry_size_sol * (price_ratio - 1.0);
+
+    match decision.action {
         ExitAction::None => {}
         ExitAction::Partial => {
-            if let Err(e) = momentum_sell(&mint, fraction, app_state, &cfg, &reason, &logger).await {
-                logger.log(format!("Partial sell error {}: {}", mint, e).red().to_string());
-                if let Some(mut p) = POSITIONS.get_mut(&mint) {
-                    p.selling = false;
+            match momentum_sell(&mint, decision.frac_of_current, app_state, &cfg, &decision.reason, &logger).await {
+                Ok(sig) => log_trade_event(&TradeLogEvent {
+                    event: "SELL_PARTIAL",
+                    mint: &mint,
+                    reason: &decision.reason,
+                    score: signal.score,
+                    entry_mcap: decision.entry_mcap,
+                    current_mcap: decision.current_mcap,
+                    pnl_pct: decision.pnl,
+                    fraction_of_original: decision.frac_of_original,
+                    est_sol: est_proceeds,
+                    est_realized_pnl_sol: est_realized_pnl,
+                    signature: &sig,
+                }),
+                Err(e) => {
+                    logger.log(format!("Partial sell error {}: {}", mint, e).red().to_string());
+                    if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                        p.selling = false;
+                    }
                 }
             }
         }
         ExitAction::Full => {
-            if let Err(e) = momentum_sell(&mint, 1.0, app_state, &cfg, &reason, &logger).await {
-                logger.log(format!("Exit sell error {}: {}", mint, e).red().to_string());
-                if let Some(mut p) = POSITIONS.get_mut(&mint) {
-                    p.selling = false;
+            match momentum_sell(&mint, 1.0, app_state, &cfg, &decision.reason, &logger).await {
+                Ok(sig) => {
+                    log_trade_event(&TradeLogEvent {
+                        event: "SELL_FULL",
+                        mint: &mint,
+                        reason: &decision.reason,
+                        score: signal.score,
+                        entry_mcap: decision.entry_mcap,
+                        current_mcap: decision.current_mcap,
+                        pnl_pct: decision.pnl,
+                        fraction_of_original: decision.frac_of_original,
+                        est_sol: est_proceeds,
+                        est_realized_pnl_sol: est_realized_pnl,
+                        signature: &sig,
+                    });
+                    finalize_exit(&mint);
                 }
-            } else {
-                finalize_exit(&mint);
+                Err(e) => {
+                    logger.log(format!("Exit sell error {}: {}", mint, e).red().to_string());
+                    if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                        p.selling = false;
+                    }
+                }
             }
+        }
+    }
+}
+
+/// What the exit policy decided to do for a position this tick.
+struct Decision {
+    action: ExitAction,
+    /// Fraction of the *current* balance to sell.
+    frac_of_current: f64,
+    /// Fraction of the *original* position this represents (for PnL math).
+    frac_of_original: f64,
+    reason: String,
+    pnl: f64,
+    entry_mcap: f64,
+    current_mcap: f64,
+    entry_size_sol: f64,
+}
+
+impl Decision {
+    fn none() -> Self {
+        Decision {
+            action: ExitAction::None,
+            frac_of_current: 0.0,
+            frac_of_original: 0.0,
+            reason: String::new(),
+            pnl: 0.0,
+            entry_mcap: 0.0,
+            current_mcap: 0.0,
+            entry_size_sol: 0.0,
+        }
+    }
+
+    fn full(remaining_fraction: f64, reason: String, pnl: f64, entry_mcap: f64, current_mcap: f64, entry_size_sol: f64) -> Self {
+        Decision {
+            action: ExitAction::Full,
+            frac_of_current: 1.0,
+            frac_of_original: remaining_fraction,
+            reason,
+            pnl,
+            entry_mcap,
+            current_mcap,
+            entry_size_sol,
         }
     }
 }
@@ -650,11 +824,22 @@ enum ExitAction {
 /// Background loop that evaluates every open position on a fixed cadence.
 async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, logger: Logger) {
     let mut interval = time::interval(Duration::from_secs(3));
+    let mut ticks: u64 = 0;
     while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
         interval.tick().await;
         let mints: Vec<String> = POSITIONS.iter().map(|e| e.key().clone()).collect();
         for mint in mints {
             evaluate_position(mint, app_state.clone(), cfg.clone(), logger.clone()).await;
+        }
+
+        // Live PnL summary roughly every 60s.
+        ticks += 1;
+        if ticks % 20 == 0 {
+            let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
+            logger.log(format!(
+                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open positions | log: {}",
+                realized, buys, sells, POSITIONS.len(), trade_log_path(),
+            ).cyan().bold().to_string());
         }
     }
 }

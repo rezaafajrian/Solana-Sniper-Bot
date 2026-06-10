@@ -36,6 +36,16 @@ optimize for **asymmetric returns**, not win rate:
 - Cut failed momentum fast: if the score collapses below `MOMENTUM_COLLAPSE_SCORE`
   or sells significantly exceed buys, exit the remainder regardless of rung.
 
+**Trade logging / PnL report.** Every buy and sell is appended to an
+append-only CSV (`MOMENTUM_TRADE_LOG`, default `momentum_trades.csv`) with
+columns: timestamp, event (`BUY`/`SELL_PARTIAL`/`SELL_FULL`), mint, reason,
+score, entry/current market cap, PnL %, fraction of original sold, estimated SOL
+proceeds, estimated realized PnL (SOL), and the tx signature. A live summary
+line (cumulative realized PnL, buys/sells, open positions) is logged to the
+console roughly every 60s. Use the CSV to measure real performance and tune the
+thresholds — the realized-PnL column is a mark-to-curve estimate (pre-fees/slippage),
+so reconcile against on-chain fills for exact numbers.
+
 See `src/env.example` for every momentum tunable. Implementation: `src/processor/momentum.rs`.
 
 > ⚠️ Profitability is **not** guaranteed. The thresholds are sensible starting
