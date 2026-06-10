@@ -57,6 +57,32 @@ bot can re-buy a token that re-pumps after you've exited it. `MOMENTUM_ALLOW_REE
 `MOMENTUM_REENTRY_COOLDOWN_SECS` cooldown; set it to `false` to keep the
 original "never rebuy" behavior.
 
+**Dry run — validate before risking money.** Set `MOMENTUM_DRY_RUN=true` to
+paper-trade: the bot runs the full strategy against the live pump.fun stream
+(real momentum, real market caps) but sends **no transactions**. Fills are
+simulated at the current market cap minus `MOMENTUM_SIM_COST_FRACTION` (default
+3%, covering fees + tip + slippage), and every simulated buy/sell is written to
+the trade CSV exactly like a live trade. This lets you measure whether the
+configuration has an edge with zero capital at risk. Flip to `false` only after
+the numbers justify it.
+
+**Analyze the results.** A zero-dependency analyzer turns the CSV into the four
+questions that decide whether there's an edge:
+
+```bash
+python3 scripts/analyze_momentum.py momentum_trades.csv
+```
+
+It reports total realized PnL after costs, win/loss distribution and the biggest
+winners/losers, whether higher entry scores actually predict better outcomes
+(so you know which way to move `MOMENTUM_ENTRY_SCORE`), and the cost drag between
+estimated and on-chain-actual proceeds. It correctly prefers `SELL_ACTUAL` rows
+over estimates in live mode and reads the simulated truth in dry-run mode.
+
+> **Recommended workflow:** run dry for a few hundred trades → analyze →
+> if PnL is positive and scores are predictive, tune and go live at *tiny* size
+> (0.02 SOL) → analyze the real fills → only then consider scaling.
+
 See `src/env.example` for every momentum tunable. Implementation: `src/processor/momentum.rs`.
 
 > ⚠️ Profitability is **not** guaranteed. The thresholds are sensible starting

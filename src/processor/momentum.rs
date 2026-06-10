@@ -106,6 +106,11 @@ pub struct MomentumConfig {
     pub allow_reentry: bool,
     /// Seconds to wait after an exit before the same token may be re-entered.
     pub reentry_cooldown_secs: u64,
+    /// Dry run: simulate fills instead of sending transactions (no money at risk).
+    pub dry_run: bool,
+    /// Simulated round-trip cost as a fraction of fill value (fees + tip + slippage),
+    /// applied to each simulated buy and sell so paper PnL reflects reality.
+    pub sim_cost_fraction: f64,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -148,11 +153,23 @@ impl MomentumConfig {
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
             reentry_cooldown_secs: env_u64("MOMENTUM_REENTRY_COOLDOWN_SECS", 300),
+            dry_run: std::env::var("MOMENTUM_DRY_RUN")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+            sim_cost_fraction: env_f64("MOMENTUM_SIM_COST_FRACTION", 0.03),
         }
     }
 
     pub fn log(&self, logger: &Logger) {
         logger.log("------- MOMENTUM CONFIG -------".cyan().bold().to_string());
+        if self.dry_run {
+            logger.log(format!(
+                "🧪 DRY RUN — no transactions sent. Simulated round-trip cost {:.1}% per fill.",
+                self.sim_cost_fraction * 100.0,
+            ).yellow().bold().to_string());
+        } else {
+            logger.log("💰 LIVE — real transactions, real money.".red().bold().to_string());
+        }
         logger.log(format!("Buy strength not age | position {} SOL x {} slots", self.position_size_sol, self.max_positions));
         logger.log(format!("Entry score >= {} | collapse < {} | hard stop {}%", self.entry_score, self.collapse_score, self.hard_stop_pct));
         logger.log(format!("Windows: short {}s / baseline {}s", self.short_window_secs, self.medium_window_secs));
@@ -507,7 +524,8 @@ fn ingest_trade(parsed: &TradeInfoFromToken, trader: String, now: u64, cfg: &Mom
 }
 
 fn position_slots_available(cfg: &MomentumConfig) -> bool {
-    let held = BOUGHT_TOKEN_LIST.len();
+    // POSITIONS is authoritative in both live and dry-run modes.
+    let held = POSITIONS.len();
     let in_flight = IN_FLIGHT_BUYS.load(Ordering::SeqCst);
     held + in_flight < cfg.max_positions
 }
@@ -555,22 +573,27 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         mint, signal.score, signal.buy_volume_short, signal.unique_buyers_short, signal.mcap_velocity * 100.0, signal.current_mcap,
     ).green().bold().to_string());
 
-    let mut buy_config = sniper.swap_config.clone();
-    buy_config.swap_direction = SwapDirection::Buy;
-    buy_config.in_type = SwapInType::Qty;
-    buy_config.amount_in = cfg.position_size_sol;
-    buy_config.slippage = cfg.slippage_bps;
+    let result: Result<(), String> = if cfg.dry_run {
+        // Paper trade: assume the buy fills at the current market cap.
+        Ok(())
+    } else {
+        let mut buy_config = sniper.swap_config.clone();
+        buy_config.swap_direction = SwapDirection::Buy;
+        buy_config.in_type = SwapInType::Qty;
+        buy_config.amount_in = cfg.position_size_sol;
+        buy_config.slippage = cfg.slippage_bps;
 
-    let app_state = Arc::new(sniper.app_state.clone());
-    let mut buy_trade_info = parsed.clone();
-    buy_trade_info.dex_type = DexType::PumpFun;
+        let app_state = Arc::new(sniper.app_state.clone());
+        let mut buy_trade_info = parsed.clone();
+        buy_trade_info.dex_type = DexType::PumpFun;
 
-    let result = execute_buy(
-        buy_trade_info,
-        app_state,
-        Arc::new(buy_config),
-        SwapProtocol::PumpFun,
-    ).await;
+        execute_buy(
+            buy_trade_info,
+            app_state,
+            Arc::new(buy_config),
+            SwapProtocol::PumpFun,
+        ).await
+    };
 
     IN_FLIGHT_BUYS.fetch_sub(1, Ordering::SeqCst);
 
@@ -597,7 +620,8 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 est_realized_pnl_sol: 0.0,
                 signature: "",
             });
-            logger.log(format!("✅ Bought {} at mcap {:.2} SOL", mint, signal.current_mcap).green().to_string());
+            let tag = if cfg.dry_run { "📝 [DRY] Entered" } else { "✅ Bought" };
+            logger.log(format!("{} {} at mcap {:.2} SOL", tag, mint, signal.current_mcap).green().to_string());
         }
         Err(e) => {
             logger.log(format!("❌ Buy failed for {}: {}", mint, e).red().to_string());
@@ -769,68 +793,73 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         }
     };
 
+    let (event, frac_of_current, is_full) = match decision.action {
+        ExitAction::None => return,
+        ExitAction::Partial => ("SELL_PARTIAL", decision.frac_of_current, false),
+        ExitAction::Full => ("SELL_FULL", 1.0, true),
+    };
+
     // Estimated SOL value of the chunk sold and its realized PnL (mark-to-curve, pre-fees).
     let price_ratio = if decision.entry_mcap > 0.0 { decision.current_mcap / decision.entry_mcap } else { 1.0 };
     let est_proceeds = decision.frac_of_original * decision.entry_size_sol * price_ratio;
     let est_realized_pnl = decision.frac_of_original * decision.entry_size_sol * (price_ratio - 1.0);
     let cost_basis = decision.frac_of_original * decision.entry_size_sol;
-    let recon_app = app_state.clone();
 
-    match decision.action {
-        ExitAction::None => {}
-        ExitAction::Partial => {
-            match momentum_sell(&mint, decision.frac_of_current, app_state, &cfg, &decision.reason, &logger).await {
-                Ok(sig) => {
-                    log_trade_event(&TradeLogEvent {
-                        event: "SELL_PARTIAL",
-                        mint: &mint,
-                        reason: &decision.reason,
-                        score: signal.score,
-                        entry_mcap: decision.entry_mcap,
-                        current_mcap: decision.current_mcap,
-                        pnl_pct: decision.pnl,
-                        fraction_of_original: decision.frac_of_original,
-                        est_sol: est_proceeds,
-                        est_realized_pnl_sol: est_realized_pnl,
-                        signature: &sig,
-                    });
-                    spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
-                        est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
-                }
-                Err(e) => {
-                    logger.log(format!("Partial sell error {}: {}", mint, e).red().to_string());
-                    if let Some(mut p) = POSITIONS.get_mut(&mint) {
-                        p.selling = false;
-                    }
-                }
+    if cfg.dry_run {
+        // Paper trade: assume the chunk fills at current mcap, minus a simulated
+        // round-trip cost (fees + tip + slippage). These figures are the truth in
+        // dry-run, so no on-chain reconciliation is needed.
+        let sim_proceeds = est_proceeds * (1.0 - cfg.sim_cost_fraction);
+        let sim_realized = sim_proceeds - cost_basis;
+        log_trade_event(&TradeLogEvent {
+            event,
+            mint: &mint,
+            reason: &decision.reason,
+            score: signal.score,
+            entry_mcap: decision.entry_mcap,
+            current_mcap: decision.current_mcap,
+            pnl_pct: decision.pnl,
+            fraction_of_original: decision.frac_of_original,
+            est_sol: sim_proceeds,
+            est_realized_pnl_sol: sim_realized,
+            signature: "DRY_RUN",
+        });
+        logger.log(format!(
+            "📝 [DRY] {} {:.0}% of {} ({}) | sim proceeds {:.4} SOL | sim PnL {:+.4} SOL",
+            event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
+        ).yellow().to_string());
+        if is_full {
+            finalize_exit(&mint);
+        }
+        return;
+    }
+
+    let recon_app = app_state.clone();
+    match momentum_sell(&mint, frac_of_current, app_state, &cfg, &decision.reason, &logger).await {
+        Ok(sig) => {
+            log_trade_event(&TradeLogEvent {
+                event,
+                mint: &mint,
+                reason: &decision.reason,
+                score: signal.score,
+                entry_mcap: decision.entry_mcap,
+                current_mcap: decision.current_mcap,
+                pnl_pct: decision.pnl,
+                fraction_of_original: decision.frac_of_original,
+                est_sol: est_proceeds,
+                est_realized_pnl_sol: est_realized_pnl,
+                signature: &sig,
+            });
+            spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
+                est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
+            if is_full {
+                finalize_exit(&mint);
             }
         }
-        ExitAction::Full => {
-            match momentum_sell(&mint, 1.0, app_state, &cfg, &decision.reason, &logger).await {
-                Ok(sig) => {
-                    log_trade_event(&TradeLogEvent {
-                        event: "SELL_FULL",
-                        mint: &mint,
-                        reason: &decision.reason,
-                        score: signal.score,
-                        entry_mcap: decision.entry_mcap,
-                        current_mcap: decision.current_mcap,
-                        pnl_pct: decision.pnl,
-                        fraction_of_original: decision.frac_of_original,
-                        est_sol: est_proceeds,
-                        est_realized_pnl_sol: est_realized_pnl,
-                        signature: &sig,
-                    });
-                    spawn_reconcile(recon_app, mint.clone(), sig, decision.frac_of_original, cost_basis,
-                        est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.reason.clone());
-                    finalize_exit(&mint);
-                }
-                Err(e) => {
-                    logger.log(format!("Exit sell error {}: {}", mint, e).red().to_string());
-                    if let Some(mut p) = POSITIONS.get_mut(&mint) {
-                        p.selling = false;
-                    }
-                }
+        Err(e) => {
+            logger.log(format!("Sell error {}: {}", mint, e).red().to_string());
+            if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                p.selling = false;
             }
         }
     }
@@ -938,14 +967,28 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
             evaluate_position(mint, app_state.clone(), cfg.clone(), logger.clone()).await;
         }
 
-        // Live PnL summary roughly every 60s.
+        // Live PnL summary + stale-state cleanup roughly every 60s.
         ticks += 1;
         if ticks % 20 == 0 {
             let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
             logger.log(format!(
-                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open positions | log: {}",
-                realized, buys, sells, POSITIONS.len(), trade_log_path(),
+                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open positions | tracking {} tokens | log: {}",
+                realized, buys, sells, POSITIONS.len(), TOKEN_STATE.len(), trade_log_path(),
             ).cyan().bold().to_string());
+
+            // Drop rolling state for tokens we don't hold and haven't seen trade recently,
+            // so memory doesn't grow unbounded over a long session.
+            let now = now_secs();
+            let stale_after = cfg.medium_window_secs.saturating_mul(4).max(300);
+            TOKEN_STATE.retain(|mint, state| {
+                if POSITIONS.contains_key(mint) {
+                    return true;
+                }
+                match state.ticks.back() {
+                    Some(t) => now.saturating_sub(t.ts) < stale_after,
+                    None => false,
+                }
+            });
         }
     }
 }
