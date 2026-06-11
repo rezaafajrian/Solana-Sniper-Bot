@@ -80,9 +80,12 @@ of these is actually earning its keep.
 **Discipline (enforced in code, not just advice).** The data edge (GMGN) is
 shared by everyone, so what actually keeps the account alive is process discipline:
 
-- **Circuit breaker**: new entries halt automatically once session realized PnL
-  hits `-MOMENTUM_DAILY_LOSS_LIMIT_SOL` or after `MOMENTUM_MAX_CONSECUTIVE_LOSSES`
-  losing full exits. Open positions still exit normally; you restart to resume.
+- **Circuit breaker**: new entries halt automatically once the *day's* realized
+  PnL hits `-MOMENTUM_DAILY_LOSS_LIMIT_SOL` or after `MOMENTUM_MAX_CONSECUTIVE_LOSSES`
+  losing full exits. Open positions still exit normally. With `MOMENTUM_DAILY_RESET=true`
+  (default) the breaker and loss streak auto-reset at each day boundary
+  (`MOMENTUM_DAILY_RESET_UTC_OFFSET_HOURS` sets when the day rolls), so a halted
+  bot resumes itself the next day instead of needing a restart.
 - **Go-live gate**: the bot refuses to trade real money unless `MOMENTUM_LIVE_CONFIRM=true`
   is set with `MOMENTUM_DRY_RUN=false` — no accidental live runs before validation.
 - **Verification**: the analyzer reports peak PnL, max drawdown, and worst losing

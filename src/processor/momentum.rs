@@ -56,7 +56,7 @@ MOMENTUM_SLIPPAGE_BPS=1000          # slippage for momentum buys/sells (basis po
 */
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -178,6 +178,10 @@ pub struct MomentumConfig {
     pub max_consecutive_losses: u32,
     /// Explicit acknowledgement required to trade live (when dry_run=false).
     pub live_confirmed: bool,
+    /// Auto-reset the circuit breaker (loss limit + streak) at each day boundary.
+    pub daily_reset: bool,
+    /// Hour offset from UTC defining when the trading "day" rolls over.
+    pub daily_reset_utc_offset_hours: i64,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -261,6 +265,8 @@ impl MomentumConfig {
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
             live_confirmed: std::env::var("MOMENTUM_LIVE_CONFIRM").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            daily_reset: std::env::var("MOMENTUM_DAILY_RESET").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            daily_reset_utc_offset_hours: std::env::var("MOMENTUM_DAILY_RESET_UTC_OFFSET_HOURS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
 
@@ -293,8 +299,9 @@ impl MomentumConfig {
             self.max_deployed_sol, self.buy_cost_fraction * 100.0,
         ));
         logger.log(format!(
-            "Discipline: circuit breaker at -{:.3} SOL session loss or {} consecutive losses{}",
+            "Discipline: breaker at -{:.3} SOL daily loss or {} consecutive losses | {}{}",
             self.daily_loss_limit_sol, self.max_consecutive_losses,
+            if self.daily_reset { format!("auto-reset daily (UTC{:+})", self.daily_reset_utc_offset_hours) } else { "manual reset".to_string() },
             if self.dry_run { "" } else if self.live_confirmed { " | LIVE confirmed" } else { " | LIVE NOT confirmed" },
         ));
         logger.log("------------------------------".cyan().bold().to_string());
@@ -374,16 +381,63 @@ lazy_static! {
 static GMGN: OnceCell<Arc<GmgnClient>> = OnceCell::new();
 
 /// Circuit breaker: once tripped, NEW entries are blocked (open positions still
-/// exit normally). Discipline against bleeding out on a bad session.
+/// exit normally). Discipline against bleeding out on a bad session/day.
 static TRADING_HALTED: AtomicBool = AtomicBool::new(false);
 static CONSECUTIVE_LOSSES: AtomicUsize = AtomicUsize::new(0);
+/// Current trading-day index; rolling it over resets the breaker.
+static DAY_INDEX: AtomicU64 = AtomicU64::new(0);
+
+lazy_static! {
+    /// Cumulative realized PnL captured at the start of the current day, so the
+    /// breaker measures the *day's* loss rather than all-time.
+    static ref DAY_START_REALIZED: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
+}
 
 fn trading_halted() -> bool {
     TRADING_HALTED.load(Ordering::SeqCst)
 }
 
+/// The trading-day number for `now`, offset so the day rolls over at the
+/// configured local hour rather than midnight UTC.
+fn current_day(cfg: &MomentumConfig) -> u64 {
+    let shifted = now_secs() as i64 + cfg.daily_reset_utc_offset_hours * 3600;
+    (shifted.max(0) / 86_400) as u64
+}
+
+/// Daily realized PnL = cumulative realized minus the day's starting baseline.
+fn daily_realized() -> f64 {
+    let cum = PNL_TALLY.lock().map(|g| g.0).unwrap_or(0.0);
+    let base = DAY_START_REALIZED.lock().map(|g| *g).unwrap_or(0.0);
+    cum - base
+}
+
+/// Roll the breaker into a new day when the date changes: rebase the daily PnL,
+/// clear the loss streak, and auto-resume if it was halted. No-op within a day.
+fn maybe_roll_day(cfg: &MomentumConfig, logger: &Logger) {
+    if !cfg.daily_reset {
+        return;
+    }
+    let day = current_day(cfg);
+    let prev = DAY_INDEX.load(Ordering::SeqCst);
+    if day == prev {
+        return;
+    }
+    DAY_INDEX.store(day, Ordering::SeqCst);
+    if let Ok(mut base) = DAY_START_REALIZED.lock() {
+        *base = PNL_TALLY.lock().map(|g| g.0).unwrap_or(*base);
+    }
+    CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
+    let was_halted = TRADING_HALTED.swap(false, Ordering::SeqCst);
+    logger.log(format!(
+        "🔄 New trading day — circuit breaker reset{}.",
+        if was_halted { " (auto-resumed from halt)" } else { "" },
+    ).cyan().bold().to_string());
+}
+
 /// Record the outcome of a closed position and evaluate the circuit breaker.
 fn record_full_exit(realized_sol: f64, cfg: &MomentumConfig, logger: &Logger) {
+    maybe_roll_day(cfg, logger);
+
     if realized_sol < 0.0 {
         CONSECUTIVE_LOSSES.fetch_add(1, Ordering::SeqCst);
     } else {
@@ -394,11 +448,11 @@ fn record_full_exit(realized_sol: f64, cfg: &MomentumConfig, logger: &Logger) {
         return;
     }
 
-    let session_realized = PNL_TALLY.lock().map(|g| g.0).unwrap_or(0.0);
+    let day_realized = daily_realized();
     let losses = CONSECUTIVE_LOSSES.load(Ordering::SeqCst) as u32;
 
-    let trip = if cfg.daily_loss_limit_sol > 0.0 && session_realized <= -cfg.daily_loss_limit_sol {
-        Some(format!("session loss {:.4} SOL hit limit -{:.4}", session_realized, cfg.daily_loss_limit_sol))
+    let trip = if cfg.daily_loss_limit_sol > 0.0 && day_realized <= -cfg.daily_loss_limit_sol {
+        Some(format!("day loss {:.4} SOL hit limit -{:.4}", day_realized, cfg.daily_loss_limit_sol))
     } else if cfg.max_consecutive_losses > 0 && losses >= cfg.max_consecutive_losses {
         Some(format!("{} consecutive losing trades", losses))
     } else {
@@ -407,9 +461,10 @@ fn record_full_exit(realized_sol: f64, cfg: &MomentumConfig, logger: &Logger) {
 
     if let Some(reason) = trip {
         TRADING_HALTED.store(true, Ordering::SeqCst);
+        let resume = if cfg.daily_reset { "resets automatically at the next day boundary" } else { "restart the bot to resume" };
         logger.log(format!(
-            "🛑🛑 CIRCUIT BREAKER TRIPPED — {}. New entries halted; open positions will still exit. Restart the bot to resume.",
-            reason,
+            "🛑🛑 CIRCUIT BREAKER TRIPPED — {}. New entries halted; open positions will still exit ({}).",
+            reason, resume,
         ).red().bold().to_string());
     }
 }
@@ -1484,6 +1539,9 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
     let mut ticks: u64 = 0;
     while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
         interval.tick().await;
+        // Roll the trading day even when no trades happen, so a halted breaker
+        // auto-resumes at the day boundary.
+        maybe_roll_day(&cfg, &logger);
         let mints: Vec<String> = POSITIONS.iter().map(|e| e.key().clone()).collect();
         for mint in mints {
             evaluate_position(mint, app_state.clone(), cfg.clone(), logger.clone()).await;
@@ -1495,8 +1553,8 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
             let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
             let status = if trading_halted() { " | 🛑 HALTED" } else { "" };
             logger.log(format!(
-                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open | streak {} losses | tracking {}{}",
-                realized, buys, sells, POSITIONS.len(), CONSECUTIVE_LOSSES.load(Ordering::SeqCst), TOKEN_STATE.len(), status,
+                "📊 PnL | session {:+.4} | today {:+.4} SOL | {} buys / {} sells | {} open | streak {} | tracking {}{}",
+                realized, daily_realized(), buys, sells, POSITIONS.len(), CONSECUTIVE_LOSSES.load(Ordering::SeqCst), TOKEN_STATE.len(), status,
             ).cyan().bold().to_string());
 
             // Drop rolling state for tokens we don't hold and haven't seen trade recently,
@@ -1549,6 +1607,10 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
 
     TRADING_HALTED.store(false, Ordering::SeqCst);
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
+    DAY_INDEX.store(current_day(&cfg), Ordering::SeqCst);
+    if let Ok(mut base) = DAY_START_REALIZED.lock() {
+        *base = 0.0;
+    }
     MOMENTUM_RUNNING.store(true, Ordering::SeqCst);
 
     let app_state = Arc::new(sniper.app_state.clone());
