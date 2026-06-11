@@ -30,7 +30,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dune_to_kol import looks_like_addr, WALLET_NAMES  # noqa: E402
+from dune_to_kol import looks_like_addr, extract_addr, WALLET_NAMES  # noqa: E402
 
 WEIGHT_MAX = 3.0
 
@@ -123,8 +123,8 @@ def main():
             continue
         label = label_override or (src if not src.isdigit() else f"dune{src}")
         for r in rows:
-            w = str(r.get(wallet_key, "")).strip()
-            if not looks_like_addr(w):
+            w = extract_addr(r.get(wallet_key, ""))
+            if not w:
                 continue
             weight = 1.0
             if weight_key is not None:
