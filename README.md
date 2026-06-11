@@ -77,6 +77,22 @@ of these is actually earning its keep.
   smart-money boost requires several distinct reputable wallets and caps any single
   wallet's contribution, so one farmed high-rep wallet can't bait the bot into a dump.
 
+**Discipline (enforced in code, not just advice).** The data edge (GMGN) is
+shared by everyone, so what actually keeps the account alive is process discipline:
+
+- **Circuit breaker**: new entries halt automatically once session realized PnL
+  hits `-MOMENTUM_DAILY_LOSS_LIMIT_SOL` or after `MOMENTUM_MAX_CONSECUTIVE_LOSSES`
+  losing full exits. Open positions still exit normally; you restart to resume.
+- **Go-live gate**: the bot refuses to trade real money unless `MOMENTUM_LIVE_CONFIRM=true`
+  is set with `MOMENTUM_DRY_RUN=false` — no accidental live runs before validation.
+- **Verification**: the analyzer reports peak PnL, max drawdown, and worst losing
+  streak from the logs, so you can set the breaker thresholds from real numbers.
+
+The intended workflow is a discipline, in order: **dry run → `analyze_momentum.py`
+→ A/B edges on/off (`compare_momentum.py`) → only if PnL is positive and scores
+are predictive, go live at tiny size (0.02 SOL) with the circuit breaker on →
+re-analyze real fills → scale only on proven, repeated results.**
+
 **GMGN integration (optional).** Set `GMGN_ENABLED=true` and a key from
 `gmgn.ai/ai` to layer GMGN's OpenAPI data on top of the bot's own signals — it
 fixes the from-scratch cold-start of smart-money and rug detection:

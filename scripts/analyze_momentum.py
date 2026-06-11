@@ -222,6 +222,29 @@ def main():
         print("   No sells recorded yet.")
 
     # Smart-money reputation snapshot, if present.
+    print("\n4b. DISCIPLINE / DRAWDOWN (did the process hold?)")
+    # Chronological running PnL -> peak, max drawdown, worst losing streak.
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    streak = 0
+    worst_streak = 0
+    for _mint, pnl, row in realized_rows(rows):
+        cum += pnl
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+        if row["event"] == "SELL_FULL":
+            if pnl < 0:
+                streak += 1
+                worst_streak = max(worst_streak, streak)
+            else:
+                streak = 0
+    print(f"   Peak cumulative PnL    : {peak:+.4f} SOL")
+    print(f"   Max drawdown           : -{max_dd:.4f} SOL")
+    print(f"   Worst losing streak    : {worst_streak} consecutive full exits")
+    print("   (Set MOMENTUM_DAILY_LOSS_LIMIT_SOL ~ your max tolerable drawdown and")
+    print("    MOMENTUM_MAX_CONSECUTIVE_LOSSES above normal streaks but below a blow-up.)")
+
     print("\n5. SMART-MONEY MEMORY")
     rep_path = "momentum_wallet_rep.csv"
     try:

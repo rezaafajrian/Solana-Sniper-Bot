@@ -169,6 +169,15 @@ pub struct MomentumConfig {
     pub gmgn_watchlist_ttl_secs: u64,
     /// Max smartmoney trades to pull per poll.
     pub gmgn_smartmoney_limit: u64,
+
+    // ---- Discipline: session circuit breaker + go-live gate ----
+    /// Halt NEW entries once session realized PnL drops to -this many SOL.
+    /// Open positions are still managed/exited normally. 0 disables.
+    pub daily_loss_limit_sol: f64,
+    /// Halt NEW entries after this many consecutive losing full exits. 0 disables.
+    pub max_consecutive_losses: u32,
+    /// Explicit acknowledgement required to trade live (when dry_run=false).
+    pub live_confirmed: bool,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -248,6 +257,10 @@ impl MomentumConfig {
             gmgn_trenches_preset: std::env::var("MOMENTUM_GMGN_TRENCHES_PRESET").unwrap_or_else(|_| "smart-money".to_string()),
             gmgn_watchlist_ttl_secs: env_u64("MOMENTUM_GMGN_WATCHLIST_TTL_SECS", 300),
             gmgn_smartmoney_limit: env_u64("MOMENTUM_GMGN_SMARTMONEY_LIMIT", 100),
+
+            daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
+            max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
+            live_confirmed: std::env::var("MOMENTUM_LIVE_CONFIRM").map(|v| v.to_lowercase() == "true").unwrap_or(false),
         }
     }
 
@@ -278,6 +291,11 @@ impl MomentumConfig {
         logger.log(format!(
             "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}%",
             self.max_deployed_sol, self.buy_cost_fraction * 100.0,
+        ));
+        logger.log(format!(
+            "Discipline: circuit breaker at -{:.3} SOL session loss or {} consecutive losses{}",
+            self.daily_loss_limit_sol, self.max_consecutive_losses,
+            if self.dry_run { "" } else if self.live_confirmed { " | LIVE confirmed" } else { " | LIVE NOT confirmed" },
         ));
         logger.log("------------------------------".cyan().bold().to_string());
     }
@@ -354,6 +372,47 @@ lazy_static! {
 
 /// Optional GMGN client, initialised once at startup if enabled.
 static GMGN: OnceCell<Arc<GmgnClient>> = OnceCell::new();
+
+/// Circuit breaker: once tripped, NEW entries are blocked (open positions still
+/// exit normally). Discipline against bleeding out on a bad session.
+static TRADING_HALTED: AtomicBool = AtomicBool::new(false);
+static CONSECUTIVE_LOSSES: AtomicUsize = AtomicUsize::new(0);
+
+fn trading_halted() -> bool {
+    TRADING_HALTED.load(Ordering::SeqCst)
+}
+
+/// Record the outcome of a closed position and evaluate the circuit breaker.
+fn record_full_exit(realized_sol: f64, cfg: &MomentumConfig, logger: &Logger) {
+    if realized_sol < 0.0 {
+        CONSECUTIVE_LOSSES.fetch_add(1, Ordering::SeqCst);
+    } else {
+        CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
+    }
+
+    if trading_halted() {
+        return;
+    }
+
+    let session_realized = PNL_TALLY.lock().map(|g| g.0).unwrap_or(0.0);
+    let losses = CONSECUTIVE_LOSSES.load(Ordering::SeqCst) as u32;
+
+    let trip = if cfg.daily_loss_limit_sol > 0.0 && session_realized <= -cfg.daily_loss_limit_sol {
+        Some(format!("session loss {:.4} SOL hit limit -{:.4}", session_realized, cfg.daily_loss_limit_sol))
+    } else if cfg.max_consecutive_losses > 0 && losses >= cfg.max_consecutive_losses {
+        Some(format!("{} consecutive losing trades", losses))
+    } else {
+        None
+    };
+
+    if let Some(reason) = trip {
+        TRADING_HALTED.store(true, Ordering::SeqCst);
+        logger.log(format!(
+            "🛑🛑 CIRCUIT BREAKER TRIPPED — {}. New entries halted; open positions will still exit. Restart the bot to resume.",
+            reason,
+        ).red().bold().to_string());
+    }
+}
 
 fn gmgn() -> Option<&'static Arc<GmgnClient>> {
     GMGN.get()
@@ -892,6 +951,11 @@ fn tracked_wallet_sell_volume(mint: &str, tracked: &HashSet<String>, now: u64, c
 }
 
 async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<MomentumConfig>, sniper: Arc<SniperConfig>, logger: Logger) {
+    // Discipline: if the circuit breaker has tripped, take no new entries.
+    if trading_halted() {
+        return;
+    }
+
     let mint = parsed.mint.clone();
     let now = now_secs();
 
@@ -1277,6 +1341,9 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
         ).yellow().to_string());
         commit_sell(true);
+        if is_full {
+            record_full_exit(sim_realized, &cfg, &logger);
+        }
         return;
     }
 
@@ -1297,6 +1364,9 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 signature: &sig,
             });
             commit_sell(true);
+            if is_full {
+                record_full_exit(est_realized_pnl, &cfg, &logger);
+            }
             spawn_reconcile(recon_app, mint.clone(), sig, cost_basis,
                 est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.frac_of_original, decision.reason.clone());
         }
@@ -1423,9 +1493,10 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
         ticks += 1;
         if ticks % 20 == 0 {
             let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
+            let status = if trading_halted() { " | 🛑 HALTED" } else { "" };
             logger.log(format!(
-                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open positions | tracking {} tokens | log: {}",
-                realized, buys, sells, POSITIONS.len(), TOKEN_STATE.len(), trade_log_path(),
+                "📊 PnL summary | realized {:+.4} SOL | {} buys / {} sells | {} open | streak {} losses | tracking {}{}",
+                realized, buys, sells, POSITIONS.len(), CONSECUTIVE_LOSSES.load(Ordering::SeqCst), TOKEN_STATE.len(), status,
             ).cyan().bold().to_string());
 
             // Drop rolling state for tokens we don't hold and haven't seen trade recently,
@@ -1467,6 +1538,17 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
     let cfg = Arc::new(MomentumConfig::from_env());
     cfg.log(&logger);
 
+    // Go-live gate: refuse to trade real money unless explicitly acknowledged.
+    // This prevents an accidental live run before the strategy is validated.
+    if !cfg.dry_run && !cfg.live_confirmed {
+        let msg = "Refusing to start LIVE: set MOMENTUM_LIVE_CONFIRM=true to trade real money, \
+                   or MOMENTUM_DRY_RUN=true to paper-trade. Validate in dry run + analyzer/A-B first.";
+        logger.log(format!("⛔ {}", msg).red().bold().to_string());
+        return Err(msg.to_string());
+    }
+
+    TRADING_HALTED.store(false, Ordering::SeqCst);
+    CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
     MOMENTUM_RUNNING.store(true, Ordering::SeqCst);
 
     let app_state = Arc::new(sniper.app_state.clone());
