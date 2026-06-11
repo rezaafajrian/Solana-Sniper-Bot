@@ -179,6 +179,18 @@ pub struct MomentumConfig {
     /// Max smartmoney trades to pull per poll.
     pub gmgn_smartmoney_limit: u64,
 
+    // ---- KOL tracking (your private edge) ----
+    /// Treat buys from a curated KOL wallet list as a leading entry signal.
+    pub kol_enabled: bool,
+    /// File of KOL wallets, one per line: `wallet[,weight][,label]`.
+    pub kol_file: String,
+    /// Score points added to a token a KOL just bought (per unit weight).
+    pub kol_boost: f64,
+    /// Seconds a KOL buy keeps a mint "hot".
+    pub kol_window_secs: u64,
+    /// If true, ONLY enter tokens a KOL bought (momentum/LP/anti-fake just confirm).
+    pub kol_require: bool,
+
     // ---- Discipline: session circuit breaker + go-live gate ----
     /// Halt NEW entries once session realized PnL drops to -this many SOL.
     /// Open positions are still managed/exited normally. 0 disables.
@@ -274,6 +286,12 @@ impl MomentumConfig {
             gmgn_watchlist_ttl_secs: env_u64("MOMENTUM_GMGN_WATCHLIST_TTL_SECS", 300),
             gmgn_smartmoney_limit: env_u64("MOMENTUM_GMGN_SMARTMONEY_LIMIT", 100),
 
+            kol_enabled: std::env::var("MOMENTUM_KOL_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            kol_file: std::env::var("MOMENTUM_KOL_FILE").unwrap_or_else(|_| "kol_wallets.txt".to_string()),
+            kol_boost: env_f64("MOMENTUM_KOL_BOOST", 40.0),
+            kol_window_secs: env_u64("MOMENTUM_KOL_WINDOW_SECS", 60),
+            kol_require: std::env::var("MOMENTUM_KOL_REQUIRE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
             live_confirmed: std::env::var("MOMENTUM_LIVE_CONFIRM").map(|v| v.to_lowercase() == "true").unwrap_or(false),
@@ -320,6 +338,13 @@ impl MomentumConfig {
             if self.daily_reset { format!("auto-reset daily (UTC{:+})", self.daily_reset_utc_offset_hours) } else { "manual reset".to_string() },
             if self.dry_run { "" } else if self.live_confirmed { " | LIVE confirmed" } else { " | LIVE NOT confirmed" },
         ));
+        if self.kol_enabled {
+            logger.log(format!(
+                "⭐ KOL edge: ON | file {} | boost +{:.0}/weight | window {}s | {}",
+                self.kol_file, self.kol_boost, self.kol_window_secs,
+                if self.kol_require { "PURE-KOL (only KOL buys)" } else { "boost mode" },
+            ).cyan().bold().to_string());
+        }
         logger.log("------------------------------".cyan().bold().to_string());
     }
 }
@@ -393,6 +418,45 @@ lazy_static! {
     static ref ATTR_QUEUE: std::sync::Mutex<VecDeque<PendingAttr>> = std::sync::Mutex::new(VecDeque::new());
     /// Mints GMGN smart-money / trenches flag as hot: mint -> expiry unix secs.
     static ref GMGN_WATCHLIST: DashMap<String, u64> = DashMap::new();
+    /// Your curated KOL wallets: wallet -> (weight, label).
+    static ref KOL_WALLETS: DashMap<String, (f64, String)> = DashMap::new();
+    /// Mints a KOL just bought: mint -> (expiry_unix, weight, label).
+    static ref KOL_HOT: DashMap<String, (u64, f64, String)> = DashMap::new();
+}
+
+/// Load the private KOL wallet list. Lines: `wallet[,weight][,label]` (# = comment).
+fn load_kol_wallets(path: &str) -> usize {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split(',');
+        let wallet = parts.next().unwrap_or("").trim().to_string();
+        if wallet.is_empty() {
+            continue;
+        }
+        let weight = parts.next().and_then(|w| w.trim().parse::<f64>().ok()).unwrap_or(1.0);
+        let label = parts.next().map(|l| l.trim().to_string()).unwrap_or_else(|| short_addr(&wallet));
+        KOL_WALLETS.insert(wallet, (weight, label));
+    }
+    KOL_WALLETS.len()
+}
+
+fn short_addr(a: &str) -> String {
+    if a.len() > 8 { format!("{}…{}", &a[..4], &a[a.len() - 4..]) } else { a.to_string() }
+}
+
+/// If `mint` is currently KOL-hot (unexpired), return (weight, label).
+fn kol_hot(mint: &str, now: u64) -> Option<(f64, String)> {
+    KOL_HOT.get(mint).and_then(|e| {
+        let (expiry, weight, label) = e.value();
+        if *expiry > now { Some((*weight, label.clone())) } else { None }
+    })
 }
 
 /// Optional GMGN client, initialised once at startup if enabled.
@@ -987,6 +1051,21 @@ fn ingest_trade(parsed: &TradeInfoFromToken, trader: String, now: u64, cfg: &Mom
         enqueue_attribution(trader.clone(), parsed.mint.clone(), tick_mcap, now + cfg.smart_money_horizon_secs);
     }
 
+    // KOL edge: if a tracked KOL just bought this token, mark it hot. Keep the
+    // highest-weight KOL seen within the window as the trigger.
+    if cfg.kol_enabled && parsed.is_buy && !trader.is_empty() {
+        if let Some(kw) = KOL_WALLETS.get(&trader) {
+            let (weight, label) = kw.value().clone();
+            let expiry = now + cfg.kol_window_secs;
+            let keep = KOL_HOT.get(&parsed.mint).map(|e| weight >= e.value().1).unwrap_or(true);
+            if keep {
+                KOL_HOT.insert(parsed.mint.clone(), (expiry, weight, label));
+            } else if let Some(mut e) = KOL_HOT.get_mut(&parsed.mint) {
+                e.0 = expiry; // refresh window even if a lower-weight KOL re-buys
+            }
+        }
+    }
+
     entry.ticks.push_back(TradeTick {
         ts: now,
         is_buy: parsed.is_buy,
@@ -1086,9 +1165,17 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let mint = parsed.mint.clone();
     let now = now_secs();
 
+    // KOL edge: a tracked KOL buying this token is the leading signal.
+    let kol = if cfg.kol_enabled { kol_hot(&mint, now) } else { None };
+    // Pure-KOL mode: only ever enter what a KOL bought (momentum/LP/anti-fake confirm).
+    if cfg.kol_require && kol.is_none() {
+        return;
+    }
+    let kol_pts = kol.as_ref().map(|(w, _)| cfg.kol_boost * w).unwrap_or(0.0);
+
     // GMGN smart-money / trenches confirmation adds score points for the gate.
     let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
-    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 };
+    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts;
 
     if effective_score < cfg.entry_score {
         return;
@@ -1162,13 +1249,21 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // Reserve a slot before the async buy to prevent overshooting max positions.
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
+    let kol_tag = kol.as_ref().map(|(_, l)| format!(", KOL:{} +{:.0}", l, kol_pts)).unwrap_or_default();
     logger.log(format!(
-        "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}) | genuine {:.0}% | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
+        "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}{}) | genuine {:.0}% | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
         mint, signal.score, signal.smart_money_boost,
         if gmgn_hot { format!(", GMGN +{:.1}", cfg.gmgn_boost) } else { String::new() },
+        kol_tag,
         signal.genuine_factor * 100.0,
         entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
     ).green().bold().to_string());
+
+    // Reason carries the KOL label so the analyzer can attribute PnL per KOL.
+    let buy_reason = match &kol {
+        Some((_, l)) => format!("momentum entry [KOL:{}]", l),
+        None => "momentum entry".to_string(),
+    };
 
     let result: Result<(), String> = if cfg.dry_run {
         // Paper trade: assume the buy fills at the current market cap.
@@ -1209,7 +1304,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
                 mint: &mint,
-                reason: "momentum entry",
+                reason: &buy_reason,
                 score: signal.score,
                 entry_mcap: signal.current_mcap,
                 current_mcap: signal.current_mcap,
@@ -1643,6 +1738,7 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
                     None => false,
                 }
             });
+            KOL_HOT.retain(|_, v| v.0 > now);
         }
     }
 }
@@ -1694,6 +1790,16 @@ async fn momentum_startup(
     if cfg.smart_money_enabled {
         load_wallet_rep(&cfg.wallet_rep_file);
         logger.log(format!("🧠 Loaded reputation for {} wallets from {}", WALLET_REP.len(), cfg.wallet_rep_file).cyan().to_string());
+    }
+
+    if cfg.kol_enabled {
+        let n = load_kol_wallets(&cfg.kol_file);
+        if n == 0 {
+            logger.log(format!("⚠️  KOL tracking on but no wallets loaded from {} — add wallets (one per line)", cfg.kol_file).yellow().to_string());
+        } else {
+            logger.log(format!("⭐ Loaded {} KOL wallets from {} | mode: {}", n, cfg.kol_file,
+                if cfg.kol_require { "PURE-KOL (only enter KOL buys)" } else { "boost (KOL buys prioritized)" }).cyan().bold().to_string());
+        }
     }
 
     {

@@ -245,6 +245,29 @@ def main():
     print("   (Set MOMENTUM_DAILY_LOSS_LIMIT_SOL ~ your max tolerable drawdown and")
     print("    MOMENTUM_MAX_CONSECUTIVE_LOSSES above normal streaks but below a blow-up.)")
 
+    print("\n4c. KOL ATTRIBUTION (which KOLs actually make money?)")
+    # Map mint -> KOL label from BUY reasons like "momentum entry [KOL:xyz]".
+    import re
+    mint_kol = {}
+    for r in rows:
+        if r["event"] == "BUY":
+            m = re.search(r"\[KOL:([^\]]+)\]", r["reason"])
+            if m:
+                mint_kol[r["mint"]] = m.group(1)
+    if not mint_kol:
+        print("   No KOL-tagged trades (KOL tracking off, or no KOL buys this run).")
+    else:
+        kol_pnl = defaultdict(float)
+        kol_tok = defaultdict(set)
+        for mint, pnl, _ in realized_rows(rows):
+            if mint in mint_kol:
+                kol_pnl[mint_kol[mint]] += pnl
+                kol_tok[mint_kol[mint]].add(mint)
+        print(f"   {'KOL':<20} {'tokens':>7} {'realized SOL':>14}")
+        for kol in sorted(kol_pnl, key=lambda k: kol_pnl[k], reverse=True):
+            print(f"   {kol[:20]:<20} {len(kol_tok[kol]):>7} {kol_pnl[kol]:>+14.4f}")
+        print("   -> Keep the green KOLs, cut the red ones from kol_wallets.txt. That's the edge loop.")
+
     print("\n5. SMART-MONEY MEMORY")
     rep_path = "momentum_wallet_rep.csv"
     try:

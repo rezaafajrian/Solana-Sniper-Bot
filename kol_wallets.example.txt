@@ -1,0 +1,11 @@
+# Your private KOL wallet list — THIS is your edge. Keep it curated and private.
+# One per line:  wallet[,weight][,label]
+#   weight (optional, default 1.0): higher = stronger entry boost for this KOL
+#   label  (optional): short name shown in logs + the PnL analyzer
+#
+# Examples (replace with REAL wallets you've researched):
+# 9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM,2.0,cupsey
+# 5xoBq7f7CDgZwqHrDBhRzPDFmoYNW8 Dnz3...,1.0,whale2
+# Build this from your own analysis (who consistently buys winners early).
+# After a dry run, scripts/analyze_momentum.py shows PnL per KOL — keep the
+# green ones, cut the red ones. That feedback loop IS the edge.
