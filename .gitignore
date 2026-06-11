@@ -35,3 +35,5 @@ momentum_trades.csv
 momentum_wallet_rep.csv
 momentum_wallet_rep.csv.tmp
 kol_wallets.txt
+momentum_status.json
+web/momentum_status.json

@@ -193,6 +193,8 @@ pub struct MomentumConfig {
     /// Hot-reload the KOL file every N seconds (0 = load once). Lets a cron'd
     /// Dune API fetch refresh the list live without restarting the bot.
     pub kol_reload_secs: u64,
+    /// Path for the live dashboard status snapshot JSON ("" disables).
+    pub status_file: String,
 
     // ---- Discipline: session circuit breaker + go-live gate ----
     /// Halt NEW entries once session realized PnL drops to -this many SOL.
@@ -295,6 +297,7 @@ impl MomentumConfig {
             kol_window_secs: env_u64("MOMENTUM_KOL_WINDOW_SECS", 60),
             kol_require: std::env::var("MOMENTUM_KOL_REQUIRE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
+            status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
 
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
@@ -404,6 +407,10 @@ struct MomentumPosition {
     selling: bool,
     /// Creator + top early buyers; if these distribute, exit immediately.
     tracked_wallets: HashSet<String>,
+    /// Unix seconds when the position was opened (for the dashboard age).
+    entry_ts: u64,
+    /// KOL label that triggered this entry, if any (for the dashboard).
+    kol_label: String,
 }
 
 lazy_static! {
@@ -416,6 +423,9 @@ lazy_static! {
     static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
     static ref PNL_TALLY: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
+    /// Recent trade events for the live dashboard feed: (ts, event, mint, reason, pnl_sol).
+    static ref RECENT_EVENTS: std::sync::Mutex<VecDeque<(u64, String, String, String, f64)>> =
+        std::sync::Mutex::new(VecDeque::with_capacity(64));
     /// Per-wallet reputation learned from observed outcomes (the smart-money edge).
     static ref WALLET_REP: DashMap<String, WalletRep> = DashMap::new();
     /// Pending outcome evaluations for tracked buys, ordered by due time.
@@ -755,6 +765,83 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Write a live status snapshot for the web dashboard (best-effort).
+fn write_status_snapshot(cfg: &MomentumConfig) {
+    if cfg.status_file.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
+
+    // Open positions with live PnL.
+    let mut positions: Vec<serde_json::Value> = Vec::new();
+    for e in POSITIONS.iter() {
+        let p = e.value();
+        let cur = TOKEN_STATE.get(e.key()).map(|s| s.last_mcap).unwrap_or(p.entry_mcap);
+        let pnl_pct = if p.entry_mcap > 0.0 { (cur - p.entry_mcap) / p.entry_mcap * 100.0 } else { 0.0 };
+        let rungs = p.rungs_hit.iter().filter(|&&h| h).count();
+        positions.push(serde_json::json!({
+            "mint": e.key(),
+            "entry_mcap": p.entry_mcap,
+            "current_mcap": cur,
+            "pnl_pct": pnl_pct,
+            "peak_pnl": p.peak_pnl,
+            "size_sol": p.entry_size_sol,
+            "remaining_pct": p.remaining_fraction * 100.0,
+            "rungs_hit": rungs,
+            "age_secs": now.saturating_sub(p.entry_ts),
+            "kol": p.kol_label,
+            "selling": p.selling,
+        }));
+    }
+    positions.sort_by(|a, b| b["pnl_pct"].as_f64().unwrap_or(0.0).partial_cmp(&a["pnl_pct"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Recent event feed (newest first).
+    let mut feed: Vec<serde_json::Value> = Vec::new();
+    if let Ok(q) = RECENT_EVENTS.lock() {
+        for (ts, event, mint, reason, pnl) in q.iter().rev() {
+            feed.push(serde_json::json!({ "ts": ts, "event": event, "mint": mint, "reason": reason, "pnl_sol": pnl }));
+        }
+    }
+
+    let snap = serde_json::json!({
+        "updated": now,
+        "mode": if cfg.dry_run { "DRY RUN" } else { "LIVE" },
+        "halted": trading_halted(),
+        "consecutive_losses": CONSECUTIVE_LOSSES.load(Ordering::SeqCst),
+        "pnl": {
+            "session_realized": realized,
+            "today_realized": daily_realized(),
+            "buys": buys,
+            "sells": sells,
+        },
+        "capital": { "deployed_sol": deployed_sol(), "max_deployed_sol": cfg.max_deployed_sol },
+        "counts": {
+            "open_positions": POSITIONS.len(),
+            "max_positions": cfg.max_positions,
+            "tokens_tracked": TOKEN_STATE.len(),
+            "kol_wallets": KOL_WALLETS.len(),
+            "kol_hot": KOL_HOT.len(),
+            "gmgn_watchlist": GMGN_WATCHLIST.len(),
+        },
+        "config": {
+            "position_size_sol": cfg.position_size_sol,
+            "entry_score": cfg.entry_score,
+            "hard_stop_pct": cfg.hard_stop_pct,
+            "kol_enabled": cfg.kol_enabled,
+            "kol_require": cfg.kol_require,
+            "daily_loss_limit_sol": cfg.daily_loss_limit_sol,
+        },
+        "positions": positions,
+        "feed": feed,
+    });
+
+    let tmp = format!("{}.tmp", cfg.status_file);
+    if std::fs::write(&tmp, snap.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &cfg.status_file);
+    }
+}
+
 fn trade_log_path() -> String {
     std::env::var("MOMENTUM_TRADE_LOG").unwrap_or_else(|_| "momentum_trades.csv".to_string())
 }
@@ -791,6 +878,16 @@ fn log_trade_event(ev: &TradeLogEvent) {
                 tally.2 += 1;
             }
             _ => {}
+        }
+    }
+
+    // Feed the live dashboard (keep the last 50 events).
+    if ev.event != "SELL_ACTUAL" {
+        if let Ok(mut q) = RECENT_EVENTS.lock() {
+            if q.len() >= 50 {
+                q.pop_front();
+            }
+            q.push_back((now_secs(), ev.event.to_string(), ev.mint.to_string(), ev.reason.to_string(), ev.est_realized_pnl_sol));
         }
     }
 
@@ -1306,6 +1403,8 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 peak_pnl: 0.0,
                 selling: false,
                 tracked_wallets,
+                entry_ts: now,
+                kol_label: kol.as_ref().map(|(_, l)| l.clone()).unwrap_or_default(),
             });
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
@@ -1720,6 +1819,9 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
         for mint in mints {
             evaluate_position(mint, app_state.clone(), cfg.clone(), logger.clone()).await;
         }
+
+        // Refresh the live dashboard snapshot every tick (~3s).
+        write_status_snapshot(&cfg);
 
         // Live PnL summary + stale-state cleanup roughly every 60s.
         ticks += 1;
