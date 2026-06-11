@@ -190,6 +190,9 @@ pub struct MomentumConfig {
     pub kol_window_secs: u64,
     /// If true, ONLY enter tokens a KOL bought (momentum/LP/anti-fake just confirm).
     pub kol_require: bool,
+    /// Hot-reload the KOL file every N seconds (0 = load once). Lets a cron'd
+    /// Dune API fetch refresh the list live without restarting the bot.
+    pub kol_reload_secs: u64,
 
     // ---- Discipline: session circuit breaker + go-live gate ----
     /// Halt NEW entries once session realized PnL drops to -this many SOL.
@@ -291,6 +294,7 @@ impl MomentumConfig {
             kol_boost: env_f64("MOMENTUM_KOL_BOOST", 40.0),
             kol_window_secs: env_u64("MOMENTUM_KOL_WINDOW_SECS", 60),
             kol_require: std::env::var("MOMENTUM_KOL_REQUIRE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
 
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
@@ -430,6 +434,8 @@ fn load_kol_wallets(path: &str) -> usize {
         Ok(c) => c,
         Err(_) => return 0,
     };
+    // Build fresh so a reload reflects additions AND removals.
+    KOL_WALLETS.clear();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1799,6 +1805,22 @@ async fn momentum_startup(
         } else {
             logger.log(format!("⭐ Loaded {} KOL wallets from {} | mode: {}", n, cfg.kol_file,
                 if cfg.kol_require { "PURE-KOL (only enter KOL buys)" } else { "boost (KOL buys prioritized)" }).cyan().bold().to_string());
+        }
+
+        // Hot-reload the KOL list so a cron'd Dune API fetch refreshes it live.
+        if cfg.kol_reload_secs > 0 {
+            let file = cfg.kol_file.clone();
+            let secs = cfg.kol_reload_secs;
+            let logger2 = logger.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(secs.max(10)));
+                interval.tick().await; // skip immediate tick (already loaded)
+                while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
+                    interval.tick().await;
+                    let n = load_kol_wallets(&file);
+                    logger2.log(format!("⭐ KOL list reloaded: {} wallets", n).cyan().to_string());
+                }
+            });
         }
     }
 
