@@ -58,6 +58,20 @@ value (all toggleable in `src/env.example`):
 The analyzer's "exit reasons" and "smart-money memory" sections show whether each
 of these is actually earning its keep.
 
+**Edge hardening (against manufactured momentum).** Because pump.fun momentum is
+routinely faked, the entry score is multiplied by a 0..1 **genuineness factor**:
+
+- **Buyer diversity** — `unique buyers / buy transactions`. A few wallets spamming
+  many buys to fake volume and breadth scores low (`MOMENTUM_MIN_BUYER_DIVERSITY`).
+- **Wash-trade detection** — share of buy volume from wallets that *also sold* in
+  the window (round-tripping to inflate volume) is capped by `MOMENTUM_MAX_WASH_FRACTION`.
+
+Both the base score and the smart-money boost are scaled by this factor, so neither
+real-looking volume nor smart-money confirmation can rescue a wash-traded token. The
+smart-money reputation itself is hardened too: it **time-decays** (`MOMENTUM_SMART_MONEY_HALFLIFE_SECS`)
+so stale wallets fade, and repeated buys of the *same* token are dampened so a wallet
+can't farm a reputation. The entry log shows `genuine NN%` per trade.
+
 > These improve the EV *mechanisms* — they don't guarantee profit. Validate them
 > in dry run: compare total PnL and the insider-exit category with the features
 > on vs off.

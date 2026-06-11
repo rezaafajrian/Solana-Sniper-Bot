@@ -102,6 +102,12 @@ pub struct MomentumConfig {
     pub target_unique_buyers: f64,
     pub target_mcap_growth: f64,
     pub max_wallet_concentration: f64,
+    /// Minimum ratio of unique buyers to buy transactions. Below this, the volume
+    /// looks manufactured (few wallets making many buys) and the score is cut.
+    pub min_buyer_diversity: f64,
+    /// Max share of buy volume from wallets that ALSO sold in the window
+    /// (round-tripping / wash trading). Above this, the score is cut.
+    pub max_wash_fraction: f64,
     pub scale_out_targets: Vec<f64>,
     pub slippage_bps: u64,
     /// Allow buying a token again (after the exit cooldown) if it re-pumps.
@@ -128,6 +134,9 @@ pub struct MomentumConfig {
     pub smart_money_boost_max: f64,
     /// Sum of buyer reputations that earns the full boost.
     pub smart_money_boost_scale: f64,
+    /// Reputation half-life (seconds): old performance decays so stale wallets
+    /// fade and recent results dominate. Guards against ossified reputations.
+    pub smart_money_halflife_secs: u64,
     /// File to persist wallet reputation across restarts (compounding edge).
     pub wallet_rep_file: String,
 
@@ -214,6 +223,8 @@ impl MomentumConfig {
             target_unique_buyers: env_f64("MOMENTUM_TARGET_UNIQUE_BUYERS", 10.0),
             target_mcap_growth: env_f64("MOMENTUM_TARGET_MCAP_GROWTH", 0.30),
             max_wallet_concentration: env_f64("MOMENTUM_MAX_WALLET_CONCENTRATION", 0.50),
+            min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
+            max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
             scale_out_targets: if scale_out_targets.is_empty() {
                 vec![100.0, 200.0, 300.0, 400.0]
             } else {
@@ -237,6 +248,7 @@ impl MomentumConfig {
             smart_money_min_samples: env_u64("MOMENTUM_SMART_MONEY_MIN_SAMPLES", 3) as u32,
             smart_money_boost_max: env_f64("MOMENTUM_SMART_MONEY_BOOST_MAX", 15.0),
             smart_money_boost_scale: env_f64("MOMENTUM_SMART_MONEY_BOOST_SCALE", 1.0),
+            smart_money_halflife_secs: env_u64("MOMENTUM_SMART_MONEY_HALFLIFE_SECS", 604_800),
             wallet_rep_file: std::env::var("MOMENTUM_REP_FILE")
                 .unwrap_or_else(|_| "momentum_wallet_rep.csv".to_string()),
 
@@ -286,6 +298,10 @@ impl MomentumConfig {
         logger.log(format!(
             "Targets: min buy vol {} SOL, {} unique buyers, {:.0}% mcap growth, max wallet concentration {:.0}%",
             self.min_buy_volume_sol, self.target_unique_buyers, self.target_mcap_growth * 100.0, self.max_wallet_concentration * 100.0,
+        ));
+        logger.log(format!(
+            "Anti-fake: min buyer diversity {:.2}, max wash fraction {:.2}",
+            self.min_buyer_diversity, self.max_wash_fraction,
         ));
         logger.log(format!("Scale-out rungs (20% each): {:?}% PnL, then 20% runner", self.scale_out_targets));
         logger.log(format!(
@@ -339,6 +355,8 @@ pub struct MomentumSignal {
     pub current_mcap: f64,
     /// Additive points contributed by smart-money confirmation (already in `score`).
     pub smart_money_boost: f64,
+    /// 0..1 authenticity multiplier (1 = organic; <1 = manufactured/wash momentum).
+    pub genuine_factor: f64,
 }
 
 /// An open position managed by the momentum exit policy.
@@ -490,21 +508,33 @@ async fn run_gmgn_pollers(cfg: Arc<MomentumConfig>, logger: Logger) {
         let now = now_secs();
         let expiry = now + cfg.gmgn_watchlist_ttl_secs;
 
-        let mut added = 0usize;
+        let mut fresh: Vec<String> = Vec::new();
         for mint in client.smartmoney_buys(cfg.gmgn_smartmoney_limit).await {
+            if !GMGN_WATCHLIST.contains_key(&mint) {
+                fresh.push(mint.clone());
+            }
             GMGN_WATCHLIST.insert(mint, expiry);
-            added += 1;
         }
         for mint in client.trenches_pumpfun(&cfg.gmgn_trenches_preset, 80).await {
+            if !GMGN_WATCHLIST.contains_key(&mint) {
+                fresh.push(mint.clone());
+            }
             GMGN_WATCHLIST.insert(mint, expiry);
-            added += 1;
         }
 
         // Drop expired entries.
         GMGN_WATCHLIST.retain(|_, exp| *exp > now);
 
-        if added > 0 {
-            logger.log(format!("🛰️  GMGN watchlist refreshed: {} hot mints", GMGN_WATCHLIST.len()).cyan().to_string());
+        // Edge/latency hardening: prewarm the security cache for newly-hot mints so
+        // the pre-buy veto is a cache hit instead of a blocking call on the hot path.
+        if cfg.gmgn_security_veto {
+            for mint in fresh.iter().take(40) {
+                let _ = client.security_verdict(mint).await;
+            }
+        }
+
+        if !fresh.is_empty() {
+            logger.log(format!("🛰️  GMGN watchlist refreshed: {} hot mints (+{} new, security prewarmed)", GMGN_WATCHLIST.len(), fresh.len()).cyan().to_string());
         }
     }
 }
@@ -515,6 +545,10 @@ async fn run_gmgn_pollers(cfg: Arc<MomentumConfig>, logger: Logger) {
 struct WalletRep {
     score: f64,
     samples: u32,
+    /// When the reputation was last updated (for time decay).
+    last_update: u64,
+    /// Last token graded, to dampen reputation farmed by buying one token repeatedly.
+    last_mint: String,
 }
 
 /// A buy awaiting outcome grading at `eval_at`.
@@ -591,9 +625,18 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
                 -1.0 // token went cold / untracked: treat as a loss
             };
             let mut r = WALLET_REP.entry(a.wallet).or_default();
-            let alpha = 0.1;
+            // Time-decay old reputation toward 0 so stale wallets fade.
+            if r.last_update > 0 {
+                let elapsed = now.saturating_sub(r.last_update) as f64;
+                let decay = 0.5f64.powf(elapsed / cfg.smart_money_halflife_secs.max(1) as f64);
+                r.score *= decay;
+            }
+            // Dampen reputation farmed by repeatedly buying the same token.
+            let alpha = if r.last_mint == a.mint { 0.02 } else { 0.1 };
             r.score = (1.0 - alpha) * r.score + alpha * ret;
             r.samples += 1;
+            r.last_update = now;
+            r.last_mint = a.mint.clone();
         }
 
         // Persist reputation roughly every 60s so the edge compounds across runs.
@@ -614,7 +657,9 @@ fn load_wallet_rep(path: &str) {
         let mut it = line.split(',');
         if let (Some(w), Some(s), Some(n)) = (it.next(), it.next(), it.next()) {
             if let (Ok(score), Ok(samples)) = (s.parse::<f64>(), n.parse::<u32>()) {
-                WALLET_REP.insert(w.to_string(), WalletRep { score, samples });
+                let last_update = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let last_mint = it.next().unwrap_or("").to_string();
+                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, last_update, last_mint });
             }
         }
     }
@@ -628,9 +673,10 @@ fn save_wallet_rep(path: &str) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let _ = writeln!(file, "wallet,score,samples");
+    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint");
     for e in WALLET_REP.iter() {
-        let _ = writeln!(file, "{},{:.6},{}", e.key(), e.value().score, e.value().samples);
+        let r = e.value();
+        let _ = writeln!(file, "{},{:.6},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint);
     }
     let _ = std::fs::rename(&tmp, path);
 }
@@ -769,7 +815,9 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
     let mut buy_vol_s = 0.0;
     let mut sell_vol_s = 0.0;
     let mut buy_vol_m = 0.0;
+    let mut buy_count_s = 0u32;
     let mut unique_buyers: HashSet<&str> = HashSet::new();
+    let mut sellers_s: HashSet<&str> = HashSet::new();
     let mut per_wallet_buy: HashMap<&str, f64> = HashMap::new();
     let mut first_mcap_s: Option<f64> = None;
     let mut last_mcap_s: Option<f64> = None;
@@ -781,6 +829,7 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         if t.ts >= short_cutoff {
             if t.is_buy {
                 buy_vol_s += t.sol;
+                buy_count_s += 1;
                 unique_buyers.insert(t.trader.as_str());
                 *per_wallet_buy.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
                 if first_mcap_s.is_none() && t.mcap > 0.0 {
@@ -791,6 +840,7 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
                 }
             } else {
                 sell_vol_s += t.sol;
+                sellers_s.insert(t.trader.as_str());
             }
         }
         // medium baseline (buy volume rate)
@@ -855,11 +905,32 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         1.0
     };
 
-    let base_score = (weighted * 100.0) * dump_factor;
+    // Manufactured-momentum veto (edge hardening): real demand comes from many
+    // distinct wallets buying once; fake pumps come from a few wallets cycling.
+    // (a) Buyer diversity: unique buyers / buy transactions. Low => few wallets
+    //     spamming buys to fake volume and "unique buyer" breadth.
+    let buyer_diversity = if buy_count_s > 0 { unique_buyers.len() as f64 / buy_count_s as f64 } else { 1.0 };
+    let diversity_factor = if buyer_diversity >= cfg.min_buyer_diversity {
+        1.0
+    } else {
+        clamp01(buyer_diversity / cfg.min_buyer_diversity.max(1e-9))
+    };
+    // (b) Wash trading: share of buy volume from wallets that also sold in-window
+    //     (round-tripping to inflate volume without real accumulation).
+    let wash_vol: f64 = per_wallet_buy.iter().filter(|(w, _)| sellers_s.contains(**w)).map(|(_, v)| *v).sum();
+    let wash_frac = if buy_vol_s > 0.0 { wash_vol / buy_vol_s } else { 0.0 };
+    let wash_factor = if wash_frac <= cfg.max_wash_fraction {
+        1.0
+    } else {
+        clamp01(1.0 - (wash_frac - cfg.max_wash_fraction) / (1.0 - cfg.max_wash_fraction).max(1e-9))
+    };
+    let genuine_factor = diversity_factor * wash_factor;
+
+    let base_score = (weighted * 100.0) * dump_factor * genuine_factor;
 
     // Smart-money edge: add points when proven-good wallets are among the buyers.
-    // Scaled by the dump factor so it can't rescue a token that's being dumped.
-    let boost = smart_money_boost(per_wallet_buy.keys().copied(), cfg) * dump_factor;
+    // Scaled by dump + genuineness so it can't rescue a dumped or wash-traded token.
+    let boost = smart_money_boost(per_wallet_buy.keys().copied(), cfg) * dump_factor * genuine_factor;
     let score = base_score + boost;
 
     MomentumSignal {
@@ -870,6 +941,7 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         mcap_velocity,
         current_mcap: last_mcap_s.or(Some(state.last_mcap)).unwrap_or(0.0),
         smart_money_boost: boost,
+        genuine_factor,
     }
 }
 
@@ -1091,9 +1163,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
     logger.log(format!(
-        "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}) | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
+        "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}) | genuine {:.0}% | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
         mint, signal.score, signal.smart_money_boost,
         if gmgn_hot { format!(", GMGN +{:.1}", cfg.gmgn_boost) } else { String::new() },
+        signal.genuine_factor * 100.0,
         entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
     ).green().bold().to_string());
 
