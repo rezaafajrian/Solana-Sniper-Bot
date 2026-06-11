@@ -61,8 +61,10 @@ impl GmgnConfig {
             enabled,
             base_url: env_or("GMGN_BASE_URL", "https://api.gmgn.ai").trim_end_matches('/').to_string(),
             api_key: env_or("GMGN_API_KEY", ""),
-            auth_header: env_or("GMGN_AUTH_HEADER", "Authorization"),
-            auth_prefix: env_or("GMGN_AUTH_PREFIX", "Bearer "),
+            // GMGN normal auth for read endpoints is the X-APIKEY header (no prefix,
+            // no signing). Overridable in case the scheme differs for your account.
+            auth_header: env_or("GMGN_AUTH_HEADER", "X-APIKEY"),
+            auth_prefix: env_or("GMGN_AUTH_PREFIX", ""),
             chain: env_or("GMGN_CHAIN", "sol"),
             request_timeout: Duration::from_millis(
                 std::env::var("GMGN_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),
