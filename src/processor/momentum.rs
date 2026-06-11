@@ -74,6 +74,8 @@ use yellowstone_grpc_proto::geyser::{
 
 use crate::common::config::{AppState, SwapConfig};
 use crate::common::logger::Logger;
+use crate::library::gmgn::{GmgnClient, GmgnConfig, SecurityVerdict};
+use once_cell::sync::OnceCell;
 use crate::dex::pump_fun::{Pump, PUMP_FUN_PROGRAM, TOKEN_TOTAL_SUPPLY};
 use crate::processor::sniper_bot::{execute_buy, SniperConfig, BOUGHT_TOKEN_LIST};
 use crate::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
@@ -153,6 +155,20 @@ pub struct MomentumConfig {
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
+
+    // ---- GMGN integration ----
+    /// Veto buys using GMGN's /v1/token/security (honeypot / rug_ratio).
+    pub gmgn_security_veto: bool,
+    /// Score points added when a mint is on GMGN's smart-money / trenches watchlist.
+    pub gmgn_boost: f64,
+    /// Seconds between GMGN smartmoney/trenches polls.
+    pub gmgn_poll_secs: u64,
+    /// GMGN trenches filter preset (safe | smart-money | strict).
+    pub gmgn_trenches_preset: String,
+    /// How long a GMGN watchlist entry stays hot (seconds).
+    pub gmgn_watchlist_ttl_secs: u64,
+    /// Max smartmoney trades to pull per poll.
+    pub gmgn_smartmoney_limit: u64,
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -225,6 +241,13 @@ impl MomentumConfig {
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
+
+            gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            gmgn_boost: env_f64("MOMENTUM_GMGN_BOOST", 12.0),
+            gmgn_poll_secs: env_u64("MOMENTUM_GMGN_POLL_SECS", 15),
+            gmgn_trenches_preset: std::env::var("MOMENTUM_GMGN_TRENCHES_PRESET").unwrap_or_else(|_| "smart-money".to_string()),
+            gmgn_watchlist_ttl_secs: env_u64("MOMENTUM_GMGN_WATCHLIST_TTL_SECS", 300),
+            gmgn_smartmoney_limit: env_u64("MOMENTUM_GMGN_SMARTMONEY_LIMIT", 100),
         }
     }
 
@@ -325,6 +348,51 @@ lazy_static! {
     static ref WALLET_REP: DashMap<String, WalletRep> = DashMap::new();
     /// Pending outcome evaluations for tracked buys, ordered by due time.
     static ref ATTR_QUEUE: std::sync::Mutex<VecDeque<PendingAttr>> = std::sync::Mutex::new(VecDeque::new());
+    /// Mints GMGN smart-money / trenches flag as hot: mint -> expiry unix secs.
+    static ref GMGN_WATCHLIST: DashMap<String, u64> = DashMap::new();
+}
+
+/// Optional GMGN client, initialised once at startup if enabled.
+static GMGN: OnceCell<Arc<GmgnClient>> = OnceCell::new();
+
+fn gmgn() -> Option<&'static Arc<GmgnClient>> {
+    GMGN.get()
+}
+
+fn on_gmgn_watchlist(mint: &str, now: u64) -> bool {
+    GMGN_WATCHLIST.get(mint).map(|e| *e > now).unwrap_or(false)
+}
+
+/// Background task: poll GMGN smart-money trades and pre-filtered trenches, and
+/// keep the watchlist of "hot" mints fresh. Best-effort; failures are ignored.
+async fn run_gmgn_pollers(cfg: Arc<MomentumConfig>, logger: Logger) {
+    let client = match gmgn() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    let mut interval = time::interval(Duration::from_secs(cfg.gmgn_poll_secs.max(5)));
+    while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
+        interval.tick().await;
+        let now = now_secs();
+        let expiry = now + cfg.gmgn_watchlist_ttl_secs;
+
+        let mut added = 0usize;
+        for mint in client.smartmoney_buys(cfg.gmgn_smartmoney_limit).await {
+            GMGN_WATCHLIST.insert(mint, expiry);
+            added += 1;
+        }
+        for mint in client.trenches_pumpfun(&cfg.gmgn_trenches_preset, 80).await {
+            GMGN_WATCHLIST.insert(mint, expiry);
+            added += 1;
+        }
+
+        // Drop expired entries.
+        GMGN_WATCHLIST.retain(|_, exp| *exp > now);
+
+        if added > 0 {
+            logger.log(format!("🛰️  GMGN watchlist refreshed: {} hot mints", GMGN_WATCHLIST.len()).cyan().to_string());
+        }
+    }
 }
 
 /// Reputation for a wallet: an EMA of the clamped forward returns of tokens it
@@ -827,7 +895,11 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let mint = parsed.mint.clone();
     let now = now_secs();
 
-    if signal.score < cfg.entry_score {
+    // GMGN smart-money / trenches confirmation adds score points for the gate.
+    let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
+    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 };
+
+    if effective_score < cfg.entry_score {
         return;
     }
     if POSITIONS.contains_key(&mint) || BOUGHT_TOKEN_LIST.contains_key(&mint) {
@@ -841,6 +913,23 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     }
     if signal.current_mcap <= 0.0 {
         return;
+    }
+
+    // GMGN security veto: skip honeypots / high rug_ratio before committing capital.
+    if cfg.gmgn_security_veto {
+        if let Some(client) = gmgn() {
+            match client.security_verdict(&mint).await {
+                SecurityVerdict::Reject(reason) => {
+                    logger.log(format!("🛑 GMGN veto {} — {}", mint, reason).red().to_string());
+                    return;
+                }
+                SecurityVerdict::Unknown if client.veto_on_unknown() => {
+                    logger.log(format!("🛑 GMGN veto {} — security unknown (fail-closed)", mint).yellow().to_string());
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     // Allow re-entry on a fresh pump: clear the bot's permanent buy blacklist for
@@ -883,8 +972,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
     logger.log(format!(
-        "🟢 ENTRY {} | score {:.1} (smart +{:.1}) | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
-        mint, signal.score, signal.smart_money_boost, entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
+        "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}) | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
+        mint, signal.score, signal.smart_money_boost,
+        if gmgn_hot { format!(", GMGN +{:.1}", cfg.gmgn_boost) } else { String::new() },
+        entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
     ).green().bold().to_string());
 
     let result: Result<(), String> = if cfg.dry_run {
@@ -1399,6 +1490,21 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
     if cfg.smart_money_enabled {
         let cfg = cfg.clone();
         tokio::spawn(async move { run_attribution(cfg).await });
+    }
+
+    // Optional GMGN integration: rug veto + smart-money / trenches watchlist.
+    {
+        let gmgn_cfg = GmgnConfig::from_env();
+        let client = GmgnClient::new(gmgn_cfg);
+        if client.enabled() {
+            let _ = GMGN.set(client);
+            logger.log("🛰️  GMGN integration active (rug veto + smart-money/trenches watchlist)".cyan().bold().to_string());
+            let cfg = cfg.clone();
+            let logger2 = logger.clone();
+            tokio::spawn(async move { run_gmgn_pollers(cfg, logger2).await });
+        } else {
+            logger.log("GMGN integration disabled (set GMGN_ENABLED=true and GMGN_API_KEY)".to_string());
+        }
     }
 
     // Connect to Yellowstone gRPC.

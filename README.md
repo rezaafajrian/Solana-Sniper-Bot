@@ -77,6 +77,27 @@ of these is actually earning its keep.
   smart-money boost requires several distinct reputable wallets and caps any single
   wallet's contribution, so one farmed high-rep wallet can't bait the bot into a dump.
 
+**GMGN integration (optional).** Set `GMGN_ENABLED=true` and a key from
+`gmgn.ai/ai` to layer GMGN's OpenAPI data on top of the bot's own signals — it
+fixes the from-scratch cold-start of smart-money and rug detection:
+
+- **Rug/security veto** — before each buy, `GET /v1/token/security` rejects
+  honeypots and tokens with `rug_ratio` above `GMGN_MAX_RUG_RATIO`. Verdicts are
+  cached; an unknown/failed lookup fails open by default (`GMGN_VETO_ON_UNKNOWN`).
+- **Smart-money + trenches watchlist** — a background poller pulls
+  `/v1/user/smartmoney` buys and `/v1/trenches` (pump.fun, smart-money preset)
+  into a hot-mint watchlist. When one of those mints shows momentum in our stream,
+  its entry score gets `MOMENTUM_GMGN_BOOST` extra points.
+
+Everything degrades gracefully: every GMGN call is timed out and falls back to the
+bot's own logic, so GMGN being slow or down never blocks or crashes trading. The
+auth header is configurable (`GMGN_AUTH_HEADER` / `GMGN_AUTH_PREFIX`) since the
+exact scheme is account-specific — confirm it from your GMGN account. Implementation:
+`src/library/gmgn.rs`.
+
+> GMGN data is a *shared* edge (everyone uses it): it improves selectivity and rug
+> avoidance, not raw speed. A/B it in dry run like the other features.
+
 **Trade logging / PnL report.** Every buy and sell is appended to an
 append-only CSV (`MOMENTUM_TRADE_LOG`, default `momentum_trades.csv`) with
 columns: timestamp, event (`BUY`/`SELL_PARTIAL`/`SELL_FULL`), mint, reason,
