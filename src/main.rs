@@ -587,10 +587,22 @@ async fn main() {
             excluded_addresses: Vec::new(),
             protocol_preference,
         };
-        println!("🚀 Starting MOMENTUM sniper (pump.fun, buy-strength-not-age)...");
-        match solana_vntr_sniper::processor::momentum::start_momentum_monitoring(momentum_config).await {
-            Ok(_) => println!("✅ Momentum monitoring completed"),
-            Err(e) => eprintln!("❌ Momentum monitoring error: {}", e),
+        // Feed selection: "grpc" (Yellowstone, default) or "ws" (standard RPC
+        // websocket blockSubscribe — works on Chainstack/Helius without gRPC).
+        let feed = std::env::var("MOMENTUM_FEED").unwrap_or_else(|_| "grpc".to_string()).to_lowercase();
+        if feed == "ws" {
+            let ws_url = std::env::var("RPC_WSS").unwrap_or_default();
+            println!("🚀 Starting MOMENTUM sniper (pump.fun, websocket feed)...");
+            match solana_vntr_sniper::processor::momentum::start_momentum_ws(momentum_config, ws_url).await {
+                Ok(_) => println!("✅ Momentum monitoring completed"),
+                Err(e) => eprintln!("❌ Momentum monitoring error: {}", e),
+            }
+        } else {
+            println!("🚀 Starting MOMENTUM sniper (pump.fun, gRPC feed)...");
+            match solana_vntr_sniper::processor::momentum::start_momentum_monitoring(momentum_config).await {
+                Ok(_) => println!("✅ Momentum monitoring completed"),
+                Err(e) => eprintln!("❌ Momentum monitoring error: {}", e),
+            }
         }
         return;
     }

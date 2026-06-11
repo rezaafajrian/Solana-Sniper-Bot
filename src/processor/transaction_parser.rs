@@ -17,6 +17,57 @@ lazy_static::lazy_static! {
 #[inline]
 fn dex_log(_msg: String) {}
 
+/// Decode a pump.fun trade event straight from its CPI log-data buffer (lengths
+/// 266 / 170 / 138), independent of the gRPC transaction wrapper. The mint and
+/// all trade fields live in the buffer itself, so this is reusable by any feed
+/// (e.g. a websocket `blockSubscribe` path) that can supply the event bytes.
+pub fn decode_pumpfun_event(buffer: &[u8]) -> Option<TradeInfoFromToken> {
+    if !matches!(buffer.len(), 266 | 170 | 138) {
+        return None;
+    }
+    fn pk(b: &[u8], o: usize) -> Option<String> {
+        if o + 32 > b.len() { return None; }
+        Some(bs58::encode(&b[o..o + 32]).into_string())
+    }
+    fn u64le(b: &[u8], o: usize) -> Option<u64> {
+        if o + 8 > b.len() { return None; }
+        let mut x = [0u8; 8];
+        x.copy_from_slice(&b[o..o + 8]);
+        Some(u64::from_le_bytes(x))
+    }
+    let mint = pk(buffer, 16)?;
+    let sol_amount = u64le(buffer, 48)?;
+    let token_amount = u64le(buffer, 56)?;
+    let is_buy = buffer.get(64)? == &1;
+    let timestamp = u64le(buffer, 97)?;
+    let virtual_sol_reserves = u64le(buffer, 105)?;
+    let virtual_token_reserves = u64le(buffer, 113)?;
+    let real_sol_reserves = u64le(buffer, 121)?;
+    let creator = pk(buffer, 185)?;
+    let price = if virtual_token_reserves > 0 {
+        virtual_sol_reserves.saturating_mul(1_000_000_000) / virtual_token_reserves
+    } else {
+        0
+    };
+    Some(TradeInfoFromToken {
+        dex_type: DexType::PumpFun,
+        slot: 0,
+        signature: String::new(),
+        pool_id: String::new(),
+        mint,
+        timestamp,
+        is_buy,
+        price,
+        is_reverse_when_pump_swap: false,
+        coin_creator: Some(creator),
+        sol_change: sol_amount as f64 / 1_000_000_000.0,
+        token_change: token_amount as f64 / 1_000_000_000.0,
+        liquidity: real_sol_reserves as f64 / 1_000_000_000.0,
+        virtual_sol_reserves,
+        virtual_token_reserves,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DexType {
     PumpSwap,

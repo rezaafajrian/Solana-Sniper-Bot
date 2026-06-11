@@ -1662,15 +1662,17 @@ async fn send_heartbeat_ping(
     tx.send(ping).await.map_err(|e| format!("ping failed: {:?}", e))
 }
 
-/// Start the momentum sniper: stream every pump.fun trade, score momentum, buy
-/// strength, and manage exits with the scale-out + collapse policy.
-pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), String> {
-    let logger = Logger::new("[MOMENTUM] => ".green().bold().to_string());
-    let cfg = Arc::new(MomentumConfig::from_env());
-    cfg.log(&logger);
+/// Shared startup for both feeds: go-live gate, circuit-breaker/day init,
+/// reputation load, and the background tasks (exit monitor, attribution, GMGN).
+/// Returns the app_state + sniper handles, or an error if the go-live gate blocks.
+async fn momentum_startup(
+    cfg: &Arc<MomentumConfig>,
+    sniper: SniperConfig,
+    logger: &Logger,
+) -> Result<(Arc<AppState>, Arc<SniperConfig>), String> {
+    cfg.log(logger);
 
     // Go-live gate: refuse to trade real money unless explicitly acknowledged.
-    // This prevents an accidental live run before the strategy is validated.
     if !cfg.dry_run && !cfg.live_confirmed {
         let msg = "Refusing to start LIVE: set MOMENTUM_LIVE_CONFIRM=true to trade real money, \
                    or MOMENTUM_DRY_RUN=true to paper-trade. Validate in dry run + analyzer/A-B first.";
@@ -1680,7 +1682,7 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
 
     TRADING_HALTED.store(false, Ordering::SeqCst);
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
-    DAY_INDEX.store(current_day(&cfg), Ordering::SeqCst);
+    DAY_INDEX.store(current_day(cfg), Ordering::SeqCst);
     if let Ok(mut base) = DAY_START_REALIZED.lock() {
         *base = 0.0;
     }
@@ -1689,13 +1691,11 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
     let app_state = Arc::new(sniper.app_state.clone());
     let sniper = Arc::new(sniper);
 
-    // Load persisted wallet reputation so the smart-money edge compounds across runs.
     if cfg.smart_money_enabled {
         load_wallet_rep(&cfg.wallet_rep_file);
         logger.log(format!("🧠 Loaded reputation for {} wallets from {}", WALLET_REP.len(), cfg.wallet_rep_file).cyan().to_string());
     }
 
-    // Exit monitor in the background.
     {
         let app_state = app_state.clone();
         let cfg = cfg.clone();
@@ -1703,13 +1703,11 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
         tokio::spawn(async move { run_exit_monitor(app_state, cfg, logger).await });
     }
 
-    // Smart-money attribution learner in the background.
     if cfg.smart_money_enabled {
         let cfg = cfg.clone();
         tokio::spawn(async move { run_attribution(cfg).await });
     }
 
-    // Optional GMGN integration: rug veto + smart-money / trenches watchlist.
     {
         let gmgn_cfg = GmgnConfig::from_env();
         let client = GmgnClient::new(gmgn_cfg);
@@ -1723,6 +1721,58 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
             logger.log("GMGN integration disabled (set GMGN_ENABLED=true and GMGN_API_KEY)".to_string());
         }
     }
+
+    Ok((app_state, sniper))
+}
+
+/// Momentum sniper over a standard RPC **websocket** (blockSubscribe → pump.fun).
+/// No Yellowstone gRPC needed — runs on a plain wss endpoint (Chainstack/Helius).
+pub async fn start_momentum_ws(sniper: SniperConfig, ws_url: String) -> Result<(), String> {
+    let logger = Logger::new("[MOMENTUM-WS] => ".green().bold().to_string());
+    let cfg = Arc::new(MomentumConfig::from_env());
+    let (_app_state, sniper) = momentum_startup(&cfg, sniper, &logger).await?;
+
+    if ws_url.trim().is_empty() {
+        return Err("RPC_WSS is empty — set it to your websocket endpoint for MOMENTUM_FEED=ws".to_string());
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::library::ws_feed::FeedItem>(10_000);
+    {
+        let logger = logger.clone();
+        tokio::spawn(async move { crate::library::ws_feed::run(ws_url, tx, logger).await });
+    }
+
+    logger.log("🚀 Momentum sniper live (websocket feed) — buying strength.".green().bold().to_string());
+
+    while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
+        match rx.recv().await {
+            Some((parsed, trader)) => {
+                if parsed.mint == WSOL_MINT || parsed.dex_type != DexType::PumpFun {
+                    continue;
+                }
+                let now = now_secs();
+                let signal = ingest_trade(&parsed, trader, now, &cfg);
+                let cfg2 = cfg.clone();
+                let sniper2 = sniper.clone();
+                let logger2 = logger.clone();
+                tokio::spawn(async move { try_enter(parsed, signal, cfg2, sniper2, logger2).await });
+            }
+            None => {
+                logger.log("Websocket feed channel closed".yellow().to_string());
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Start the momentum sniper: stream every pump.fun trade, score momentum, buy
+/// strength, and manage exits with the scale-out + collapse policy.
+pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), String> {
+    let logger = Logger::new("[MOMENTUM] => ".green().bold().to_string());
+    let cfg = Arc::new(MomentumConfig::from_env());
+    let (app_state, sniper) = momentum_startup(&cfg, sniper, &logger).await?;
+    let _ = &app_state;
 
     // Connect to Yellowstone gRPC.
     let mut client = GeyserGrpcClient::build_from_shared(sniper.yellowstone_grpc_http.clone())

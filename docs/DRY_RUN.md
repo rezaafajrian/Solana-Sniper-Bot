@@ -10,16 +10,22 @@ signing) against a live feed, collect `momentum_trades.csv`, and analyze it.
 
 ## 1. What you need
 
-The dry run needs a live **Yellowstone gRPC** feed (NOT a websocket RPC). Options:
+You need a normal Solana **RPC** url (Helius RPC is fine) plus a **data feed**.
+There are two feed options — pick whichever matches what you have:
 
-- **Helius LaserStream** (Yellowstone-compatible): endpoint like
-  `https://laserstream-mainnet-ewr.helius-rpc.com`, x-token = your Helius API key.
-  Requires a **Business plan** for mainnet — check your dashboard.
+### Option A — Websocket feed (`MOMENTUM_FEED=ws`) — no gRPC needed
+Runs on a **standard RPC websocket** via `blockSubscribe`. Works with the
+Chainstack / Helius `wss://...` endpoint you already have (no Business plan).
+Set `RPC_WSS=wss://...`. `blockSubscribe` must be enabled on the node
+(Chainstack dedicated nodes and Helius support it). This is the easiest path.
+
+### Option B — Yellowstone gRPC feed (`MOMENTUM_FEED=grpc`) — fastest
+Lower latency, but needs a gRPC endpoint:
+- **Helius LaserStream**: `https://laserstream-mainnet-ewr.helius-rpc.com`,
+  x-token = your Helius API key. Needs a **Business plan** for mainnet.
 - **Shyft gRPC**: `https://grpc.<region>.shyft.to` + a gRPC token.
 - **Chainstack / Triton dedicated node** with the Yellowstone gRPC add-on (the
-  plain `wss://...` websocket URL will NOT work — gRPC is a separate endpoint).
-
-You also need a normal Solana **RPC** url (Helius RPC is fine).
+  plain `wss://...` URL is NOT gRPC — that's Option A).
 
 ## 2. Build
 
@@ -43,10 +49,18 @@ MOMENTUM_SMART_MONEY=true
 MOMENTUM_LEADER_DUMP_EXIT=true
 GMGN_ENABLED=false
 
-# ---- fill these three ----
+# ---- feed: Option A (websocket, easiest) ----
+MOMENTUM_FEED=ws
+RPC_WSS=YOUR_WEBSOCKET_URL          # e.g. your Chainstack/Helius wss endpoint
 RPC_HTTP=YOUR_SOLANA_RPC_URL
-YELLOWSTONE_GRPC_HTTP=YOUR_YELLOWSTONE_GRPC_ENDPOINT
-YELLOWSTONE_GRPC_TOKEN=YOUR_GRPC_XTOKEN
+# unused with MOMENTUM_FEED=ws, but the loader still requires them to be present:
+YELLOWSTONE_GRPC_HTTP=unused
+YELLOWSTONE_GRPC_TOKEN=unused
+
+# ---- OR feed: Option B (gRPC) — set MOMENTUM_FEED=grpc and fill these instead ----
+# MOMENTUM_FEED=grpc
+# YELLOWSTONE_GRPC_HTTP=YOUR_YELLOWSTONE_GRPC_ENDPOINT
+# YELLOWSTONE_GRPC_TOKEN=YOUR_GRPC_XTOKEN
 
 # ---- throwaway wallet: dry run never signs; DO NOT fund ----
 PRIVATE_KEY=GENERATE_A_BURNER_OR_USE_ANY_VALID_BASE58_KEYPAIR
