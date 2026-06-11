@@ -84,6 +84,9 @@ def main():
     weight_col = None
     min_weight = None
     limit = 1000
+    filter_col = None
+    filter_min = None
+    top = None
     sources = []
     i = 0
     while i < len(args):
@@ -96,6 +99,12 @@ def main():
             weight_col = args[i + 1].lower(); i += 2
         elif a == "--min-weight" and i + 1 < len(args):
             min_weight = float(args[i + 1]); i += 2
+        elif a == "--filter-col" and i + 1 < len(args):
+            filter_col = args[i + 1].lower(); i += 2
+        elif a == "--filter-min" and i + 1 < len(args):
+            filter_min = float(args[i + 1]); i += 2
+        elif a == "--top" and i + 1 < len(args):
+            top = int(args[i + 1]); i += 2
         elif a == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1]); i += 2
         else:
@@ -103,7 +112,8 @@ def main():
 
     if not sources:
         print("usage: dune_api_to_kol.py <query_id|results.json> [...] "
-              "[--api-key KEY] [--label NAME] [--weight-col COL] [--min-weight X] [--limit N]",
+              "[--api-key KEY] [--label NAME] [--weight-col COL] [--min-weight X] "
+              "[--filter-col COL --filter-min X] [--top N] [--limit N]",
               file=sys.stderr)
         sys.exit(1)
 
@@ -121,11 +131,26 @@ def main():
         if not wallet_key:
             print(f"# no wallet column found in {src}", file=sys.stderr)
             continue
+        # Resolve the filter column (e.g. winrate) by name.
+        filter_key = None
+        if filter_col:
+            for k in rows[0].keys():
+                if filter_col in k.lower():
+                    filter_key = k
+                    break
         label = label_override or (src if not src.isdigit() else f"dune{src}")
         for r in rows:
             w = extract_addr(r.get(wallet_key, ""))
             if not w:
                 continue
+            # Win-rate / quality filter.
+            if filter_key is not None and filter_min is not None:
+                try:
+                    fv = float(str(r.get(filter_key, "0")).replace("%", "").replace(",", ""))
+                except (ValueError, TypeError):
+                    fv = 0.0
+                if fv < filter_min:
+                    continue
             weight = 1.0
             if weight_key is not None:
                 try:
@@ -136,6 +161,11 @@ def main():
                 continue
             if w not in seen or weight > seen[w][0]:
                 seen[w] = (weight, label)
+
+    # Keep only the top-N by raw weight (before normalization), if requested.
+    if top is not None and len(seen) > top:
+        kept = sorted(seen.items(), key=lambda kv: kv[1][0], reverse=True)[:top]
+        seen = dict(kept)
 
     if weight_col is not None and seen:
         vals = [w for (w, _) in seen.values()]
