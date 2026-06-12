@@ -4,7 +4,6 @@ use rand::{seq::IteratorRandom, thread_rng};
 use serde_json::{json, Value};
 use anchor_client::solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
 use std::{str::FromStr, sync::LazyLock};
-use bs64;
 
 use crate::common::config::import_env_var;
 
@@ -108,7 +107,7 @@ impl ZeroSlotClient {
             )
         })?;
 
-        let encoded_tx = &bs64::encode(&wire_transaction);
+        let encoded_tx = &base64::encode(&wire_transaction);
 
         for retry in 0..MAX_RETRIES {
             match self.try_send_transaction(encoded_tx).await {
