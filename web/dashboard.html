@@ -124,8 +124,10 @@
       <div id="positions" class="poswrap"><div class="empty">No open positions yet…</div></div>
     </div>
     <div>
+      <h2>★ KOL Leaderboard — keep green, cut red</h2>
+      <div id="board" class="feed" style="max-height:28vh;margin-bottom:14px"><div class="empty">No KOL trades closed yet…</div></div>
       <h2>Trade Feed</h2>
-      <div id="feed" class="feed"><div class="empty">Waiting for activity…</div></div>
+      <div id="feed" class="feed" style="max-height:30vh"><div class="empty">Waiting for activity…</div></div>
     </div>
   </section>
 </div>
@@ -206,6 +208,26 @@ async function tick(){
         </div>
         <div class="pnl ${cls(p.pnl_pct)}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(1)}%</div>
         <div class="pbar">${pnlBar(p.pnl_pct)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // KOL leaderboard
+  const lb=d.kol_leaderboard||[];
+  const bc=$('board');
+  if(!lb.length){ bc.innerHTML='<div class="empty">No KOL trades closed yet…</div>'; }
+  else{
+    bc.innerHTML=lb.map((k,i)=>{
+      const tot=(k.wins||0)+(k.losses||0);
+      const wr=tot?Math.round((k.wins||0)/tot*100):0;
+      const medal=i===0?'🥇':i===1?'🥈':i===2?'🥉':`#${i+1}`;
+      const v=Number(k.realized_sol||0);
+      return `<div class="ev ${v>=0?'buy':'sellf'}">
+        <div class="top">
+          <span><b>${medal}</b> <span class="pill kol">★ ${k.kol}</span></span>
+          <span class="${cls(v)}" style="font-weight:800">${sol(v)}</span>
+        </div>
+        <div class="rsn">${k.wins||0}W / ${k.losses||0}L · ${wr}% win${tot? '':' · open'}</div>
       </div>`;
     }).join('');
   }

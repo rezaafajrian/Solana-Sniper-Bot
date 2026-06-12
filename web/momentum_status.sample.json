@@ -17,5 +17,10 @@
     { "ts": 1749599981, "event": "BUY", "mint": "9RA4V5baQ7pGn8nhzYKScd7v5JcoM8zQrUdGnwtocRie", "reason": "momentum entry [KOL:adam_alpha]", "pnl_sol": 0.0 },
     { "ts": 1749599950, "event": "SELL_FULL", "mint": "FakeMint1111111111111111111111111111111111", "reason": "hard stop -35.0%", "pnl_sol": -0.074 },
     { "ts": 1749599902, "event": "BUY", "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE", "reason": "momentum entry [KOL:couldbebasic]", "pnl_sol": 0.0 }
+  ],
+  "kol_leaderboard": [
+    { "kol": "couldbebasic", "realized_sol": 0.2914, "wins": 4, "losses": 1 },
+    { "kol": "adam_alpha", "realized_sol": 0.0631, "wins": 2, "losses": 2 },
+    { "kol": "whale_07", "realized_sol": -0.1120, "wins": 1, "losses": 5 }
   ]
 }

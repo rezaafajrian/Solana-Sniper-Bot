@@ -426,6 +426,8 @@ lazy_static! {
     /// Recent trade events for the live dashboard feed: (ts, event, mint, reason, pnl_sol).
     static ref RECENT_EVENTS: std::sync::Mutex<VecDeque<(u64, String, String, String, f64)>> =
         std::sync::Mutex::new(VecDeque::with_capacity(64));
+    /// Per-KOL realized PnL leaderboard: label -> (realized_sol, wins, losses).
+    static ref KOL_PNL: DashMap<String, (f64, u32, u32)> = DashMap::new();
     /// Per-wallet reputation learned from observed outcomes (the smart-money edge).
     static ref WALLET_REP: DashMap<String, WalletRep> = DashMap::new();
     /// Pending outcome evaluations for tracked buys, ordered by due time.
@@ -530,6 +532,19 @@ fn maybe_roll_day(cfg: &MomentumConfig, logger: &Logger) {
         "🔄 New trading day — circuit breaker reset{}.",
         if was_halted { " (auto-resumed from halt)" } else { "" },
     ).cyan().bold().to_string());
+}
+
+/// Accumulate realized PnL for the KOL that triggered a position. `is_full`
+/// marks the closing exit, where we tally the win/loss for the whole trade.
+fn record_kol_pnl(label: &str, realized_sol: f64, is_full: bool, trade_realized: f64) {
+    if label.is_empty() {
+        return;
+    }
+    let mut e = KOL_PNL.entry(label.to_string()).or_insert((0.0, 0, 0));
+    e.0 += realized_sol;
+    if is_full {
+        if trade_realized >= 0.0 { e.1 += 1; } else { e.2 += 1; }
+    }
 }
 
 /// Record the outcome of a closed position and evaluate the circuit breaker.
@@ -804,6 +819,13 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
         }
     }
 
+    // Per-KOL leaderboard (best realized PnL first) — keep the green, hunt alts.
+    let mut kol_board: Vec<serde_json::Value> = KOL_PNL.iter().map(|e| {
+        let (realized, wins, losses) = *e.value();
+        serde_json::json!({ "kol": e.key(), "realized_sol": realized, "wins": wins, "losses": losses })
+    }).collect();
+    kol_board.sort_by(|a, b| b["realized_sol"].as_f64().unwrap_or(0.0).partial_cmp(&a["realized_sol"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
     let snap = serde_json::json!({
         "updated": now,
         "mode": if cfg.dry_run { "DRY RUN" } else { "LIVE" },
@@ -834,6 +856,7 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
         },
         "positions": positions,
         "feed": feed,
+        "kol_leaderboard": kol_board,
     });
 
     let tmp = format!("{}.tmp", cfg.status_file);
@@ -1529,6 +1552,9 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         None => return,
     };
 
+    // KOL that triggered this position (for the per-KOL leaderboard).
+    let pos_kol = POSITIONS.get(&mint).map(|p| p.kol_label.clone()).unwrap_or_default();
+
     // Insider/leader-dump signal (read-only) computed before locking the position.
     let leader_sell = {
         let tracked = POSITIONS.get(&mint).map(|p| p.tracked_wallets.clone());
@@ -1669,6 +1695,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
         ).yellow().to_string());
         commit_sell(true);
+        record_kol_pnl(&pos_kol, sim_realized, is_full, sim_realized);
         if is_full {
             record_full_exit(sim_realized, &cfg, &logger);
         }
@@ -1692,6 +1719,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 signature: &sig,
             });
             commit_sell(true);
+            record_kol_pnl(&pos_kol, est_realized_pnl, is_full, est_realized_pnl);
             if is_full {
                 record_full_exit(est_realized_pnl, &cfg, &logger);
             }
