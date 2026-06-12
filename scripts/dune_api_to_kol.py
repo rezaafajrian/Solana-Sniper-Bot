@@ -26,13 +26,52 @@ Options:
 
 import json
 import os
+import re
 import sys
+import time
 import urllib.request
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dune_to_kol import looks_like_addr, extract_addr, WALLET_NAMES  # noqa: E402
 
 WEIGHT_MAX = 3.0
+
+
+def now_unix():
+    return time.time()
+
+
+def parse_ts(v):
+    """Parse a Dune timestamp into unix seconds. Handles ISO strings, plain
+    'YYYY-MM-DD HH:MM:SS[.fff] UTC', and numeric epoch (s or ms)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    # numeric epoch?
+    try:
+        n = float(s)
+        return n / 1000.0 if n > 1e12 else n
+    except ValueError:
+        pass
+    s = s.replace(" UTC", "").replace("Z", "").strip()
+    # normalize "YYYY-MM-DD HH:MM:SS" -> ISO
+    s = s.replace(" ", "T", 1) if (" " in s and "T" not in s) else s
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    # last resort: pull a date
+    m = re.search(r"\d{4}-\d{2}-\d{2}", s)
+    if m:
+        try:
+            return datetime.strptime(m.group(0), "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 def fetch_rows(source, api_key, limit):
@@ -86,6 +125,8 @@ def main():
     limit = 1000
     filter_col = None
     filter_min = None
+    recent_col = None
+    recent_days = None
     top = None
     sources = []
     i = 0
@@ -99,6 +140,10 @@ def main():
             weight_col = args[i + 1].lower(); i += 2
         elif a == "--min-weight" and i + 1 < len(args):
             min_weight = float(args[i + 1]); i += 2
+        elif a == "--recent-col" and i + 1 < len(args):
+            recent_col = args[i + 1].lower(); i += 2
+        elif a == "--recent-days" and i + 1 < len(args):
+            recent_days = float(args[i + 1]); i += 2
         elif a == "--filter-col" and i + 1 < len(args):
             filter_col = args[i + 1].lower(); i += 2
         elif a == "--filter-min" and i + 1 < len(args):
@@ -113,7 +158,7 @@ def main():
     if not sources:
         print("usage: dune_api_to_kol.py <query_id|results.json> [...] "
               "[--api-key KEY] [--label NAME] [--weight-col COL] [--min-weight X] "
-              "[--filter-col COL --filter-min X] [--top N] [--limit N]",
+              "[--filter-col COL --filter-min X] [--recent-col COL --recent-days N] [--top N] [--limit N]",
               file=sys.stderr)
         sys.exit(1)
 
@@ -138,11 +183,24 @@ def main():
                 if filter_col in k.lower():
                     filter_key = k
                     break
+        # Resolve the recency column (e.g. last_swap) by name.
+        recent_key = None
+        if recent_col:
+            for k in rows[0].keys():
+                if recent_col in k.lower():
+                    recent_key = k
+                    break
+        recent_cutoff = (now_unix() - recent_days * 86400) if recent_days is not None else None
         label = label_override or (src if not src.isdigit() else f"dune{src}")
         for r in rows:
             w = extract_addr(r.get(wallet_key, ""))
             if not w:
                 continue
+            # Recency filter: drop wallets whose last activity is older than N days.
+            if recent_key is not None and recent_cutoff is not None:
+                ts = parse_ts(r.get(recent_key))
+                if ts is None or ts < recent_cutoff:
+                    continue
             # Win-rate / quality filter.
             if filter_key is not None and filter_min is not None:
                 try:
