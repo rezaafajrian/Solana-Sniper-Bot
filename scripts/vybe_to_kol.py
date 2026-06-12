@@ -78,7 +78,7 @@ def extract_name(row, default):
 def main():
     a = sys.argv[1:]
     api_key = os.environ.get("VYBE_API_KEY")
-    base = "https://api.vybenetwork.com"; path = "/account/known-accounts"
+    base = "https://api.vybenetwork.xyz"; path = "/account/known-accounts"
     labels = []; limit = 1000; weight = 1.5; src_label = "vybe"; debug = False
     i = 0
     while i < len(a):
