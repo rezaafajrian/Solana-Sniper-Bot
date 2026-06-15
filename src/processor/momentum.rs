@@ -195,6 +195,8 @@ pub struct MomentumConfig {
     pub kol_reload_secs: u64,
     /// Path for the live dashboard status snapshot JSON ("" disables).
     pub status_file: String,
+    /// Transaction landing route: "zeroslot" | "jito" | "multi" (jito+rpc broadcast).
+    pub landing: String,
 
     // ---- Discipline: session circuit breaker + go-live gate ----
     /// Halt NEW entries once session realized PnL drops to -this many SOL.
@@ -298,6 +300,7 @@ impl MomentumConfig {
             kol_require: std::env::var("MOMENTUM_KOL_REQUIRE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
             status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
+            landing: std::env::var("MOMENTUM_LANDING").unwrap_or_else(|_| "zeroslot".to_string()).to_lowercase(),
 
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
@@ -336,8 +339,8 @@ impl MomentumConfig {
             if self.conviction_sizing { "on" } else { "off" }, self.conviction_max_mult,
         ));
         logger.log(format!(
-            "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}%",
-            self.max_deployed_sol, self.buy_cost_fraction * 100.0,
+            "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}% | landing: {}",
+            self.max_deployed_sol, self.buy_cost_fraction * 100.0, self.landing,
         ));
         logger.log(format!(
             "Discipline: breaker at -{:.3} SOL daily loss or {} consecutive losses | {}{}",
@@ -1516,14 +1519,17 @@ async fn momentum_sell(
         .await
         .ok_or_else(|| "no recent blockhash".to_string())?;
 
-    let sigs = crate::block_engine::tx::new_signed_and_send_zeroslot(
-        app_state.zeroslot_rpc_client.clone(),
-        blockhash,
-        &keypair,
-        instructions,
-        logger,
-    )
-    .await
+    let sigs = match cfg.landing.as_str() {
+        "jito" => crate::block_engine::tx::new_signed_and_send_jito(
+            blockhash, &keypair, instructions, logger,
+        ).await,
+        "multi" => crate::block_engine::tx::new_signed_and_send_multi(
+            &app_state, blockhash, &keypair, instructions, logger,
+        ).await,
+        _ => crate::block_engine::tx::new_signed_and_send_zeroslot(
+            app_state.zeroslot_rpc_client.clone(), blockhash, &keypair, instructions, logger,
+        ).await,
+    }
     .map_err(|e| format!("send sell failed: {}", e))?;
 
     let signature = sigs.first().cloned().unwrap_or_default();

@@ -238,3 +238,106 @@ pub async fn new_signed_and_send_with_landing_mode(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Jito bundle landing + safe multi-route broadcast
+// ---------------------------------------------------------------------------
+
+/// Public Jito tip accounts (rotate to spread load).
+pub const JITO_TIP_ACCOUNTS: [&str; 8] = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
+
+fn jito_block_engine_url() -> String {
+    env::var("JITO_BLOCK_ENGINE")
+        .unwrap_or_else(|_| "https://mainnet.block-engine.jito.wtf/api/v1/bundles".to_string())
+}
+
+fn jito_tip_lamports() -> u64 {
+    let sol = env::var("JITO_TIP_VALUE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.001);
+    (sol * 1_000_000_000.0) as u64
+}
+
+fn pick_jito_tip_account() -> Pubkey {
+    let idx = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as usize) % JITO_TIP_ACCOUNTS.len();
+    Pubkey::from_str(JITO_TIP_ACCOUNTS[idx]).expect("valid jito tip account")
+}
+
+/// POST a base58-encoded signed transaction to the Jito block engine as a bundle.
+async fn submit_jito_bundle(tx_b58: &str, logger: &Logger) -> Result<()> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "sendBundle", "params": [[tx_b58]]
+    });
+    let client = Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_else(|_| Client::new());
+    let resp = client.post(jito_block_engine_url()).json(&body).send().await
+        .map_err(|e| anyhow!("jito send failed: {}", e))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() || text.contains("\"error\"") {
+        return Err(anyhow!("jito bundle rejected ({}): {}", status, text));
+    }
+    logger.log(format!("Jito bundle accepted: {}", text).green().to_string());
+    Ok(())
+}
+
+/// Land a transaction via a Jito bundle (adds a Jito tip instruction).
+pub async fn new_signed_and_send_jito(
+    recent_blockhash: anchor_client::solana_sdk::hash::Hash,
+    keypair: &Keypair,
+    mut instructions: Vec<Instruction>,
+    logger: &Logger,
+) -> Result<Vec<String>> {
+    let start = Instant::now();
+    instructions.push(system_instruction::transfer(&keypair.pubkey(), &pick_jito_tip_account(), jito_tip_lamports()));
+    let txn = Transaction::new_signed_with_payer(&instructions, Some(&keypair.pubkey()), &vec![keypair], recent_blockhash);
+    let sig = txn.signatures.first().map(|s| s.to_string()).unwrap_or_default();
+    let wire = bincode::serialize(&txn).map_err(|e| anyhow!("serialize: {}", e))?;
+    let b58 = bs58::encode(&wire).into_string();
+    submit_jito_bundle(&b58, logger).await?;
+    logger.log(format!("[TXN-ELAPSED(JITO)]: {:?}", start.elapsed()).yellow().to_string());
+    Ok(vec![sig])
+}
+
+/// SAFE multi-route: build ONE Jito-tipped transaction and broadcast the *same*
+/// signed bytes to both the Jito block engine and the normal RPC concurrently.
+/// Because both carry the identical signature, at most one can execute — no
+/// risk of double-buying — but two independent paths maximize the chance one lands.
+pub async fn new_signed_and_send_multi(
+    app_state: &crate::common::config::AppState,
+    recent_blockhash: anchor_client::solana_sdk::hash::Hash,
+    keypair: &Keypair,
+    mut instructions: Vec<Instruction>,
+    logger: &Logger,
+) -> Result<Vec<String>> {
+    let start = Instant::now();
+    instructions.push(system_instruction::transfer(&keypair.pubkey(), &pick_jito_tip_account(), jito_tip_lamports()));
+    let txn = Transaction::new_signed_with_payer(&instructions, Some(&keypair.pubkey()), &vec![keypair], recent_blockhash);
+    let sig = txn.signatures.first().map(|s| s.to_string()).unwrap_or_default();
+    let wire = bincode::serialize(&txn).map_err(|e| anyhow!("serialize: {}", e))?;
+    let b58 = bs58::encode(&wire).into_string();
+
+    let jito = submit_jito_bundle(&b58, logger);
+    let rpc = app_state.rpc_nonblocking_client.send_transaction(&txn);
+    let (jito_res, rpc_res) = tokio::join!(jito, rpc);
+
+    let jito_ok = jito_res.is_ok();
+    let rpc_ok = rpc_res.is_ok();
+    if jito_ok || rpc_ok {
+        logger.log(format!(
+            "[TXN-ELAPSED(MULTI)]: {:?} | jito={} rpc={}", start.elapsed(), jito_ok, rpc_ok
+        ).yellow().to_string());
+        Ok(vec![sig])
+    } else {
+        Err(anyhow!("multi-route failed: jito={:?} rpc={:?}", jito_res.err(), rpc_res.err()))
+    }
+}
