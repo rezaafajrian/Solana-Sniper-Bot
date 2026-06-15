@@ -197,6 +197,10 @@ pub struct MomentumConfig {
     pub status_file: String,
     /// Transaction landing route: "zeroslot" | "jito" | "multi" (jito+rpc broadcast).
     pub landing: String,
+    /// Exit a held token when its real SOL reserves reach this (bonding curve is
+    /// about to complete/migrate to Raydium/PumpSwap, after which our bonding-curve
+    /// pricing no longer applies). pump.fun graduates around ~85 SOL. 0 disables.
+    pub migration_exit_sol: f64,
 
     // ---- Discipline: session circuit breaker + go-live gate ----
     /// Halt NEW entries once session realized PnL drops to -this many SOL.
@@ -301,6 +305,7 @@ impl MomentumConfig {
             kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
             status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
             landing: std::env::var("MOMENTUM_LANDING").unwrap_or_else(|_| "zeroslot".to_string()).to_lowercase(),
+            migration_exit_sol: env_f64("MOMENTUM_MIGRATION_EXIT_SOL", 82.0),
 
             daily_loss_limit_sol: env_f64("MOMENTUM_DAILY_LOSS_LIMIT_SOL", 0.3),
             max_consecutive_losses: env_u64("MOMENTUM_MAX_CONSECUTIVE_LOSSES", 6) as u32,
@@ -1394,21 +1399,20 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         None => "momentum entry".to_string(),
     };
 
-    let result: Result<(), String> = if cfg.dry_run {
-        // Paper trade: assume the buy fills at the current market cap.
-        Ok(())
+    // Live buy via the configured landing route (zeroslot | jito | multi), the
+    // same fast path the sells use. Returns the tx signature for reconciliation.
+    let result: Result<Option<String>, String> = if cfg.dry_run {
+        Ok(None)
     } else {
-        // Live buy via the configured landing route (zeroslot | jito | multi),
-        // the same fast path the sells use.
         momentum_buy(&parsed, entry_size, Arc::new(sniper.app_state.clone()), &cfg, &logger)
             .await
-            .map(|_| ())
+            .map(Some)
     };
 
     IN_FLIGHT_BUYS.fetch_sub(1, Ordering::SeqCst);
 
     match result {
-        Ok(_) => {
+        Ok(buy_sig) => {
             POSITIONS.insert(mint.clone(), MomentumPosition {
                 entry_mcap: signal.current_mcap,
                 entry_size_sol: entry_size,
@@ -1436,11 +1440,51 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             });
             let tag = if cfg.dry_run { "📝 [DRY] Entered" } else { "✅ Bought" };
             logger.log(format!("{} {} at mcap {:.2} SOL", tag, mint, signal.current_mcap).green().to_string());
+
+            // Exact buy reconciliation: read the true SOL spent from the buy tx and
+            // correct the position's cost basis so realized PnL is exact on both legs.
+            if let Some(sig) = buy_sig {
+                spawn_buy_reconcile(Arc::new(sniper.app_state.clone()), mint.clone(), sig, cost_basis_sol, signal.current_mcap, signal.score);
+            }
         }
         Err(e) => {
             logger.log(format!("❌ Buy failed for {}: {}", mint, e).red().to_string());
         }
     }
+}
+
+/// Read the true on-chain SOL spent on a buy and correct the position's cost
+/// basis (the buy leg of exact PnL). Best-effort, in the background.
+#[allow(clippy::too_many_arguments)]
+fn spawn_buy_reconcile(app_state: Arc<AppState>, mint: String, signature: String, est_cost: f64, entry_mcap: f64, score: f64) {
+    if signature.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Some(delta) = fetch_actual_sol_delta(&app_state, &signature).await {
+            // A buy spends SOL -> wallet delta is negative; actual cost = -delta.
+            let actual_cost = (-delta).max(0.0);
+            if actual_cost <= 0.0 {
+                return;
+            }
+            if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                p.cost_basis_sol = actual_cost;
+            }
+            log_trade_event(&TradeLogEvent {
+                event: "BUY_ACTUAL",
+                mint: &mint,
+                reason: "on-chain buy cost",
+                score,
+                entry_mcap,
+                current_mcap: entry_mcap,
+                pnl_pct: 0.0,
+                fraction_of_original: 1.0,
+                est_sol: -actual_cost,
+                est_realized_pnl_sol: est_cost - actual_cost, // estimate error (info only)
+                signature: &signature,
+            });
+        }
+    });
 }
 
 /// Buy `amount_sol` of a pump.fun token, landing via the configured route
@@ -1600,6 +1644,11 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     // KOL that triggered this position (for the per-KOL leaderboard).
     let pos_kol = POSITIONS.get(&mint).map(|p| p.kol_label.clone()).unwrap_or_default();
 
+    // Real SOL reserves in the bonding curve (the `liquidity` field). When it nears
+    // the graduation threshold the token is about to migrate, after which our
+    // bonding-curve mcap is no longer valid — so we exit rather than hold blind.
+    let curve_sol = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+
     // Insider/leader-dump signal (read-only) computed before locking the position.
     let leader_sell = {
         let tracked = POSITIONS.get(&mint).map(|p| p.tracked_wallets.clone());
@@ -1631,8 +1680,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         let entry_size_sol = pos.entry_size_sol;
         let cost_basis_sol = pos.cost_basis_sol;
 
-        // 0. Insider/leader distribution -> exit immediately, ahead of everything.
-        if cfg.leader_dump_exit_enabled && leader_sell >= cfg.leader_dump_sol {
+        // 0a. Migration imminent -> exit before bonding-curve pricing goes invalid.
+        if cfg.migration_exit_sol > 0.0 && curve_sol >= cfg.migration_exit_sol {
+            pos.selling = true;
+            Decision::full(pos.remaining_fraction, format!("migration imminent ({:.1} SOL in curve, pnl {:.1}%)", curve_sol, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
+        }
+        // 0b. Insider/leader distribution -> exit immediately, ahead of everything.
+        else if cfg.leader_dump_exit_enabled && leader_sell >= cfg.leader_dump_sol {
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
