@@ -68,20 +68,46 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                 }
                 logger.log("📡 Websocket feed connected (blockSubscribe → pump.fun)".green().to_string());
 
+                let mut msg_count: u64 = 0;
+                let mut event_count: u64 = 0;
+                let mut logged_first = false;
+                let mut last_report = std::time::Instant::now();
+
                 while let Some(msg) = stream.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
+                            msg_count += 1;
+                            // Log the FIRST message verbatim — it's the subscribe ack
+                            // (or an error), which tells us instantly if blockSubscribe
+                            // was accepted.
+                            if !logged_first {
+                                logged_first = true;
+                                let head: String = text.chars().take(400).collect();
+                                logger.log(format!("ws first message: {}", head).cyan().to_string());
+                            }
                             if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                                forward_block(&v, &tx).await;
+                                event_count += forward_block(&v, &tx).await as u64;
                                 if tx.is_closed() {
                                     return;
                                 }
+                            }
+                            // Heartbeat every ~30s so we can see msgs-in vs events-out.
+                            if last_report.elapsed().as_secs() >= 30 {
+                                last_report = std::time::Instant::now();
+                                logger.log(format!("ws: {} msgs received, {} pump.fun events parsed", msg_count, event_count).cyan().to_string());
                             }
                         }
                         Ok(Message::Ping(p)) => {
                             let _ = stream.send(Message::Pong(p)).await;
                         }
-                        Ok(Message::Close(_)) | Err(_) => break,
+                        Ok(Message::Close(c)) => {
+                            logger.log(format!("ws: server closed: {:?}", c).yellow().to_string());
+                            break;
+                        }
+                        Err(e) => {
+                            logger.log(format!("ws: stream error: {}", e).red().to_string());
+                            break;
+                        }
                         _ => {}
                     }
                 }
@@ -97,7 +123,8 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
 }
 
 /// Pull pump.fun trades out of a blockNotification value and forward them.
-async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) {
+/// Returns the number of events forwarded.
+async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
     // blockNotification: params.result.value.block.transactions[]
     let txns = match v
         .get("params")
@@ -108,9 +135,10 @@ async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) {
         .and_then(|t| t.as_array())
     {
         Some(arr) => arr,
-        None => return,
+        None => return 0,
     };
 
+    let mut forwarded = 0usize;
     for txn in txns {
         // Fee payer = first account key (the trader).
         let signer = txn
@@ -146,10 +174,12 @@ async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) {
                 }
                 if let Some(parsed) = decode_pumpfun_event(&bytes) {
                     if tx.send((parsed, signer.clone())).await.is_err() {
-                        return;
+                        return forwarded;
                     }
+                    forwarded += 1;
                 }
             }
         }
     }
+    forwarded
 }
