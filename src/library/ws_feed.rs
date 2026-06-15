@@ -145,25 +145,47 @@ fn log_block_shape(v: &Value, logger: &Logger) {
     let block = v.pointer("/params/result/value/block");
     logger.log(format!("shape: .block keys = {}", keys(block)).cyan().to_string());
     let txns = v.pointer("/params/result/value/block/transactions").and_then(|t| t.as_array());
-    match txns {
-        Some(arr) => {
-            logger.log(format!("shape: block.transactions len = {}", arr.len()).cyan().to_string());
-            if let Some(t0) = arr.first() {
-                logger.log(format!("shape: tx[0] keys = {}", keys(Some(t0))).cyan().to_string());
-                logger.log(format!("shape: tx[0].transaction = {}", keys(t0.get("transaction"))).cyan().to_string());
-                logger.log(format!("shape: tx[0].meta keys = {}", keys(t0.get("meta"))).cyan().to_string());
-                logger.log(format!("shape: tx[0].meta.innerInstructions = {}", keys(t0.pointer("/meta/innerInstructions"))).cyan().to_string());
-                // dump a small slice of tx[0] for the exact field names
-                let raw = serde_json::to_string(t0).unwrap_or_default();
-                logger.log(format!("shape: tx[0] head = {}", raw.chars().take(700).collect::<String>()).cyan().to_string());
-            }
-        }
+    let arr = match txns {
+        Some(a) => a,
         None => {
-            // transactions not where we expect — dump the value head to relocate it
             let raw = serde_json::to_string(value.unwrap_or(v)).unwrap_or_default();
             logger.log(format!("shape: value head = {}", raw.chars().take(700).collect::<String>()).cyan().to_string());
+            return;
         }
+    };
+    logger.log(format!("shape: block.transactions len = {}", arr.len()).cyan().to_string());
+
+    // Find the first SUCCESSFUL tx with non-empty inner instructions and dump its
+    // inner-instruction data fields + decoded byte lengths (that's where the
+    // pump.fun trade event lives), plus any "Program data:" log lines.
+    for (i, t) in arr.iter().enumerate() {
+        let failed = t.pointer("/meta/err").map(|e| !e.is_null()).unwrap_or(false);
+        let inner = t.pointer("/meta/innerInstructions").and_then(|x| x.as_array());
+        let has_inner = inner.map(|a| !a.is_empty()).unwrap_or(false);
+        if failed || !has_inner {
+            continue;
+        }
+        logger.log(format!("shape: first success tx with inner = idx {}", i).cyan().to_string());
+        if let Some(groups) = inner {
+            for grp in groups.iter().take(2) {
+                if let Some(ixs) = grp.get("instructions").and_then(|x| x.as_array()) {
+                    for ix in ixs.iter().take(6) {
+                        let d = ix.get("data").and_then(|x| x.as_str()).unwrap_or("");
+                        let b58 = bs58::decode(d).into_vec().map(|b| b.len()).unwrap_or(0);
+                        logger.log(format!("shape: inner ix data_head={} b58_len={}", d.chars().take(24).collect::<String>(), b58).cyan().to_string());
+                    }
+                }
+            }
+        }
+        // Program data logs (alternative event source)
+        if let Some(logs) = t.pointer("/meta/logMessages").and_then(|x| x.as_array()) {
+            for l in logs.iter().filter_map(|x| x.as_str()).filter(|s| s.contains("Program data:")).take(2) {
+                logger.log(format!("shape: {}", l.chars().take(80).collect::<String>()).cyan().to_string());
+            }
+        }
+        return;
     }
+    logger.log("shape: no successful tx with inner instructions in this block".yellow().to_string());
 }
 
 /// Pull pump.fun trades out of a blockNotification value and forward them.
