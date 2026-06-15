@@ -32,7 +32,6 @@ use colored::Colorize;
 use tokio::time;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use solana_sdk::signer::keypair::Keypair;
 use futures_util::stream::StreamExt;
 use futures_util::{SinkExt, Sink};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
@@ -46,17 +45,12 @@ use crate::common::{
     config::{Config, AppState, SwapConfig},
     logger::Logger,
     cache::WALLET_TOKEN_ACCOUNTS,
-    constants::WHALE_SELLING_AMOUNT_FOR_SELLING_TRIGGER,
 };
 use crate::processor::swap::{SwapDirection, SwapProtocol, SwapInType};
-use crate::processor::transaction_parser::{DexType, TradeInfoFromToken};
-use crate::processor::selling_strategy::{TokenTrackingInfo as SellingTokenTrackingInfo, TokenMetrics};
-use crate::processor::transaction_retry;
 use dashmap::DashMap;
 use crate::dex::pump_fun::PUMP_FUN_PROGRAM;
 use crate::dex::pump_swap::PUMP_SWAP_PROGRAM;
 use crate::dex::raydium_launchpad::RAYDIUM_LAUNCHPAD_PROGRAM;
-use chrono::Timelike;
 
 // Enum for different selling actions
 #[derive(Debug, Clone)]
@@ -347,7 +341,7 @@ async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<()
 }
 
 /// Check if all tokens are sold and stop GRPC streaming to prevent connection accumulation
-pub async fn check_and_stop_streaming_if_all_sold(logger: &Logger) {
+pub async fn check_and_stop_streaming_if_all_sold(_logger: &Logger) {
     let active_tokens_count = BOUGHT_TOKEN_LIST.len();
     let active_monitoring_count = MONITORING_TASKS.len();
     let active_tracking_count = TOKEN_TRACKING.len();
@@ -2223,7 +2217,7 @@ pub async fn execute_sell(
                 logger.log("Using PumpFun protocol for sell".to_string());
                 
                 // Create the PumpFun instance
-                let pump = crate::dex::pump_fun::Pump::new(
+                let _pump = crate::dex::pump_fun::Pump::new(
                     app_state.rpc_nonblocking_client.clone(),
                     app_state.rpc_client.clone(),
                     app_state.wallet.clone(),
@@ -2284,7 +2278,7 @@ pub async fn execute_sell(
                 logger.log("Using PumpSwap protocol for sell".to_string());
                 
                 // Create the PumpSwap instance
-                let pump_swap = crate::dex::pump_swap::PumpSwap::new(
+                let _pump_swap = crate::dex::pump_swap::PumpSwap::new(
                     app_state.wallet.clone(),
                     Some(app_state.rpc_client.clone()),
                     Some(app_state.rpc_nonblocking_client.clone()),
@@ -2343,7 +2337,7 @@ pub async fn execute_sell(
             SwapProtocol::RaydiumLaunchpad => {
                 logger.log("Using Raydium protocol for sell".to_string());
                 
-                let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                let _raydium = crate::dex::raydium_launchpad::Raydium::new(
                     app_state.wallet.clone(),
                     Some(app_state.rpc_client.clone()),
                     Some(app_state.rpc_nonblocking_client.clone()),
@@ -2398,7 +2392,7 @@ pub async fn execute_sell(
             SwapProtocol::Auto | SwapProtocol::Unknown => {
                 logger.log("Auto/Unknown protocol detected, defaulting to PumpFun for sell".yellow().to_string());
                 
-                let pump = crate::dex::pump_fun::Pump::new(
+                let _pump = crate::dex::pump_fun::Pump::new(
                     app_state.rpc_nonblocking_client.clone(),
                     app_state.rpc_client.clone(),
                     app_state.wallet.clone(),
@@ -2468,7 +2462,7 @@ pub async fn execute_sell(
             };
             logger.log(format!("Total sold: {}", sold_count));
             
-            let bought_count = BOUGHT_TOKENS.get(&()).map(|r| *r).unwrap_or(0);
+            let _bought_count = BOUGHT_TOKENS.get(&()).map(|r| *r).unwrap_or(0);
             let _active_tokens: Vec<String> = TOKEN_TRACKING.iter().map(|entry| entry.key().clone()).collect();
             
             // Note: Keeping token account in WALLET_TOKEN_ACCOUNTS for potential future use
@@ -2624,10 +2618,10 @@ async fn handle_sniper_bot_logic(
     txn: &SubscribeUpdateTransaction,
     logger: &Logger,
 ) -> Result<(), String> {
-    let instruction_type = parsed_data.dex_type.clone();
+    let _instruction_type = parsed_data.dex_type.clone();
     
     // Extract signer from transaction to identify target wallet
-    if let Some(ref target_signature) = target_signature {
+    if let Some(_target_signature) = target_signature {
         // Extract the actual signer from the transaction
         if let Some(signer) = extract_signer_from_transaction(txn) {
             // Check if this transaction is from one of our target wallets
@@ -2711,7 +2705,7 @@ async fn handle_target_wallet_buy(
 }
 
 /// SNIPER BOT: Check and increment trade count, remove token if limit reached
-fn check_and_increment_trade_count(mint: &str, logger: &Logger) -> bool {
+fn check_and_increment_trade_count(mint: &str, _logger: &Logger) -> bool {
     if let Some(mut focus_info) = FOCUS_TOKEN_LIST.get_mut(mint) {
         focus_info.total_trades += 1;
         
@@ -2758,7 +2752,7 @@ async fn handle_target_wallet_sell(
             drop(config);
             
             match selling_engine.unified_emergency_sell(&mint_clone, false, None, None).await {
-                Ok(signature) => {
+                Ok(_signature) => {
                     // Update focus token sell count and check trade limit
                     if let Some(mut focus_info) = FOCUS_TOKEN_LIST.get_mut(&mint_clone) {
                         focus_info.sell_count += 1;
@@ -2879,8 +2873,8 @@ async fn start_price_monitoring(
     
     // Spawn monitoring task
     let mint_clone = mint.clone();
-    let config_clone = config.clone();
-    let logger_clone = logger.clone();
+    let _config_clone = config.clone();
+    let _logger_clone = logger.clone();
     
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5)); // Check every 5 seconds
@@ -3017,7 +3011,7 @@ async fn handle_parsed_data_for_selling(
     let mint = parsed_data.mint.clone();
     
     // TARGET WALLET SELL DETECTION - Check if this sell is from one of our target wallets
-    if let Some(ref target_signature) = target_signature {
+    if let Some(_target_signature) = target_signature {
         // Extract signer from the target signature - this represents the target wallet that made the transaction
         if let Some(signer) = extract_signer_from_transaction(&txn) {
             // Check if the signer is in our target wallet list
@@ -3028,7 +3022,7 @@ async fn handle_parsed_data_for_selling(
                 ).purple().bold().to_string());
                 
                 // Check if we own this token
-                if let Some(mut token_info) = BOUGHT_TOKEN_LIST.get_mut(&parsed_data.mint) {
+                if let Some(_token_info) = BOUGHT_TOKEN_LIST.get_mut(&parsed_data.mint) {
                     logger.log(format!(
                         "🚨 We own token {} that target wallet is selling - executing IMMEDIATE COPY SELL",
                         parsed_data.mint
@@ -3091,7 +3085,7 @@ async fn handle_parsed_data_for_selling(
             ).red().bold().to_string());
             
             // Check if we own this token
-            if let Some(mut token_info) = BOUGHT_TOKEN_LIST.get_mut(&parsed_data.mint) {
+            if let Some(_token_info) = BOUGHT_TOKEN_LIST.get_mut(&parsed_data.mint) {
                 logger.log(format!(
                     "🚨 We own token {} that whale is selling - executing EMERGENCY SELL via zeroslot",
                     parsed_data.mint

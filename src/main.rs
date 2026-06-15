@@ -290,7 +290,7 @@ async fn sell_all_tokens(config: &Config) -> Result<(), String> {
     logger.log(format!("💱 Starting to sell {} tokens", tokens_to_sell.len()));
     
     // Sell each token using Jupiter API
-    for (mint, amount, decimals) in tokens_to_sell {
+    for (mint, amount, _decimals) in tokens_to_sell {
         logger.log(format!("💱 Selling token: {}", mint).cyan().to_string());
         
         // First get the quote to show detailed information

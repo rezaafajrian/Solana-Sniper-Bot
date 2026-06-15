@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use colored::Colorize;
-use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
 use anchor_client::solana_sdk::{
     instruction::Instruction,
     signature::Keypair,
@@ -13,11 +12,8 @@ use std::env;
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use spl_token::ui_amount_to_amount;
 use solana_sdk::signature::Signer;
-use tokio::time::{Instant, sleep};
-use tokio::sync::Mutex;
-use once_cell::sync::Lazy;
-use reqwest::{Client, ClientBuilder};
-use base64;
+use tokio::time::Instant;
+use reqwest::Client;
 use bs58;
 use std::time::Duration;
 use crate::{
@@ -25,11 +21,8 @@ use crate::{
         logger::Logger,
         config::TransactionLandingMode,
     },
-    library::{
-        zeroslot::{self, ZeroSlotClient},
-    },
+    library::zeroslot::{self},
 };
-use dotenv::dotenv;
 
 // prioritization fee = UNIT_PRICE * UNIT_LIMIT
 fn get_unit_price() -> u64 {
@@ -105,9 +98,9 @@ pub async fn new_signed_and_send_zeroslot(
 
 
 pub async fn new_signed_and_send_zeroslot_fast(
-    compute_unit_limit: u32,
-    compute_unit_price: u64,
-    tip_lamports: u64,
+    _compute_unit_limit: u32,
+    _compute_unit_price: u64,
+    _tip_lamports: u64,
     zeroslot_rpc_client: Arc<crate::library::zeroslot::ZeroSlotClient>,
     recent_blockhash: solana_sdk::hash::Hash,
     keypair: &Keypair,
@@ -168,7 +161,7 @@ pub async fn new_signed_and_send_normal(
     rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
     recent_blockhash: anchor_client::solana_sdk::hash::Hash,
     keypair: &Keypair,
-    mut instructions: Vec<Instruction>,
+    instructions: Vec<Instruction>,
     logger: &Logger,
 ) -> Result<Vec<String>> {
     let start_time = Instant::now();

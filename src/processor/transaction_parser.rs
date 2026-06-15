@@ -1,13 +1,10 @@
 use bs58;
-use std::str::FromStr;
-use solana_sdk::pubkey::Pubkey;
 use colored::Colorize;
 use crate::common::logger::Logger;
 use lazy_static;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction;
 use std::time::Instant;
 // Import PUMP_FUN_PROGRAM instead of PUMP_PROGRAM
-use crate::dex::pump_fun::PUMP_FUN_PROGRAM;
 // Create a static logger for this module
 lazy_static::lazy_static! {
     static ref LOGGER: Logger = Logger::new("[PARSER] => ".blue().to_string());
@@ -164,7 +161,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
     ) -> String {
         
         let mut mint = String::new();
-        let mut is_reverse = false;
+        let _is_reverse = false;
         
         // Try to extract from token balances if txn is available
         if let Some(tx_inner) = &txn.transaction {
@@ -202,7 +199,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
     // NOTE: MintTo checking has been removed - we now process all transactions
     let _has_mint_to = _has_mint_to_instruction(txn);
     
-    let start_time = Instant::now();
+    let _start_time = Instant::now();
     match buffer.len() {
 
         368 => {  // pump swap transaction - 368 bytes
@@ -210,18 +207,18 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             let mint = extract_token_info(&txn);
             let timestamp = parse_u64(buffer, 16)?;
             let base_amount_in_or_base_amount_out = parse_u64(buffer, 24)?;
-            let min_quote_amount_out = parse_u64(buffer, 32)?;
-            let user_base_token_reserves = parse_u64(buffer, 40)?;
-            let user_quote_token_reserves = parse_u64(buffer, 48)?;
+            let _min_quote_amount_out = parse_u64(buffer, 32)?;
+            let _user_base_token_reserves = parse_u64(buffer, 40)?;
+            let _user_quote_token_reserves = parse_u64(buffer, 48)?;
             let pool_base_token_reserves = parse_u64(buffer, 56)?;
             let pool_quote_token_reserves = parse_u64(buffer, 64)?;
             let quote_amount_out = parse_u64(buffer, 72)?;
-            let lp_fee_basis_points = parse_u64(buffer, 80)?;
-            let lp_fee = parse_u64(buffer, 88)?;
-            let protocol_fee_basis_points = parse_u64(buffer, 96)?;
-            let protocol_fee = parse_u64(buffer, 104)?;
-            let quote_amount_out_without_lp_fee = parse_u64(buffer, 112)?;
-            let user_quote_amount_out = parse_u64(buffer, 120)?;
+            let _lp_fee_basis_points = parse_u64(buffer, 80)?;
+            let _lp_fee = parse_u64(buffer, 88)?;
+            let _protocol_fee_basis_points = parse_u64(buffer, 96)?;
+            let _protocol_fee = parse_u64(buffer, 104)?;
+            let _quote_amount_out_without_lp_fee = parse_u64(buffer, 112)?;
+            let _user_quote_amount_out = parse_u64(buffer, 120)?;
             let pool_id = parse_public_key(buffer, 128)?;
             let coin_creator = parse_public_key(buffer, 320)?;
             
@@ -313,18 +310,18 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             let mint = extract_token_info(&txn);
             let timestamp = parse_u64(buffer, 16)?;
             let base_amount_in_or_base_amount_out = parse_u64(buffer, 24)?;
-            let min_quote_amount_out = parse_u64(buffer, 32)?;
-            let user_base_token_reserves = parse_u64(buffer, 40)?;
-            let user_quote_token_reserves = parse_u64(buffer, 48)?;
+            let _min_quote_amount_out = parse_u64(buffer, 32)?;
+            let _user_base_token_reserves = parse_u64(buffer, 40)?;
+            let _user_quote_token_reserves = parse_u64(buffer, 48)?;
             let pool_base_token_reserves = parse_u64(buffer, 56)?;
             let pool_quote_token_reserves = parse_u64(buffer, 64)?;
             let quote_amount_out = parse_u64(buffer, 72)?;
-            let lp_fee_basis_points = parse_u64(buffer, 80)?;
-            let lp_fee = parse_u64(buffer, 88)?;
-            let protocol_fee_basis_points = parse_u64(buffer, 96)?;
-            let protocol_fee = parse_u64(buffer, 104)?;
-            let quote_amount_out_without_lp_fee = parse_u64(buffer, 112)?;
-            let user_quote_amount_out = parse_u64(buffer, 120)?;
+            let _lp_fee_basis_points = parse_u64(buffer, 80)?;
+            let _lp_fee = parse_u64(buffer, 88)?;
+            let _protocol_fee_basis_points = parse_u64(buffer, 96)?;
+            let _protocol_fee = parse_u64(buffer, 104)?;
+            let _quote_amount_out_without_lp_fee = parse_u64(buffer, 112)?;
+            let _user_quote_amount_out = parse_u64(buffer, 120)?;
             let pool_id = parse_public_key(buffer, 128)?;
             
             // Determine if this is a reverse case by checking if the mint is WSOL
@@ -414,7 +411,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             let virtual_sol_reserves = parse_u64(buffer, 105)?;
             let virtual_token_reserves = parse_u64(buffer, 113)?;
             let real_sol_reserves = parse_u64(buffer, 121)?;
-            let real_token_reserves = parse_u64(buffer, 129)?;
+            let _real_token_reserves = parse_u64(buffer, 129)?;
             let creator = parse_public_key(buffer, 185)?;
             // Calculate price for PumpFun: virtualSolReserves/virtualTokenReserves
             let price = if virtual_token_reserves > 0 {
@@ -468,7 +465,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             let virtual_sol_reserves = parse_u64(buffer, 105)?;
             let virtual_token_reserves = parse_u64(buffer, 113)?;
             let real_sol_reserves = parse_u64(buffer, 121)?;
-            let real_token_reserves = parse_u64(buffer, 129)?;
+            let _real_token_reserves = parse_u64(buffer, 129)?;
             let creator = parse_public_key(buffer, 185)?;
             // Calculate price for PumpFun: virtualSolReserves/virtualTokenReserves
             let price = if virtual_token_reserves > 0 {
@@ -522,7 +519,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             let virtual_sol_reserves = parse_u64(buffer, 105)?;
             let virtual_token_reserves = parse_u64(buffer, 113)?;
             let real_sol_reserves = parse_u64(buffer, 121)?;
-            let real_token_reserves = parse_u64(buffer, 129)?;
+            let _real_token_reserves = parse_u64(buffer, 129)?;
             let creator = parse_public_key(buffer, 185)?;
             // Calculate price for PumpFun: virtualSolReserves/virtualTokenReserves
             let price = if virtual_token_reserves > 0 {
@@ -581,7 +578,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             
             // For Raydium Launchpad, we don't need reverse logic since it's never reverse
             let mint = extract_token_info(&txn);
-            let is_reverse_when_pump_swap = false;
+            let _is_reverse_when_pump_swap = false;
             
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -77,8 +77,8 @@ use crate::common::logger::Logger;
 use crate::library::gmgn::{GmgnClient, GmgnConfig, SecurityVerdict};
 use once_cell::sync::OnceCell;
 use crate::dex::pump_fun::{Pump, PUMP_FUN_PROGRAM, TOKEN_TOTAL_SUPPLY};
-use crate::processor::sniper_bot::{execute_buy, SniperConfig, BOUGHT_TOKEN_LIST};
-use crate::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
+use crate::processor::sniper_bot::{SniperConfig, BOUGHT_TOKEN_LIST};
+use crate::processor::swap::{SwapDirection, SwapInType};
 use crate::processor::transaction_parser::{parse_transaction_data, DexType, TradeInfoFromToken};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -1398,22 +1398,11 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         // Paper trade: assume the buy fills at the current market cap.
         Ok(())
     } else {
-        let mut buy_config = sniper.swap_config.clone();
-        buy_config.swap_direction = SwapDirection::Buy;
-        buy_config.in_type = SwapInType::Qty;
-        buy_config.amount_in = entry_size;
-        buy_config.slippage = cfg.slippage_bps;
-
-        let app_state = Arc::new(sniper.app_state.clone());
-        let mut buy_trade_info = parsed.clone();
-        buy_trade_info.dex_type = DexType::PumpFun;
-
-        execute_buy(
-            buy_trade_info,
-            app_state,
-            Arc::new(buy_config),
-            SwapProtocol::PumpFun,
-        ).await
+        // Live buy via the configured landing route (zeroslot | jito | multi),
+        // the same fast path the sells use.
+        momentum_buy(&parsed, entry_size, Arc::new(sniper.app_state.clone()), &cfg, &logger)
+            .await
+            .map(|_| ())
     };
 
     IN_FLIGHT_BUYS.fetch_sub(1, Ordering::SeqCst);
@@ -1452,6 +1441,56 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             logger.log(format!("❌ Buy failed for {}: {}", mint, e).red().to_string());
         }
     }
+}
+
+/// Buy `amount_sol` of a pump.fun token, landing via the configured route
+/// (zeroslot | jito | multi). Mirrors momentum_sell so both legs share the same
+/// fast-landing path. Returns the tx signature.
+async fn momentum_buy(
+    parsed: &TradeInfoFromToken,
+    amount_sol: f64,
+    app_state: Arc<AppState>,
+    cfg: &MomentumConfig,
+    logger: &Logger,
+) -> Result<String, String> {
+    let buy_config = SwapConfig {
+        swap_direction: SwapDirection::Buy,
+        in_type: SwapInType::Qty,
+        amount_in: amount_sol,
+        slippage: cfg.slippage_bps,
+    };
+    let mut trade_info = parsed.clone();
+    trade_info.dex_type = DexType::PumpFun;
+    trade_info.is_buy = true;
+
+    let pump = Pump::new(
+        app_state.rpc_nonblocking_client.clone(),
+        app_state.rpc_client.clone(),
+        app_state.wallet.clone(),
+    );
+    let (keypair, instructions, _price) = pump
+        .build_swap_from_parsed_data(&trade_info, buy_config)
+        .await
+        .map_err(|e| format!("build buy failed: {}", e))?;
+
+    let blockhash = crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash()
+        .await
+        .ok_or_else(|| "no recent blockhash".to_string())?;
+
+    let sigs = match cfg.landing.as_str() {
+        "jito" => crate::block_engine::tx::new_signed_and_send_jito(
+            blockhash, &keypair, instructions, logger,
+        ).await,
+        "multi" => crate::block_engine::tx::new_signed_and_send_multi(
+            &app_state, blockhash, &keypair, instructions, logger,
+        ).await,
+        _ => crate::block_engine::tx::new_signed_and_send_zeroslot(
+            app_state.zeroslot_rpc_client.clone(), blockhash, &keypair, instructions, logger,
+        ).await,
+    }
+    .map_err(|e| format!("send buy failed: {}", e))?;
+
+    Ok(sigs.first().cloned().unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------

@@ -196,6 +196,29 @@ See `src/env.example` for every momentum tunable. Implementation: `src/processor
 > points, not backtested optimums — paper-test with tiny size first and tune
 > from real fills.
 
+### Transaction landing (`MOMENTUM_LANDING`)
+Both buys and sells route through the same configurable landing path:
+- `zeroslot` (default), `jito` (Jito tip + `sendBundle`), or `multi` — builds **one**
+  Jito-tipped transaction and broadcasts the *identical signed bytes* to both the
+  Jito block engine and the RPC. Same signature ⇒ at most one can execute, so you
+  get two landing chances with **no double-execution risk**. Tune `JITO_TIP_VALUE`.
+
+### Known limitations (read before going live)
+Being honest about what's *not* solved is part of using this responsibly:
+- **Market cap is bonding-curve math** — correct on-curve, but **wrong after a token
+  migrates** to Raydium/PumpSwap. PnL/exits misprice a migrated token. Treat
+  post-migration positions with caution.
+- **Realized PnL is exact on the sell leg only.** Buys fold in an *estimated*
+  entry cost (`MOMENTUM_BUY_COST_FRACTION`); the buy isn't reconciled on-chain, so
+  total PnL is slightly conservative-to-approximate on entries.
+- **Dry-run fills are optimistic** — they assume you fill at the observed market
+  cap instantly. Live, you're latency- and slippage-disadvantaged, so live results
+  will be worse than paper. Use dry run to test *signal quality*, not to predict live PnL.
+- **The websocket feed (`MOMENTUM_FEED=ws`) lags gRPC** by seconds (`blockSubscribe`
+  at confirmed commitment). Fine for validation; for competitive live sniping prefer a gRPC endpoint.
+- **The edge is the wallet list + discipline, not the code.** Public KOL lists are
+  shared and decay; the per-KOL leaderboard exists so you prune to your own proven set.
+
 ---
 
 ### How it works (logic)

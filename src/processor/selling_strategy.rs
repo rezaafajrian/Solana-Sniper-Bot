@@ -17,12 +17,10 @@ use solana_program_pack::Pack;
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
-    cache::WALLET_TOKEN_ACCOUNTS,
 };
 use crate::processor::transaction_parser::{TradeInfoFromToken, DexType};
 use crate::common::timeseries as ts;
 use crate::processor::swap::{SwapDirection, SwapProtocol, SwapInType};
-use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
 
 // Implement conversion from SwapProtocol to DexType

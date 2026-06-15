@@ -29,7 +29,6 @@ use crate::{
 };
 
 // Import the volume accumulator structures from pump_fun
-use crate::dex::pump_fun::{GlobalVolumeAccumulator, UserVolumeAccumulator};
 
 // PUMP SWAP FIXES:
 // 1. Fixed buy token amount calculation to use same direct formula as pump fun
@@ -299,7 +298,7 @@ impl PumpSwap {
         coin_creator: Pubkey,
         amount_in: f64,
         in_type: SwapInType,
-        slippage_bps: u64,
+        _slippage_bps: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
         let in_ata = get_associated_token_address(&owner, &mint);
@@ -493,7 +492,7 @@ async fn get_pool_info_for_price(
     rpc_client: Arc<anchor_client::solana_client::rpc_client::RpcClient>,
     mint: Pubkey,
 ) -> Result<(Pubkey, u64, u64)> {
-    let logger = Logger::new("[PUMPSWAP-PRICE-QUERY] => ".blue().to_string());
+    let _logger = Logger::new("[PUMPSWAP-PRICE-QUERY] => ".blue().to_string());
     
     // Initialize
     let sol_mint = SOL_MINT;

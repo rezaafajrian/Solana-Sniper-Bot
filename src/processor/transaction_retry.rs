@@ -3,25 +3,19 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use anchor_client::solana_sdk::{
     pubkey::Pubkey, 
-    signature::{Signature, Keypair}, 
-    instruction::Instruction,
-    transaction::{VersionedTransaction, Transaction},
+    signature::Signature,
     signer::Signer,
-    hash::Hash,
 };
 use spl_associated_token_account::get_associated_token_address;
 use colored::Colorize;
 use tokio::time::sleep;
-use base64;
 
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
 };
-use crate::processor::swap::SwapDirection;
 use crate::library::jupiter_api::JupiterClient;
 use crate::processor::transaction_parser::TradeInfoFromToken;
-use crate::block_engine::tx;
 
 /// Maximum number of retry attempts for selling transactions
 const MAX_RETRIES: u32 = 3;

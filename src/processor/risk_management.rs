@@ -28,7 +28,7 @@ With this configuration, the system will automatically check target wallet balan
 where the target wallet's balance falls below 1000 tokens.
 */
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use solana_program_pack::Pack;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +37,6 @@ use colored::Colorize;
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use spl_token::state::Account as TokenAccount;
-use spl_token_2022::extension::StateWithExtensionsOwned;
 
 use crate::common::logger::Logger;
 use crate::common::config::{AppState, SwapConfig, import_env_var};
@@ -258,7 +257,7 @@ impl RiskManagementService {
     async fn trigger_emergency_sell(
         &self,
         token_mint: &str,
-        token_info: &BoughtTokenInfo,
+        _token_info: &BoughtTokenInfo,
     ) -> Result<(), String> {
         self.logger.log(format!(
             "🔥 Executing emergency sell for token {} due to risk management trigger",

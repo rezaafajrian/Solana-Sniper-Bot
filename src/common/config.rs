@@ -1,12 +1,10 @@
 use anyhow::Result;
-use bs58;
 use colored::Colorize;
 use dotenv::dotenv;
 use reqwest::Error;
 use serde::Deserialize;
 use anchor_client::solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair, signer::Signer};
 use tokio::sync::{Mutex, OnceCell};
-use tokio_tungstenite::tungstenite::http::request;
 use std::{env, sync::Arc};
 use crate::processor::swap::SwapProtocol;
 use crate::{
@@ -95,7 +93,7 @@ impl Config {
                 slippage_input
             };
             let solana_price = create_coingecko_proxy().await.unwrap_or(200_f64);
-            let rpc_client = create_rpc_client().unwrap();
+            let _rpc_client = create_rpc_client().unwrap();
             let rpc_nonblocking_client = create_nonblocking_rpc_client().await.unwrap();
             let zeroslot_rpc_client = create_zeroslot_rpc_client().await.unwrap();
             let wallet: std::sync::Arc<anchor_client::solana_sdk::signature::Keypair> = import_wallet().unwrap();

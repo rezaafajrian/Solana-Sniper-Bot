@@ -22,7 +22,6 @@ use std::num::NonZeroUsize;
 
 use crate::{
     common::{config::SwapConfig, logger::Logger, cache::WALLET_TOKEN_ACCOUNTS},
-    block_engine::token,
     processor::{monitor::BondingCurveInfo, swap::{SwapDirection, SwapInType}},
 };
 
@@ -215,7 +214,7 @@ impl Pump {
             price_in_sol, price_in_sol / 1_000_000_000.0, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves));
         
         // Use slippage directly as basis points (already u64)
-        let slippage_bps = swap_config.slippage;
+        let _slippage_bps = swap_config.slippage;
         
         // Create instructions as needed
         let mut create_instruction = None;
