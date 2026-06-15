@@ -235,7 +235,9 @@ async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
                     Ok(b) => b,
                     Err(_) => continue,
                 };
-                if !matches!(bytes.len(), 266 | 170 | 138) {
+                // decode_pumpfun_event identifies the event by its discriminator,
+                // so we don't filter by length here (pump.fun's event grew over time).
+                if bytes.len() < 129 {
                     continue;
                 }
                 if let Some(parsed) = decode_pumpfun_event(&bytes) {

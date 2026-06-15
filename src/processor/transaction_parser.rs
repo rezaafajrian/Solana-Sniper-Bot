@@ -14,12 +14,19 @@ lazy_static::lazy_static! {
 #[inline]
 fn dex_log(_msg: String) {}
 
-/// Decode a pump.fun trade event straight from its CPI log-data buffer (lengths
-/// 266 / 170 / 138), independent of the gRPC transaction wrapper. The mint and
-/// all trade fields live in the buffer itself, so this is reusable by any feed
-/// (e.g. a websocket `blockSubscribe` path) that can supply the event bytes.
+/// Decode a pump.fun trade event from its CPI self-invoke data buffer, identified
+/// by the Anchor event discriminator (stable across format changes). Layout:
+///   [0..8]   anchor self-CPI instruction discriminator
+///   [8..16]  TradeEvent event discriminator  = [189,219,127,211,78,230,97,238]
+///   [16..]   TradeEvent fields (mint@16, sol@48, token@56, is_buy@64, ts@97,
+///            vSol@105, vTok@113, realSol@121, creator@185 ...)
+/// pump.fun has lengthened this event over time (creator/fee fields appended), so
+/// we match on the discriminator, not an exact length. Reusable by any feed.
+pub const PUMPFUN_TRADE_DISCRIMINATOR: [u8; 8] = [189, 219, 127, 211, 78, 230, 97, 238];
+
 pub fn decode_pumpfun_event(buffer: &[u8]) -> Option<TradeInfoFromToken> {
-    if !matches!(buffer.len(), 266 | 170 | 138) {
+    // Need at least through real_sol_reserves (121+8=129); identify by discriminator.
+    if buffer.len() < 129 || buffer.get(8..16) != Some(&PUMPFUN_TRADE_DISCRIMINATOR[..]) {
         return None;
     }
     fn pk(b: &[u8], o: usize) -> Option<String> {
@@ -36,11 +43,12 @@ pub fn decode_pumpfun_event(buffer: &[u8]) -> Option<TradeInfoFromToken> {
     let sol_amount = u64le(buffer, 48)?;
     let token_amount = u64le(buffer, 56)?;
     let is_buy = buffer.get(64)? == &1;
-    let timestamp = u64le(buffer, 97)?;
+    let timestamp = u64le(buffer, 97).unwrap_or(0);
     let virtual_sol_reserves = u64le(buffer, 105)?;
     let virtual_token_reserves = u64le(buffer, 113)?;
-    let real_sol_reserves = u64le(buffer, 121)?;
-    let creator = pk(buffer, 185)?;
+    let real_sol_reserves = u64le(buffer, 121).unwrap_or(0);
+    // creator position can shift with appended fields; read it best-effort.
+    let creator = pk(buffer, 185);
     let price = if virtual_token_reserves > 0 {
         virtual_sol_reserves.saturating_mul(1_000_000_000) / virtual_token_reserves
     } else {
@@ -56,7 +64,7 @@ pub fn decode_pumpfun_event(buffer: &[u8]) -> Option<TradeInfoFromToken> {
         is_buy,
         price,
         is_reverse_when_pump_swap: false,
-        coin_creator: Some(creator),
+        coin_creator: creator,
         sol_change: sol_amount as f64 / 1_000_000_000.0,
         token_change: token_amount as f64 / 1_000_000_000.0,
         liquidity: real_sol_reserves as f64 / 1_000_000_000.0,
