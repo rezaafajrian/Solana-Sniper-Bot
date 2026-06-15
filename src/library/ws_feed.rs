@@ -71,6 +71,7 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                 let mut msg_count: u64 = 0;
                 let mut event_count: u64 = 0;
                 let mut logged_first = false;
+                let mut logged_shape = false;
                 let mut last_report = std::time::Instant::now();
 
                 while let Some(msg) = stream.next().await {
@@ -86,6 +87,12 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                                 logger.log(format!("ws first message: {}", head).cyan().to_string());
                             }
                             if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                                // One-shot: dump the shape of the first block notification
+                                // so we can see exactly where the transactions/inner data live.
+                                if !logged_shape && v.get("method").and_then(|m| m.as_str()) == Some("blockNotification") {
+                                    logged_shape = true;
+                                    log_block_shape(&v, &logger);
+                                }
                                 event_count += forward_block(&v, &tx).await as u64;
                                 if tx.is_closed() {
                                     return;
@@ -119,6 +126,43 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+/// One-shot structural dump of a block notification, so we can map the real field
+/// layout (it varies by provider/encoding) and fix `forward_block`.
+fn log_block_shape(v: &Value, logger: &Logger) {
+    fn keys(v: Option<&Value>) -> String {
+        match v {
+            Some(Value::Object(m)) => m.keys().cloned().collect::<Vec<_>>().join(","),
+            Some(Value::Array(a)) => format!("[array len {}]", a.len()),
+            Some(other) => format!("[{}]", if other.is_string() { "string" } else { "value" }),
+            None => "<none>".to_string(),
+        }
+    }
+    let value = v.pointer("/params/result/value");
+    logger.log(format!("shape: params.result.value keys = {}", keys(value)).cyan().to_string());
+    let block = v.pointer("/params/result/value/block");
+    logger.log(format!("shape: .block keys = {}", keys(block)).cyan().to_string());
+    let txns = v.pointer("/params/result/value/block/transactions").and_then(|t| t.as_array());
+    match txns {
+        Some(arr) => {
+            logger.log(format!("shape: block.transactions len = {}", arr.len()).cyan().to_string());
+            if let Some(t0) = arr.first() {
+                logger.log(format!("shape: tx[0] keys = {}", keys(Some(t0))).cyan().to_string());
+                logger.log(format!("shape: tx[0].transaction = {}", keys(t0.get("transaction"))).cyan().to_string());
+                logger.log(format!("shape: tx[0].meta keys = {}", keys(t0.get("meta"))).cyan().to_string());
+                logger.log(format!("shape: tx[0].meta.innerInstructions = {}", keys(t0.pointer("/meta/innerInstructions"))).cyan().to_string());
+                // dump a small slice of tx[0] for the exact field names
+                let raw = serde_json::to_string(t0).unwrap_or_default();
+                logger.log(format!("shape: tx[0] head = {}", raw.chars().take(700).collect::<String>()).cyan().to_string());
+            }
+        }
+        None => {
+            // transactions not where we expect — dump the value head to relocate it
+            let raw = serde_json::to_string(value.unwrap_or(v)).unwrap_or_default();
+            logger.log(format!("shape: value head = {}", raw.chars().take(700).collect::<String>()).cyan().to_string());
+        }
     }
 }
 
