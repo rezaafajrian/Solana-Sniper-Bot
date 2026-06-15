@@ -47,19 +47,6 @@ fn get_unit_limit() -> u32 {
 }
 
 
-// Cache the FlashBlock API key
-static FLASHBLOCK_API_KEY: Lazy<String> = Lazy::new(|| {
-    std::env::var("FLASHBLOCK_API_KEY")
-        .ok()
-        .unwrap_or_else(|| "da07907679634859".to_string())
-});
-
-// Create a static HTTP client with optimized configuration for FlashBlock API
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-   let client = reqwest::Client::new();
-   client
-});
-
 pub async fn new_signed_and_send_zeroslot(
     zeroslot_rpc_client: Arc<crate::library::zeroslot::ZeroSlotClient>,
     recent_blockhash: solana_sdk::hash::Hash,

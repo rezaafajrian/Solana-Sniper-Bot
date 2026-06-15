@@ -509,39 +509,6 @@ fn create_sell_accounts(
 ])
 }
 
-#[inline]
-fn calculate_raydium_sell_amount_out(
-    base_amount_in: u64,
-    virtual_base_reserve: u64, 
-    virtual_quote_reserve: u64,
-    real_base_reserve: u64,
-    real_quote_reserve: u64
-) -> u64 {
-    if base_amount_in == 0 || virtual_base_reserve == 0 || virtual_quote_reserve == 0 {
-        return 0;
-    }
-    
-    // Raydium Launchpad constant product formula for selling:
-    // input_reserve = virtual_base - real_base  
-    // output_reserve = virtual_quote + real_quote
-    // amount_out = (amount_in * output_reserve) / (input_reserve + amount_in)
-    
-    let input_reserve = virtual_base_reserve.saturating_sub(real_base_reserve);
-    let output_reserve = virtual_quote_reserve.saturating_add(real_quote_reserve);
-    
-    if input_reserve == 0 || input_reserve > virtual_base_reserve {
-        return 0;
-    }
-    
-    let numerator = (base_amount_in as u128).saturating_mul(output_reserve as u128);
-    let denominator = (input_reserve as u128).saturating_add(base_amount_in as u128);
-    
-    if denominator == 0 {
-        return 0;
-    }
-    
-    numerator.checked_div(denominator).unwrap_or(0) as u64
-}
 
 // Optimized instruction creation
 fn create_swap_instruction(

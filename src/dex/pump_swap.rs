@@ -565,50 +565,8 @@ async fn get_pool_info_for_price(
     Ok((pool_id, base_balance, quote_balance))
 }
 
-// Optimized math functions with overflow protection
-#[inline]
-fn calculate_buy_base_amount(quote_amount_in: u64, quote_reserve: u64, base_reserve: u64) -> u64 {
-    if quote_amount_in == 0 || base_reserve == 0 || quote_reserve == 0 {
-        return 0;
-    }
-    
-    let quote_reserve_after = quote_reserve.saturating_add(quote_amount_in);
-    let numerator = (quote_reserve as u128).saturating_mul(base_reserve as u128);
-    let denominator = quote_reserve_after as u128;
-    
-    if denominator == 0 {
-        return 0;
-    }
-    
-    let base_reserve_after = numerator.checked_div(denominator).unwrap_or(0);
-    base_reserve.saturating_sub(base_reserve_after as u64)
-}
 
-#[inline]
-fn calculate_sell_quote_amount(base_amount_in: u64, base_reserve: u64, quote_reserve: u64) -> u64 {
-    if base_amount_in == 0 || base_reserve == 0 || quote_reserve == 0 {
-        return 0;
-    }
-    
-    let base_reserve_after = base_reserve.saturating_add(base_amount_in);
-    let numerator = (quote_reserve as u128).saturating_mul(base_reserve as u128);
-    let denominator = base_reserve_after as u128;
-    
-    if denominator == 0 {
-        return 0;
-    }
-    
-    let quote_reserve_after = numerator.checked_div(denominator).unwrap_or(0);
-    quote_reserve.saturating_sub(quote_reserve_after as u64)
-}
 
-#[inline]
-fn min_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> u64 {
-    input_amount
-        .saturating_mul(TEN_THOUSAND.saturating_sub(slippage_bps))
-        .checked_div(TEN_THOUSAND)
-        .unwrap_or(0)
-}
 
 #[inline]
 fn max_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> u64 {
