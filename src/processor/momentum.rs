@@ -140,6 +140,23 @@ pub struct MomentumConfig {
     /// File to persist wallet reputation across restarts (compounding edge).
     pub wallet_rep_file: String,
 
+    // ---- Edge: alpha-follow (act on the learned smart-money memory) ----
+    /// Follow PROVEN wallets: when a single wallet whose learned reputation clears
+    /// the bar buys a token, treat it as a high-conviction entry signal. This is how
+    /// the bot acts on its own memory — and it compounds, since more wallets cross
+    /// the bar as reputation accumulates across runs.
+    pub alpha_follow_enabled: bool,
+    /// Minimum learned reputation (EMA of forward returns) for a wallet to be "alpha".
+    pub alpha_rep_min: f64,
+    /// Minimum reputation samples before a wallet can be followed as alpha.
+    pub alpha_min_samples: u32,
+    /// Score points added when an alpha wallet is buying (0..100 scale).
+    pub alpha_boost: f64,
+    /// Seconds an alpha buy keeps a token "hot" for entry.
+    pub alpha_window_secs: u64,
+    /// Position-size multiple applied when following a proven wallet (KOL or alpha).
+    pub alpha_size_mult: f64,
+
     // ---- Edge: insider / leader-dump exit ----
     /// Exit immediately when the creator or top early buyers start distributing.
     pub leader_dump_exit_enabled: bool,
@@ -275,6 +292,15 @@ impl MomentumConfig {
             wallet_rep_file: std::env::var("MOMENTUM_REP_FILE")
                 .unwrap_or_else(|_| "momentum_wallet_rep.csv".to_string()),
 
+            alpha_follow_enabled: std::env::var("MOMENTUM_ALPHA_FOLLOW")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            alpha_rep_min: env_f64("MOMENTUM_ALPHA_REP_MIN", 0.5),
+            alpha_min_samples: env_u64("MOMENTUM_ALPHA_MIN_SAMPLES", 5) as u32,
+            alpha_boost: env_f64("MOMENTUM_ALPHA_BOOST", 35.0),
+            alpha_window_secs: env_u64("MOMENTUM_ALPHA_WINDOW_SECS", 60),
+            alpha_size_mult: env_f64("MOMENTUM_ALPHA_SIZE_MULT", 1.5),
+
             leader_dump_exit_enabled: std::env::var("MOMENTUM_LEADER_DUMP_EXIT")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
@@ -342,6 +368,11 @@ impl MomentumConfig {
             if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max, self.smart_money_min_distinct,
             if self.leader_dump_exit_enabled { "on" } else { "off" }, self.leader_dump_sol,
             if self.conviction_sizing { "on" } else { "off" }, self.conviction_max_mult,
+        ));
+        logger.log(format!(
+            "🧠 Alpha-follow: {} | rep >= {:.2} over >= {} samples | boost +{:.0} | window {}s | size x{:.2}",
+            if self.alpha_follow_enabled { "ON (follows learned proven wallets)" } else { "off" },
+            self.alpha_rep_min, self.alpha_min_samples, self.alpha_boost, self.alpha_window_secs, self.alpha_size_mult,
         ));
         logger.log(format!(
             "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}% | landing: {}",
@@ -689,6 +720,35 @@ fn smart_money_boost<'a>(buyers: impl Iterator<Item = &'a str>, cfg: &MomentumCo
         return 0.0;
     }
     (cfg.smart_money_boost_max * clamp01(sum / cfg.smart_money_boost_scale.max(1e-9))).min(cfg.smart_money_boost_max)
+}
+
+/// The single best PROVEN wallet currently buying this token, if any.
+///
+/// "Proven" = learned reputation >= `alpha_rep_min` over >= `alpha_min_samples`
+/// graded buys. This is the bot acting on its own memory: it follows wallets that
+/// have repeatedly bought before pumps. Returns `(wallet, reputation)` of the
+/// strongest such buyer in the alpha window. Self-strengthening: as more buys get
+/// graded, more wallets cross the bar, so coverage grows the longer the bot runs.
+fn alpha_hot(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(String, f64)> {
+    if !cfg.alpha_follow_enabled {
+        return None;
+    }
+    let cut = now.saturating_sub(cfg.alpha_window_secs);
+    let state = TOKEN_STATE.get(mint)?;
+    let mut best: Option<(String, f64)> = None;
+    for t in state.ticks.iter() {
+        if !t.is_buy || t.ts < cut || t.trader.is_empty() || t.sol < cfg.smart_money_min_sol {
+            continue;
+        }
+        if let Some(r) = WALLET_REP.get(&t.trader) {
+            if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+                if best.as_ref().map(|(_, s)| r.score > *s).unwrap_or(true) {
+                    best = Some((t.trader.clone(), r.score));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Queue a buy for later outcome grading (smart-money learning).
@@ -1307,9 +1367,15 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     }
     let kol_pts = kol.as_ref().map(|(w, _)| cfg.kol_boost * w).unwrap_or(0.0);
 
+    // Alpha-follow edge: a wallet the bot LEARNED is reliable is buying this token.
+    // Only when no curated KOL already fired (avoid stacking two big boosts). This is
+    // the memory in action — and it strengthens every run as more wallets earn the bar.
+    let alpha = if kol.is_none() { alpha_hot(&mint, now, &cfg) } else { None };
+    let alpha_pts = alpha.as_ref().map(|_| cfg.alpha_boost).unwrap_or(0.0);
+
     // GMGN smart-money / trenches confirmation adds score points for the gate.
     let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
-    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts;
+    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts + alpha_pts;
 
     if effective_score < cfg.entry_score {
         return;
@@ -1358,6 +1424,13 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     } else {
         cfg.position_size_sol
     };
+    // Following a proven wallet (curated KOL or learned alpha) is our highest-
+    // conviction signal — size up. Capped so one trade can't dwarf the book.
+    let following = kol.is_some() || alpha.is_some();
+    if following && cfg.alpha_size_mult > 1.0 {
+        let cap = cfg.position_size_sol * cfg.conviction_max_mult.max(cfg.alpha_size_mult);
+        entry_size = (entry_size * cfg.alpha_size_mult).min(cap);
+    }
 
     // Global capital cap: never let total exposure exceed the budget. Trim the
     // last entry to the remaining headroom; skip if there isn't enough room.
@@ -1383,19 +1456,34 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // Reserve a slot before the async buy to prevent overshooting max positions.
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
-    let kol_tag = kol.as_ref().map(|(_, l)| format!(", KOL:{} +{:.0}", l, kol_pts)).unwrap_or_default();
+    // Attribution label: the wallet we're following. Curated KOLs keep their label;
+    // learned alpha wallets get an "α:<prefix>" label so the per-KOL leaderboard
+    // tracks the bot's self-discovered edge alongside the curated one.
+    let lead_label: Option<String> = if let Some((_, l)) = &kol {
+        Some(l.clone())
+    } else {
+        alpha.as_ref().map(|(w, _)| format!("α:{}", &w[..w.len().min(8)]))
+    };
+
+    let lead_tag = if let Some((_, l)) = &kol {
+        format!(", KOL:{} +{:.0}", l, kol_pts)
+    } else if let Some((w, rep)) = &alpha {
+        format!(", ALPHA:{} (rep {:.2}) +{:.0}", &w[..w.len().min(8)], rep, alpha_pts)
+    } else {
+        String::new()
+    };
     logger.log(format!(
         "🟢 ENTRY {} | score {:.1} (smart +{:.1}{}{}) | genuine {:.0}% | size {:.3} SOL | buyvol {:.2} | {} buyers | mcap {:.1} SOL",
         mint, signal.score, signal.smart_money_boost,
         if gmgn_hot { format!(", GMGN +{:.1}", cfg.gmgn_boost) } else { String::new() },
-        kol_tag,
+        lead_tag,
         signal.genuine_factor * 100.0,
         entry_size, signal.buy_volume_short, signal.unique_buyers_short, signal.current_mcap,
     ).green().bold().to_string());
 
-    // Reason carries the KOL label so the analyzer can attribute PnL per KOL.
-    let buy_reason = match &kol {
-        Some((_, l)) => format!("momentum entry [KOL:{}]", l),
+    // Reason carries the lead label so the analyzer can attribute PnL per wallet.
+    let buy_reason = match &lead_label {
+        Some(l) => format!("momentum entry [KOL:{}]", l),
         None => "momentum entry".to_string(),
     };
 
@@ -1423,7 +1511,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 selling: false,
                 tracked_wallets,
                 entry_ts: now,
-                kol_label: kol.as_ref().map(|(_, l)| l.clone()).unwrap_or_default(),
+                kol_label: lead_label.clone().unwrap_or_default(),
             });
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
@@ -2024,7 +2112,14 @@ async fn momentum_startup(
 
     if cfg.smart_money_enabled {
         load_wallet_rep(&cfg.wallet_rep_file);
-        logger.log(format!("🧠 Loaded reputation for {} wallets from {}", WALLET_REP.len(), cfg.wallet_rep_file).cyan().to_string());
+        let proven = WALLET_REP
+            .iter()
+            .filter(|e| e.value().samples >= cfg.alpha_min_samples && e.value().score >= cfg.alpha_rep_min)
+            .count();
+        logger.log(format!(
+            "🧠 Loaded reputation for {} wallets from {} — {} already proven (rep >= {:.2}, >= {} samples) and will be followed",
+            WALLET_REP.len(), cfg.wallet_rep_file, proven, cfg.alpha_rep_min, cfg.alpha_min_samples,
+        ).cyan().to_string());
     }
 
     if cfg.kol_enabled {
