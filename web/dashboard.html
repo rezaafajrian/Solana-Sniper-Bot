@@ -1,255 +1,435 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Momentum Sniper — Live</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>MOMENTUM ZERO — live terminal</title>
 <style>
   :root{
-    --bg:#070b14; --panel:#0d1424; --panel2:#111a2e; --line:#1d2942;
-    --txt:#e7ecf5; --dim:#8a96ad; --accent:#5eead4; --accent2:#7c93ff;
-    --green:#34d399; --red:#fb7185; --amber:#fbbf24; --purple:#c084fc;
-    --glow:0 0 18px rgba(94,234,212,.35);
+    --bg:#03060a; --panel:#070c10; --panel2:#0a1116; --grid:#0e1a18;
+    --line:#13231f; --txt:#9fe8cf; --dim:#3f6b5c; --dimmer:#27463c;
+    --green:#1dff9b; --greend:#0c8f5a; --red:#ff4d6a; --redd:#7a1f33;
+    --cyan:#37e6ff; --amber:#ffc24b; --white:#dffff2;
   }
   *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);}
   body{
-    margin:0;font-family:'SF Mono',ui-monospace,'Cascadia Code',Menlo,monospace;
-    background:radial-gradient(1200px 700px at 80% -10%, #122145 0%, transparent 55%),
-               radial-gradient(900px 600px at -10% 10%, #0e2236 0%, transparent 50%), var(--bg);
-    color:var(--txt);min-height:100vh;padding:18px;letter-spacing:.2px;
+    font-family:"SF Mono","JetBrains Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+    font-size:11px; line-height:1.35; letter-spacing:.2px;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
+    background-image:repeating-linear-gradient(0deg,transparent 0 3px,rgba(0,40,30,.05) 3px 4px);
   }
+  .scan{position:fixed;inset:0;pointer-events:none;z-index:99;
+    background:linear-gradient(rgba(0,0,0,0) 50%,rgba(0,0,0,.18) 50%);background-size:100% 3px;mix-blend-mode:multiply;}
   a{color:inherit;text-decoration:none}
-  .wrap{max-width:1280px;margin:0 auto}
-  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;flex-wrap:wrap}
-  .brand{display:flex;align-items:center;gap:12px}
-  .logo{font-size:24px;font-weight:700;background:linear-gradient(90deg,var(--accent),var(--accent2));
-        -webkit-background-clip:text;background-clip:text;color:transparent}
-  .badge{padding:5px 12px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid var(--line)}
-  .badge.dry{color:var(--amber);border-color:#5a4a14;background:#1c1605}
-  .badge.live{color:var(--red);border-color:#5a1a24;background:#1c0710}
-  .badge.halt{color:#fff;background:linear-gradient(90deg,#b91c1c,#7f1d1d);border-color:#7f1d1d;animation:pulse 1.2s infinite}
-  .badge.ok{color:var(--green);border-color:#14532d;background:#04140c}
-  .upd{font-size:12px;color:var(--dim)}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .up{color:var(--green)} .down{color:var(--red)} .cy{color:var(--cyan)} .am{color:var(--amber)} .dim{color:var(--dim)} .wt{color:var(--white)}
 
-  .hero{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:14px;margin-bottom:14px}
-  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
-        border-radius:16px;padding:16px 18px;position:relative;overflow:hidden}
-  .card .lbl{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim)}
-  .pnl-big{font-size:46px;font-weight:800;margin-top:6px;line-height:1}
-  .sub{font-size:13px;color:var(--dim);margin-top:8px}
-  .pos{color:var(--green);text-shadow:0 0 16px rgba(52,211,153,.45)}
-  .neg{color:var(--red);text-shadow:0 0 16px rgba(251,113,133,.45)}
-  .stat{font-size:30px;font-weight:700;margin-top:6px}
-  .bar{height:8px;border-radius:6px;background:#0a1322;margin-top:10px;overflow:hidden;border:1px solid var(--line)}
-  .bar > i{display:block;height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:6px}
+  /* top bar */
+  header{display:flex;align-items:center;gap:14px;padding:7px 12px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#08120e,#04080a);position:sticky;top:0;z-index:50}
+  .brand{font-weight:700;color:var(--green);letter-spacing:3px;font-size:13px;text-shadow:0 0 8px rgba(29,255,155,.5)}
+  .brand b{color:var(--white)}
+  .pill{padding:2px 8px;border:1px solid var(--dimmer);border-radius:2px;font-size:10px;letter-spacing:1px}
+  .pill.dry{color:var(--cyan);border-color:#0c4a55;background:#04161a}
+  .pill.live{color:var(--green);border-color:#0c5a3a;background:#04160e}
+  .pill.halt{color:var(--red);border-color:var(--redd);background:#1a0509;animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:.35}}
+  header .sp{flex:1}
+  .clock{color:var(--dim)} .clock b{color:var(--txt)}
+  .led{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green);margin-right:5px;vertical-align:middle}
+  .led.stale{background:var(--amber);box-shadow:0 0 7px var(--amber)}
 
-  .tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:18px}
-  .tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
-  .tile .v{font-size:22px;font-weight:700}
-  .tile .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+  /* layout */
+  .wrap{display:grid;grid-template-columns:248px 1fr 300px;gap:1px;background:var(--line);}
+  .col{display:flex;flex-direction:column;gap:1px;background:var(--line)}
+  .panel{background:var(--panel);padding:8px 10px}
+  .ph{display:flex;align-items:center;gap:6px;color:var(--green);font-size:9px;letter-spacing:2px;
+    border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px;text-transform:uppercase}
+  .ph .x{flex:1} .ph .c{color:var(--dim);letter-spacing:1px}
+  .ph::before{content:"▌";color:var(--greend)}
 
-  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:14px}
-  h2{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);margin:0 0 12px}
-  .poswrap{display:flex;flex-direction:column;gap:10px;max-height:62vh;overflow:auto}
-  .prow{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;
-        display:grid;grid-template-columns:1fr auto;gap:6px;transition:.2s}
-  .prow:hover{border-color:#2c3c63}
-  .prow.sell{border-color:#5a1a24;box-shadow:0 0 0 1px #5a1a2433 inset}
-  .mint{font-weight:700;font-size:14px}
-  .pill{display:inline-block;font-size:10px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim);margin-left:8px}
-  .pill.kol{color:var(--purple);border-color:#3a2a52;background:#140b22}
-  .meta{font-size:12px;color:var(--dim);margin-top:6px;display:flex;gap:14px;flex-wrap:wrap}
-  .pnl{font-size:24px;font-weight:800;text-align:right;min-width:120px}
-  .pbar{grid-column:1/-1;height:6px;border-radius:5px;background:#0a1322;overflow:hidden;border:1px solid var(--line);margin-top:8px}
-  .pbar > i{display:block;height:100%}
+  /* key/val rows */
+  .kv{display:flex;justify-content:space-between;gap:8px;padding:1.5px 0}
+  .kv .k{color:var(--dim)} .kv .v{color:var(--txt);text-align:right;font-variant-numeric:tabular-nums}
+  .bar{height:4px;background:#06100c;border:1px solid var(--line);margin:3px 0 6px;position:relative;overflow:hidden}
+  .bar > i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--greend),var(--green));box-shadow:0 0 6px rgba(29,255,155,.6)}
+  .bar.r > i{background:linear-gradient(90deg,var(--redd),var(--red));box-shadow:0 0 6px rgba(255,77,106,.5)}
 
-  .feed{display:flex;flex-direction:column;gap:8px;max-height:62vh;overflow:auto}
-  .ev{background:var(--panel);border:1px solid var(--line);border-left-width:3px;border-radius:10px;padding:9px 12px;font-size:13px;animation:slidein .25s ease}
-  .ev.buy{border-left-color:var(--green)}
-  .ev.sellp{border-left-color:var(--amber)}
-  .ev.sellf{border-left-color:var(--red)}
-  .ev .top{display:flex;justify-content:space-between;gap:8px}
-  .ev .rsn{color:var(--dim);font-size:12px;margin-top:3px}
-  @keyframes slidein{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
-  .empty{color:var(--dim);font-size:13px;padding:18px;text-align:center}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:var(--glow);margin-right:6px;animation:pulse 1.6s infinite}
-  @media(max-width:980px){.hero,.grid{grid-template-columns:1fr}.tiles{grid-template-columns:repeat(3,1fr)}}
+  /* hero + chart */
+  .hero{display:flex;align-items:flex-end;gap:18px;padding:10px 14px 4px}
+  .hero .lab{color:var(--dim);font-size:9px;letter-spacing:2px}
+  .hero .big{font-size:40px;line-height:.95;font-weight:700;font-variant-numeric:tabular-nums;text-shadow:0 0 16px currentColor}
+  .hero .sub{font-size:11px;color:var(--dim)}
+  .hero .sub b{font-variant-numeric:tabular-nums}
+  .chartbox{position:relative;flex:1;min-height:300px}
+  canvas{display:block;width:100%;height:100%}
+  .cmeta{position:absolute;top:6px;right:10px;text-align:right;color:var(--dim);font-size:9px;letter-spacing:1px}
+
+  /* feed */
+  .feed{max-height:520px;overflow:auto;display:flex;flex-direction:column}
+  .ev{display:grid;grid-template-columns:42px 56px 1fr auto;gap:6px;padding:2px 0;border-bottom:1px solid #081210;white-space:nowrap}
+  .ev .t{color:var(--dimmer)} .ev .m{color:var(--cyan);overflow:hidden;text-overflow:ellipsis}
+  .ev .tag{font-size:9px;letter-spacing:.5px}
+  .ev .pl{text-align:right;font-variant-numeric:tabular-nums}
+  .tag.buy{color:var(--cyan)} .tag.sf{color:var(--green)} .tag.sp{color:var(--amber)} .tag.hs{color:var(--red)}
+
+  /* tables */
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th{color:var(--dim);font-weight:400;text-align:right;font-size:9px;letter-spacing:1px;padding:2px 6px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  td{padding:2.5px 6px;border-bottom:1px solid #081210}
+  tr:hover td{background:#06110d}
+  .mint{color:var(--cyan)} .runner{color:var(--dim);font-size:9px}
+  .miniwin{display:inline-block;height:5px;background:var(--green);box-shadow:0 0 5px var(--green);vertical-align:middle}
+  .minilose{display:inline-block;height:5px;background:var(--red);box-shadow:0 0 5px var(--red);vertical-align:middle}
+
+  .botgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--line)}
+  footer{padding:6px 12px;color:var(--dimmer);font-size:9px;letter-spacing:1px;border-top:1px solid var(--line);display:flex;gap:14px}
+  footer .sp{flex:1}
+
+  @media(max-width:900px){
+    .wrap{grid-template-columns:1fr}
+    .botgrid{grid-template-columns:1fr}
+    .hero .big{font-size:34px}
+  }
+  /* scrollbars */
+  ::-webkit-scrollbar{width:7px;height:7px}
+  ::-webkit-scrollbar-thumb{background:#13241e;border-radius:0}
+  ::-webkit-scrollbar-track{background:#04080a}
 </style>
 </head>
 <body>
+<div class="scan"></div>
+
+<header>
+  <div class="brand">MOMENTUM<b>ZERO</b></div>
+  <span id="mode" class="pill dry">— — —</span>
+  <span id="halt" class="pill halt" style="display:none">⛔ HALTED</span>
+  <div class="sp"></div>
+  <div class="clock"><span class="led" id="led"></span><span id="conn">connecting…</span> · <b id="clock">--:--:--</b></div>
+</header>
+
 <div class="wrap">
-  <header>
-    <div class="brand">
-      <span class="logo">◢ MOMENTUM SNIPER</span>
-      <span id="mode" class="badge dry">—</span>
-      <span id="halt" class="badge ok" style="display:none">HALTED</span>
+  <!-- LEFT: stats -->
+  <div class="col">
+    <div class="panel">
+      <div class="ph"><span class="x">P / L</span><span class="c" id="modec">dry</span></div>
+      <div class="kv"><span class="k">session realized</span><span class="v" id="pnlSession">—</span></div>
+      <div class="kv"><span class="k">today realized</span><span class="v" id="pnlToday">—</span></div>
+      <div class="kv"><span class="k">buys / sells</span><span class="v" id="bs">—</span></div>
+      <div class="kv"><span class="k">win rate</span><span class="v" id="winrate">—</span></div>
+      <div class="bar" id="winbar"><i style="width:0%"></i></div>
+      <div class="kv"><span class="k">avg / token</span><span class="v" id="avgtok">—</span></div>
     </div>
-    <div class="upd"><span class="dot"></span><span id="updated">connecting…</span></div>
-  </header>
 
-  <section class="hero">
-    <div class="card">
-      <div class="lbl">Session Realized PnL</div>
-      <div id="sessionPnl" class="pnl-big">—</div>
-      <div class="sub">Today <span id="todayPnl">—</span> · <span id="buys">0</span> buys / <span id="sells">0</span> sells · loss streak <span id="streak">0</span></div>
+    <div class="panel">
+      <div class="ph"><span class="x">CAPITAL</span></div>
+      <div class="kv"><span class="k">deployed</span><span class="v" id="deployed">—</span></div>
+      <div class="bar" id="capbar"><i style="width:0%"></i></div>
+      <div class="kv"><span class="k">open / max pos</span><span class="v" id="pos">—</span></div>
+      <div class="bar" id="posbar"><i style="width:0%"></i></div>
+      <div class="kv"><span class="k">loss-streak</span><span class="v" id="streak">—</span></div>
     </div>
-    <div class="card">
-      <div class="lbl">Open Positions</div>
-      <div id="openCount" class="stat">0 / 0</div>
-      <div class="sub">Capital deployed</div>
-      <div class="bar"><i id="capBar" style="width:0%"></i></div>
-      <div class="sub"><span id="deployed">0</span> / <span id="maxDeployed">0</span> SOL</div>
-    </div>
-    <div class="card">
-      <div class="lbl">Position Size · Mode</div>
-      <div id="sizeStat" class="stat">—</div>
-      <div class="sub">entry score ≥ <span id="entryScore">—</span> · stop <span id="stop">—</span>%</div>
-      <div class="sub" id="kolMode">KOL: off</div>
-    </div>
-  </section>
 
-  <section class="tiles">
-    <div class="tile"><div class="v" id="tTracked">0</div><div class="k">Tokens Tracked</div></div>
-    <div class="tile"><div class="v" id="tKol">0</div><div class="k">KOL Wallets</div></div>
-    <div class="tile"><div class="v" id="tKolHot">0</div><div class="k">KOL Hot Now</div></div>
-    <div class="tile"><div class="v" id="tGmgn">0</div><div class="k">GMGN Watch</div></div>
-    <div class="tile"><div class="v" id="tBuys">0</div><div class="k">Total Buys</div></div>
-    <div class="tile"><div class="v" id="tSells">0</div><div class="k">Total Sells</div></div>
-  </section>
+    <div class="panel">
+      <div class="ph"><span class="x">MEMORY · LEARNED EDGE</span></div>
+      <div class="kv"><span class="k">wallets scored</span><span class="v cy" id="walletRep">—</span></div>
+      <div class="kv"><span class="k">proven (followed)</span><span class="v up" id="alphaProven">—</span></div>
+      <div class="kv"><span class="k">tokens tracked</span><span class="v" id="tracked">—</span></div>
+      <div class="kv"><span class="k">kol wallets / hot</span><span class="v" id="kolc">—</span></div>
+    </div>
 
-  <section class="grid">
-    <div>
-      <h2>Open Positions — live</h2>
-      <div id="positions" class="poswrap"><div class="empty">No open positions yet…</div></div>
+    <div class="panel">
+      <div class="ph"><span class="x">CONFIG</span></div>
+      <div class="kv"><span class="k">entry score ≥</span><span class="v" id="cfgScore">—</span></div>
+      <div class="kv"><span class="k">position size</span><span class="v" id="cfgSize">—</span></div>
+      <div class="kv"><span class="k">hard stop</span><span class="v down" id="cfgStop">—</span></div>
+      <div class="kv"><span class="k">daily loss limit</span><span class="v" id="cfgLoss">—</span></div>
+      <div class="kv"><span class="k">alpha-follow</span><span class="v" id="cfgAlpha">—</span></div>
+      <div class="kv"><span class="k">kol mode</span><span class="v" id="cfgKol">—</span></div>
     </div>
-    <div>
-      <h2>★ KOL Leaderboard — keep green, cut red</h2>
-      <div id="board" class="feed" style="max-height:28vh;margin-bottom:14px"><div class="empty">No KOL trades closed yet…</div></div>
-      <h2>Trade Feed</h2>
-      <div id="feed" class="feed" style="max-height:30vh"><div class="empty">Waiting for activity…</div></div>
+  </div>
+
+  <!-- CENTER: hero + equity curve -->
+  <div class="col">
+    <div class="panel" style="padding-bottom:0">
+      <div class="hero">
+        <div>
+          <div class="lab">SESSION REALIZED PnL · SOL</div>
+          <div class="big" id="heroBig">—</div>
+          <div class="sub">peak <b id="heroPeak">—</b> · drawdown <b class="down" id="heroDD">—</b></div>
+        </div>
+      </div>
+      <div class="chartbox">
+        <canvas id="chart"></canvas>
+        <div class="cmeta" id="cmeta"></div>
+      </div>
     </div>
-  </section>
+    <div class="panel">
+      <div class="ph"><span class="x">OPEN POSITIONS</span><span class="c" id="posCount">0</span></div>
+      <table id="posTable">
+        <thead><tr><th>mint</th><th>lead</th><th>age</th><th>mcap</th><th>peak</th><th>left</th><th>PnL%</th></tr></thead>
+        <tbody id="posBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- RIGHT: live feed -->
+  <div class="col">
+    <div class="panel" style="flex:1">
+      <div class="ph"><span class="x">LIVE TAPE</span><span class="c" id="feedCount">0</span></div>
+      <div class="feed" id="feed"></div>
+    </div>
+  </div>
 </div>
+
+<div class="botgrid">
+  <div class="panel">
+    <div class="ph"><span class="x">LEAD ATTRIBUTION · PnL</span></div>
+    <table>
+      <thead><tr><th>wallet / kol</th><th>W/L</th><th>realized</th></tr></thead>
+      <tbody id="kolBody"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="x">SCOUT LIST · TOP LEARNED ALPHA</span></div>
+    <table>
+      <thead><tr><th>wallet</th><th>samples</th><th>rep</th></tr></thead>
+      <tbody id="alphaBody"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="x">EXIT MIX · THIS SESSION</span></div>
+    <table>
+      <thead><tr><th>reason</th><th>count</th><th>realized</th></tr></thead>
+      <tbody id="exitBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>
+  <span>MOMENTUM ZERO TERMINAL</span>
+  <span class="sp"></span>
+  <span id="ftStamp">—</span>
+  <span class="dim">buys strength · follows proven wallets · cuts losers</span>
+</footer>
 
 <script>
 const $ = id => document.getElementById(id);
-const sol = n => (n>=0?'+':'') + Number(n).toFixed(4) + ' SOL';
-const shortMint = m => m && m.length>10 ? m.slice(0,4)+'…'+m.slice(-4) : (m||'');
-const ago = s => { s=Math.max(0,s); if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m'; return Math.floor(s/3600)+'h'; };
-const cls = v => v>0?'pos':(v<0?'neg':'');
+const fmtSol = (v,sign=true)=>{ if(v==null||isNaN(v))return "—"; const s=(sign&&v>0?"+":"")+v.toFixed(4); return s; };
+const cls = v => v>0?"up":(v<0?"down":"dim");
+const shortMint = m => m? (m.length>12? m.slice(0,4)+"…"+m.slice(-4):m):"—";
+const ago = ts => { const s=Math.max(0,Math.floor(Date.now()/1000)-ts); if(s<60)return s+"s"; if(s<3600)return Math.floor(s/60)+"m"; return Math.floor(s/3600)+"h"; };
 
-function pnlBar(pct){
-  // map pnl% to a 0-100 width and color
-  const w = Math.min(100, Math.abs(pct)/4*100/ (pct>=0?1:1)); // 400% => full
-  const width = Math.min(100, Math.abs(pct)/4); // 400% -> 100%
-  const col = pct>=0 ? 'linear-gradient(90deg,#0e6b52,#34d399)' : 'linear-gradient(90deg,#7f1d2b,#fb7185)';
-  return `<i style="width:${Math.max(3,width)}%;background:${col}"></i>`;
+// ---- equity curve history (built client-side from polled session_realized) ----
+const HKEY="mz_hist_v1";
+let hist = [];
+try{ hist = JSON.parse(localStorage.getItem(HKEY)||"[]"); }catch(e){ hist=[]; }
+let lastBuys = null;
+
+function pushHist(snap){
+  const v = snap?.pnl?.session_realized;
+  const buys = snap?.pnl?.buys ?? 0;
+  if(v==null||isNaN(v)) return;
+  // Detect a fresh session (buy counter reset to/near 0) -> reset the curve.
+  if(lastBuys!=null && buys < lastBuys){ hist=[]; }
+  lastBuys = buys;
+  const t = (snap.updated||Math.floor(Date.now()/1000));
+  const last = hist[hist.length-1];
+  if(!last || last.t!==t || last.v!==v) hist.push({t, v});
+  if(hist.length>600) hist=hist.slice(-600);
+  try{ localStorage.setItem(HKEY, JSON.stringify(hist)); }catch(e){}
 }
 
-async function tick(){
-  let d;
-  try{ const r = await fetch('momentum_status.json?_='+Date.now(),{cache:'no-store'}); d = await r.json(); }
-  catch(e){ $('updated').textContent='waiting for bot (momentum_status.json)…'; return; }
+function drawChart(){
+  const cv=$("chart"); const box=cv.parentElement;
+  const dpr=window.devicePixelRatio||1;
+  const w=box.clientWidth, h=box.clientHeight;
+  cv.width=w*dpr; cv.height=h*dpr; const c=cv.getContext("2d"); c.scale(dpr,dpr);
+  c.clearRect(0,0,w,h);
+  // grid
+  c.strokeStyle="#0c1a16"; c.lineWidth=1;
+  for(let i=0;i<=5;i++){ const y=Math.round(h*i/5)+.5; c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke(); }
+  for(let i=0;i<=8;i++){ const x=Math.round(w*i/8)+.5; c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke(); }
+  if(hist.length<2){ c.fillStyle="#27463c"; c.font="10px monospace"; c.fillText("awaiting trades…",10,18); return; }
+  const vs=hist.map(p=>p.v);
+  let lo=Math.min(0,...vs), hi=Math.max(0,...vs); if(hi-lo<1e-6){hi+=0.01;lo-=0.01;}
+  const pad=(hi-lo)*0.12; hi+=pad; lo-=pad;
+  const X=i=>w*i/(hist.length-1);
+  const Y=v=>h-((v-lo)/(hi-lo))*h;
+  // zero line
+  const yz=Y(0); c.strokeStyle="#16332a"; c.setLineDash([3,3]); c.beginPath();c.moveTo(0,yz);c.lineTo(w,yz);c.stroke(); c.setLineDash([]);
+  const end=vs[vs.length-1]; const pos=end>=0;
+  const col=pos?"#1dff9b":"#ff4d6a";
+  // area fill
+  const grad=c.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,pos?"rgba(29,255,155,.28)":"rgba(255,77,106,.24)");
+  grad.addColorStop(1,"rgba(0,0,0,0)");
+  c.beginPath(); c.moveTo(0,yz);
+  hist.forEach((p,i)=>c.lineTo(X(i),Y(p.v)));
+  c.lineTo(w,yz); c.closePath(); c.fillStyle=grad; c.fill();
+  // line
+  c.beginPath(); hist.forEach((p,i)=>{ const x=X(i),y=Y(p.v); i?c.lineTo(x,y):c.moveTo(x,y); });
+  c.strokeStyle=col; c.lineWidth=1.6; c.shadowColor=col; c.shadowBlur=8; c.stroke(); c.shadowBlur=0;
+  // end dot
+  const ex=X(hist.length-1), ey=Y(end);
+  c.fillStyle=col; c.beginPath(); c.arc(ex,ey,2.6,0,7); c.fill();
+  $("cmeta").innerHTML = `hi ${hi.toFixed(3)}<br>lo ${lo.toFixed(3)}<br>${hist.length} pts`;
+}
 
+function peakDD(){
+  if(!hist.length) return {peak:0,dd:0};
+  let peak=-1e9, dd=0, run=-1e9;
+  hist.forEach(p=>{ run=Math.max(run,p.v); peak=Math.max(peak,p.v); dd=Math.min(dd,p.v-run); });
+  return {peak,dd};
+}
+
+function feedTag(ev,reason){
+  if(ev==="BUY") return ["buy","BUY"];
+  if(ev==="SELL_PARTIAL") return ["sp","SCALE"];
+  if(ev==="SELL_FULL"){ return /stop|collapse|dump/i.test(reason||"")?["hs","STOP"]:["sf","EXIT"]; }
+  return ["dim",ev];
+}
+
+function render(snap){
   // header
-  const mode = d.mode||'—';
-  const mb=$('mode'); mb.textContent=mode; mb.className='badge '+(mode==='LIVE'?'live':'dry');
-  $('halt').style.display = d.halted ? 'inline-block':'none';
-  if(d.halted){ $('halt').className='badge halt'; }
-  const age = Math.floor(Date.now()/1000) - (d.updated||0);
-  $('updated').textContent = 'updated '+ago(age)+' ago';
+  const mode=(snap.mode||"").toUpperCase();
+  const live = mode.includes("LIVE");
+  $("mode").textContent=mode||"—"; $("mode").className="pill "+(live?"live":"dry");
+  $("modec").textContent= live?"live":"dry";
+  $("halt").style.display = snap.halted?"inline-block":"none";
 
-  // hero
-  const sp=d.pnl?.session_realized??0;
-  const sPnl=$('sessionPnl'); sPnl.textContent=sol(sp); sPnl.className='pnl-big '+cls(sp);
-  const tp=d.pnl?.today_realized??0;
-  const tPnl=$('todayPnl'); tPnl.textContent=sol(tp); tPnl.className=cls(tp);
-  $('buys').textContent=d.pnl?.buys??0; $('sells').textContent=d.pnl?.sells??0;
-  $('streak').textContent=d.consecutive_losses??0;
+  // pnl
+  const p=snap.pnl||{};
+  pushHist(snap);
+  const sess=p.session_realized||0;
+  $("pnlSession").innerHTML=`<span class="${cls(sess)}">${fmtSol(sess)}</span>`;
+  $("pnlToday").innerHTML=`<span class="${cls(p.today_realized||0)}">${fmtSol(p.today_realized||0)}</span>`;
+  $("bs").textContent=`${p.buys||0} / ${p.sells||0}`;
+  $("heroBig").textContent=fmtSol(sess); $("heroBig").className="big "+cls(sess);
+  const pd=peakDD();
+  $("heroPeak").textContent=fmtSol(pd.peak); $("heroDD").textContent=fmtSol(pd.dd,false);
 
-  $('openCount').textContent=(d.counts?.open_positions??0)+' / '+(d.counts?.max_positions??0);
-  const dep=d.capital?.deployed_sol??0, mx=d.capital?.max_deployed_sol??1;
-  $('deployed').textContent=dep.toFixed(3); $('maxDeployed').textContent=mx.toFixed(2);
-  $('capBar').style.width=Math.min(100,dep/mx*100)+'%';
+  // win rate from feed (full exits)
+  const feed=snap.feed||[];
+  const exits=feed.filter(e=>e.event==="SELL_FULL");
+  const wins=exits.filter(e=>(e.pnl_sol||0)>0).length;
+  const wr = exits.length? (wins/exits.length*100):0;
+  $("winrate").textContent = exits.length? wr.toFixed(1)+"%  ("+wins+"/"+exits.length+")":"—";
+  $("winbar").firstElementChild.style.width=wr+"%";
+  const tokens = new Set(feed.filter(e=>e.event==="BUY").map(e=>e.mint)).size;
+  $("avgtok").innerHTML = tokens? `<span class="${cls(sess)}">${fmtSol(sess/tokens)}</span>`:"—";
 
-  $('sizeStat').textContent=(d.config?.position_size_sol??0)+' SOL · '+mode;
-  $('entryScore').textContent=d.config?.entry_score??'—';
-  $('stop').textContent=d.config?.hard_stop_pct??'—';
-  $('kolMode').textContent = d.config?.kol_enabled ? ('KOL: '+(d.config.kol_require?'PURE (only KOL buys)':'boost')) : 'KOL: off';
+  // capital
+  const cap=snap.capital||{}; const c=snap.counts||{}; const cfg=snap.config||{};
+  const dep=cap.deployed_sol||0, max=cap.max_deployed_sol||1;
+  $("deployed").textContent=`${dep.toFixed(3)} / ${max.toFixed(2)}`;
+  $("capbar").firstElementChild.style.width=Math.min(100,dep/max*100)+"%";
+  $("pos").textContent=`${c.open_positions||0} / ${c.max_positions||0}`;
+  $("posbar").firstElementChild.style.width=Math.min(100,(c.open_positions||0)/(c.max_positions||1)*100)+"%";
+  const st=snap.consecutive_losses||0;
+  $("streak").innerHTML = st>0?`<span class="down">${st}</span>`:"0";
 
-  // tiles
-  $('tTracked').textContent=d.counts?.tokens_tracked??0;
-  $('tKol').textContent=d.counts?.kol_wallets??0;
-  $('tKolHot').textContent=d.counts?.kol_hot??0;
-  $('tGmgn').textContent=d.counts?.gmgn_watchlist??0;
-  $('tBuys').textContent=d.pnl?.buys??0;
-  $('tSells').textContent=d.pnl?.sells??0;
+  // memory
+  $("walletRep").textContent=(c.wallet_rep||0).toLocaleString();
+  $("alphaProven").textContent=(c.alpha_proven||0).toLocaleString();
+  $("tracked").textContent=(c.tokens_tracked||0).toLocaleString();
+  $("kolc").textContent=`${c.kol_wallets||0} / ${c.kol_hot||0}`;
+
+  // config
+  $("cfgScore").textContent=cfg.entry_score ?? "—";
+  $("cfgSize").textContent=(cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—");
+  $("cfgStop").textContent=(cfg.hard_stop_pct!=null?cfg.hard_stop_pct+"%":"—");
+  $("cfgLoss").textContent=(cfg.daily_loss_limit_sol!=null?cfg.daily_loss_limit_sol+" SOL":"—");
+  $("cfgAlpha").innerHTML = cfg.alpha_follow? `<span class="up">ON</span> · rep≥${cfg.alpha_rep_min}/${cfg.alpha_min_samples}` : `<span class="dim">off</span>`;
+  $("cfgKol").textContent = cfg.kol_enabled? (cfg.kol_require?"PURE-KOL":"boost"):"off";
 
   // positions
-  const pos=d.positions||[];
-  const pc=$('positions');
-  if(!pos.length){ pc.innerHTML='<div class="empty">No open positions yet…</div>'; }
-  else{
-    pc.innerHTML=pos.map(p=>{
-      const k=p.kol?`<span class="pill kol">★ ${p.kol}</span>`:'';
-      const sell=p.selling?`<span class="pill" style="color:var(--red);border-color:#5a1a24">selling…</span>`:'';
-      return `<div class="prow ${p.selling?'sell':''}">
-        <div>
-          <div class="mint">${shortMint(p.mint)}${k}${sell}</div>
-          <div class="meta">
-            <span>mcap ${p.entry_mcap.toFixed(1)}→<b>${p.current_mcap.toFixed(1)}</b> SOL</span>
-            <span>size ${Number(p.size_sol).toFixed(3)}</span>
-            <span>held ${Number(p.remaining_pct).toFixed(0)}%</span>
-            <span>rungs ${p.rungs_hit}/4</span>
-            <span>peak ${Number(p.peak_pnl).toFixed(0)}%</span>
-            <span>age ${ago(p.age_secs)}</span>
-          </div>
-        </div>
-        <div class="pnl ${cls(p.pnl_pct)}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(1)}%</div>
-        <div class="pbar">${pnlBar(p.pnl_pct)}</div>
-      </div>`;
-    }).join('');
-  }
-
-  // KOL leaderboard
-  const lb=d.kol_leaderboard||[];
-  const bc=$('board');
-  if(!lb.length){ bc.innerHTML='<div class="empty">No KOL trades closed yet…</div>'; }
-  else{
-    bc.innerHTML=lb.map((k,i)=>{
-      const tot=(k.wins||0)+(k.losses||0);
-      const wr=tot?Math.round((k.wins||0)/tot*100):0;
-      const medal=i===0?'🥇':i===1?'🥈':i===2?'🥉':`#${i+1}`;
-      const v=Number(k.realized_sol||0);
-      return `<div class="ev ${v>=0?'buy':'sellf'}">
-        <div class="top">
-          <span><b>${medal}</b> <span class="pill kol">★ ${k.kol}</span></span>
-          <span class="${cls(v)}" style="font-weight:800">${sol(v)}</span>
-        </div>
-        <div class="rsn">${k.wins||0}W / ${k.losses||0}L · ${wr}% win${tot? '':' · open'}</div>
-      </div>`;
-    }).join('');
-  }
+  const pb=$("posBody"); pb.innerHTML="";
+  (snap.positions||[]).forEach(o=>{
+    const tr=document.createElement("tr");
+    const lead=o.kol? `<span class="cy">${o.kol}</span>`:`<span class="dim">·</span>`;
+    const sel=o.selling?` <span class="am">⟳</span>`:"";
+    tr.innerHTML=`<td class="mint">${shortMint(o.mint)}${sel}</td><td>${lead}</td>`+
+      `<td>${ago(snap.updated-(o.age_secs||0))}</td>`+
+      `<td>${(o.current_mcap||0).toFixed(1)}</td>`+
+      `<td class="dim">${(o.peak_pnl||0).toFixed(0)}%</td>`+
+      `<td class="dim">${(o.remaining_pct||0).toFixed(0)}%</td>`+
+      `<td class="${cls(o.pnl_pct)}">${(o.pnl_pct>0?"+":"")+(o.pnl_pct||0).toFixed(1)}%</td>`;
+    pb.appendChild(tr);
+  });
+  $("posCount").textContent=(snap.positions||[]).length;
 
   // feed
-  const fz=d.feed||[];
-  const fc=$('feed');
-  if(!fz.length){ fc.innerHTML='<div class="empty">Waiting for activity…</div>'; }
-  else{
-    fc.innerHTML=fz.map(e=>{
-      const t=e.event==='BUY'?'buy':(e.event==='SELL_FULL'?'sellf':'sellp');
-      const icon=e.event==='BUY'?'🟢 BUY':(e.event==='SELL_FULL'?'🔴 EXIT':'🟡 SCALE');
-      const pnl=(e.event!=='BUY')?` <span class="${cls(e.pnl_sol)}">${sol(e.pnl_sol)}</span>`:'';
-      const fage=Math.floor(Date.now()/1000)-(e.ts||0);
-      return `<div class="ev ${t}">
-        <div class="top"><span><b>${icon}</b> ${shortMint(e.mint)}${pnl}</span><span style="color:var(--dim)">${ago(fage)} ago</span></div>
-        <div class="rsn">${(e.reason||'').replace(/</g,'&lt;')}</div>
-      </div>`;
-    }).join('');
+  const fd=$("feed"); fd.innerHTML="";
+  feed.forEach(e=>{
+    const [k,lab]=feedTag(e.event,e.reason);
+    const div=document.createElement("div"); div.className="ev";
+    const pl = e.event==="BUY"? "" : `<span class="pl ${cls(e.pnl_sol)}">${fmtSol(e.pnl_sol)}</span>`;
+    div.innerHTML=`<span class="t">${ago(e.ts)}</span><span class="tag ${k}">${lab}</span>`+
+      `<span class="m" title="${e.reason||""}">${shortMint(e.mint)} <span class="dim">${(e.reason||"").replace(/momentum entry ?/,'')}</span></span>${pl}`;
+    fd.appendChild(div);
+  });
+  $("feedCount").textContent=feed.length;
+
+  // lead attribution / leaderboard
+  const kb=$("kolBody"); kb.innerHTML="";
+  (snap.kol_leaderboard||[]).forEach(k=>{
+    const tot=(k.wins||0)+(k.losses||0); const wpc=tot?(k.wins/tot*100):0;
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="cy">${k.kol||"·"}</td>`+
+      `<td><span class="miniwin" style="width:${wpc*0.3}px"></span><span class="minilose" style="width:${(100-wpc)*0.3}px"></span> <span class="dim">${k.wins||0}/${k.losses||0}</span></td>`+
+      `<td class="${cls(k.realized_sol)}">${fmtSol(k.realized_sol)}</td>`;
+    kb.appendChild(tr);
+  });
+  if(!(snap.kol_leaderboard||[]).length) kb.innerHTML=`<tr><td colspan=3 class="dim">no attributed trades yet</td></tr>`;
+
+  // scout list
+  const ab=$("alphaBody"); ab.innerHTML="";
+  (snap.top_alpha||[]).forEach(a=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="cy">${shortMint(a.wallet)}</td><td class="dim">${a.samples}</td>`+
+      `<td class="up">+${(a.score||0).toFixed(3)}</td>`;
+    ab.appendChild(tr);
+  });
+  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=3 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
+
+  // exit mix
+  const mix={};
+  exits.concat(feed.filter(e=>e.event==="SELL_PARTIAL")).forEach(e=>{
+    const r=(e.reason||"other").replace(/\s*\([^)]*\)/,'').replace(/[+\-]?\d+\.?\d*%?/g,'').trim()||"exit";
+    if(!mix[r])mix[r]={n:0,sol:0}; mix[r].n++; mix[r].sol+=(e.pnl_sol||0);
+  });
+  const eb=$("exitBody"); eb.innerHTML="";
+  Object.entries(mix).sort((a,b)=>b[1].sol-a[1].sol).forEach(([r,d])=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${r}</td><td class="dim">${d.n}</td><td class="${cls(d.sol)}">${fmtSol(d.sol)}</td>`;
+    eb.appendChild(tr);
+  });
+  if(!Object.keys(mix).length) eb.innerHTML=`<tr><td colspan=3 class="dim">no exits yet</td></tr>`;
+
+  // stamps
+  const age=Math.floor(Date.now()/1000)-(snap.updated||0);
+  $("led").className="led"+(age>15?" stale":"");
+  $("conn").textContent = age>15? `stale ${age}s`:"live";
+  $("ftStamp").textContent="updated "+ago(snap.updated)+" ago · "+new Date((snap.updated||0)*1000).toLocaleTimeString();
+  drawChart();
+}
+
+function tickClock(){ $("clock").textContent=new Date().toLocaleTimeString(); }
+setInterval(tickClock,1000); tickClock();
+
+async function poll(){
+  try{
+    const r=await fetch("momentum_status.json?_="+Date.now(),{cache:"no-store"});
+    if(!r.ok) throw new Error(r.status);
+    render(await r.json());
+  }catch(e){
+    $("conn").textContent="no data"; $("led").className="led stale";
   }
 }
-tick(); setInterval(tick, 2000);
+poll(); setInterval(poll,1500);
+window.addEventListener("resize",drawChart);
 </script>
 </body>
 </html>

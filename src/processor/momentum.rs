@@ -894,6 +894,23 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
     }).collect();
     kol_board.sort_by(|a, b| b["realized_sol"].as_f64().unwrap_or(0.0).partial_cmp(&a["realized_sol"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
 
+    // The bot's self-discovered "scout list": wallets it learned are proven, plus
+    // the strongest few — this is the compounding memory made visible.
+    let mut proven = 0usize;
+    let mut top_alpha: Vec<(String, f64, u32)> = Vec::new();
+    for e in WALLET_REP.iter() {
+        let r = e.value();
+        if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+            proven += 1;
+            top_alpha.push((e.key().clone(), r.score, r.samples));
+        }
+    }
+    top_alpha.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_alpha.truncate(15);
+    let top_alpha: Vec<serde_json::Value> = top_alpha.into_iter()
+        .map(|(w, s, n)| serde_json::json!({ "wallet": w, "score": s, "samples": n }))
+        .collect();
+
     let snap = serde_json::json!({
         "updated": now,
         "mode": if cfg.dry_run { "DRY RUN" } else { "LIVE" },
@@ -913,6 +930,8 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "kol_wallets": KOL_WALLETS.len(),
             "kol_hot": KOL_HOT.len(),
             "gmgn_watchlist": GMGN_WATCHLIST.len(),
+            "wallet_rep": WALLET_REP.len(),
+            "alpha_proven": proven,
         },
         "config": {
             "position_size_sol": cfg.position_size_sol,
@@ -921,10 +940,14 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "kol_enabled": cfg.kol_enabled,
             "kol_require": cfg.kol_require,
             "daily_loss_limit_sol": cfg.daily_loss_limit_sol,
+            "alpha_follow": cfg.alpha_follow_enabled,
+            "alpha_rep_min": cfg.alpha_rep_min,
+            "alpha_min_samples": cfg.alpha_min_samples,
         },
         "positions": positions,
         "feed": feed,
         "kol_leaderboard": kol_board,
+        "top_alpha": top_alpha,
     });
 
     let tmp = format!("{}.tmp", cfg.status_file);
