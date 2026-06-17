@@ -216,6 +216,9 @@ pub struct MomentumConfig {
     pub kol_reload_secs: u64,
     /// Path for the live dashboard status snapshot JSON ("" disables).
     pub status_file: String,
+    /// File to persist open positions so a crash/restart never loses exit
+    /// management of money already in the market ("" disables persistence).
+    pub positions_file: String,
     /// Transaction landing route: "zeroslot" | "jito" | "multi" (jito+rpc broadcast).
     pub landing: String,
     /// Exit a held token when its real SOL reserves reach this (bonding curve is
@@ -355,6 +358,7 @@ impl MomentumConfig {
             kol_require: std::env::var("MOMENTUM_KOL_REQUIRE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
             status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
+            positions_file: std::env::var("MOMENTUM_POSITIONS_FILE").unwrap_or_else(|_| "momentum_positions.json".to_string()),
             landing: std::env::var("MOMENTUM_LANDING").unwrap_or_else(|_| "zeroslot".to_string()).to_lowercase(),
             migration_exit_sol: env_f64("MOMENTUM_MIGRATION_EXIT_SOL", 82.0),
 
@@ -459,6 +463,7 @@ pub struct MomentumSignal {
 }
 
 /// An open position managed by the momentum exit policy.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct MomentumPosition {
     entry_mcap: f64,
     /// SOL actually sent on the buy (the swap amount_in).
@@ -483,6 +488,8 @@ struct MomentumPosition {
 lazy_static! {
     static ref TOKEN_STATE: DashMap<String, TokenMomentum> = DashMap::new();
     static ref POSITIONS: DashMap<String, MomentumPosition> = DashMap::new();
+    /// Path positions are persisted to (set at startup). Empty = persistence off.
+    static ref POSITIONS_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
     static ref RECENTLY_EXITED: DashMap<String, u64> = DashMap::new();
     static ref IN_FLIGHT_BUYS: AtomicUsize = AtomicUsize::new(0);
     static ref MOMENTUM_RUNNING: AtomicBool = AtomicBool::new(true);
@@ -1564,6 +1571,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 entry_ts: now,
                 kol_label: lead_label.clone().unwrap_or_default(),
             });
+            save_positions(); // crash-safety: a new open position is on disk immediately
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
                 mint: &mint,
@@ -1768,6 +1776,50 @@ fn finalize_exit(mint: &str) {
     BOUGHT_TOKEN_LIST.remove(mint);
     TOKEN_STATE.remove(mint);
     RECENTLY_EXITED.insert(mint.to_string(), now_secs());
+    save_positions();
+}
+
+/// Persist all open positions atomically (tmp + rename) so a crash/restart never
+/// loses exit management of money already in the market. Called on every change.
+fn save_positions() {
+    let path = match POSITIONS_PATH.lock() {
+        Ok(p) => p.clone(),
+        Err(_) => return,
+    };
+    if path.is_empty() {
+        return;
+    }
+    let map: HashMap<String, MomentumPosition> = POSITIONS
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    if let Ok(json) = serde_json::to_string(&map) {
+        let tmp = format!("{}.tmp", path);
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Restore open positions saved by a previous run so the exit monitor resumes
+/// managing them. Returns the recovered mints. The transient `selling` lock is
+/// cleared so each restored position is freshly re-evaluated.
+fn load_positions(path: &str) -> Vec<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let map: HashMap<String, MomentumPosition> = match serde_json::from_str(&content) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mut recovered = Vec::new();
+    for (mint, mut pos) in map {
+        pos.selling = false;
+        POSITIONS.insert(mint.clone(), pos);
+        recovered.push(mint);
+    }
+    recovered
 }
 
 /// Evaluate one position against the live signal and act.
@@ -1906,15 +1958,18 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             return;
         }
         if is_full {
-            finalize_exit(&mint);
-        } else if let Some(mut p) = POSITIONS.get_mut(&mint) {
-            if let Some(i) = decision.rung_index {
-                if i < p.rungs_hit.len() {
-                    p.rungs_hit[i] = true;
+            finalize_exit(&mint); // persists via save_positions()
+        } else {
+            if let Some(mut p) = POSITIONS.get_mut(&mint) {
+                if let Some(i) = decision.rung_index {
+                    if i < p.rungs_hit.len() {
+                        p.rungs_hit[i] = true;
+                    }
                 }
+                p.remaining_fraction = (p.remaining_fraction - decision.frac_of_original).max(0.0);
+                p.selling = false;
             }
-            p.remaining_fraction = (p.remaining_fraction - decision.frac_of_original).max(0.0);
-            p.selling = false;
+            save_positions(); // persist the reduced position (rung hit + fraction)
         }
     };
 
@@ -2165,6 +2220,26 @@ async fn momentum_startup(
         *base = 0.0;
     }
     MOMENTUM_RUNNING.store(true, Ordering::SeqCst);
+
+    // Crash recovery: adopt any open positions a previous run left on disk so the
+    // exit monitor resumes managing them. Without this, a crash/restart silently
+    // abandons money already in the market (no stop-loss, no scale-out running).
+    if let Ok(mut p) = POSITIONS_PATH.lock() {
+        *p = cfg.positions_file.clone();
+    }
+    if !cfg.positions_file.is_empty() {
+        let recovered = load_positions(&cfg.positions_file);
+        if !recovered.is_empty() {
+            logger.log(format!(
+                "♻️  Recovered {} open position(s) from {} — resuming exit management: {}",
+                recovered.len(), cfg.positions_file,
+                recovered.iter().map(|m| m.chars().take(6).collect::<String>()).collect::<Vec<_>>().join(", "),
+            ).yellow().bold().to_string());
+            if !cfg.dry_run {
+                logger.log("⚠️  LIVE recovery: verify these are still held on-chain. A position already sold/illiquid will fail its next sell harmlessly, but check your wallet.".yellow().to_string());
+            }
+        }
+    }
 
     let app_state = Arc::new(sniper.app_state.clone());
     let sniper = Arc::new(sniper);
