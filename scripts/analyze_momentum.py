@@ -61,6 +61,8 @@ def categorize(reason):
         return "hard stop"
     if "trailing" in r:
         return "trailing stop (let it run)"
+    if "stagnation" in r:
+        return "stagnation stop (dead token)"
     if "collapse" in r:
         return "momentum collapse"
     if "scale-out" in r:

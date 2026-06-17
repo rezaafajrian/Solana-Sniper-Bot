@@ -94,8 +94,17 @@ pub struct MomentumConfig {
     pub position_size_sol: f64,
     pub max_positions: usize,
     pub entry_score: f64,
+    /// Minimum BASE momentum score (before KOL/alpha/GMGN boosts) required to enter.
+    /// Stops boost-only entries on weak tokens — you need real momentum AND a signal,
+    /// not just a smart-wallet tag on a dead chart. 0 disables.
+    pub min_base_score: f64,
     pub collapse_score: f64,
     pub hard_stop_pct: f64,
+    /// Stagnation time-stop: if a position never reaches `stagnation_min_pnl`% within
+    /// `stagnation_secs`, cut it — dead tokens tie up a slot and bleed into a hard stop.
+    /// 0 secs disables.
+    pub stagnation_secs: u64,
+    pub stagnation_min_pnl: f64,
     pub short_window_secs: u64,
     pub medium_window_secs: u64,
     pub min_buy_volume_sol: f64,
@@ -299,8 +308,11 @@ impl MomentumConfig {
             position_size_sol: env_f64("MOMENTUM_POSITION_SIZE_SOL", 0.2),
             max_positions: env_usize("MOMENTUM_MAX_POSITIONS", 5),
             entry_score: env_f64("MOMENTUM_ENTRY_SCORE", 65.0),
+            min_base_score: env_f64("MOMENTUM_MIN_BASE_SCORE", 0.0),
             collapse_score: env_f64("MOMENTUM_COLLAPSE_SCORE", 35.0),
             hard_stop_pct: env_f64("MOMENTUM_HARD_STOP_PCT", -35.0),
+            stagnation_secs: env_u64("MOMENTUM_STAGNATION_SECS", 0),
+            stagnation_min_pnl: env_f64("MOMENTUM_STAGNATION_MIN_PNL", 20.0),
             short_window_secs: env_u64("MOMENTUM_SHORT_WINDOW_SECS", 30),
             medium_window_secs: env_u64("MOMENTUM_MEDIUM_WINDOW_SECS", 120),
             min_buy_volume_sol: env_f64("MOMENTUM_MIN_BUY_VOLUME_SOL", 2.0),
@@ -402,6 +414,11 @@ impl MomentumConfig {
         }
         logger.log(format!("Buy strength not age | position {} SOL x {} slots", self.position_size_sol, self.max_positions));
         logger.log(format!("Entry score >= {} | collapse < {} | hard stop {}%", self.entry_score, self.collapse_score, self.hard_stop_pct));
+        logger.log(format!(
+            "Entry filters: base-momentum floor {} | stagnation stop {}",
+            if self.min_base_score > 0.0 { format!(">= {:.0} (boosts can't bypass)", self.min_base_score) } else { "off".to_string() },
+            if self.stagnation_secs > 0 { format!("cut if peak < {:.0}% after {}s", self.stagnation_min_pnl, self.stagnation_secs) } else { "off".to_string() },
+        ));
         logger.log(format!("Windows: short {}s / baseline {}s", self.short_window_secs, self.medium_window_secs));
         logger.log(format!(
             "Targets: min buy vol {} SOL, {} unique buyers, {:.0}% mcap growth, max wallet concentration {:.0}%",
@@ -1463,6 +1480,11 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     if effective_score < cfg.entry_score {
         return;
     }
+    // Base-momentum floor: a boost (KOL/alpha/GMGN) can't drag in a token that has
+    // no real momentum of its own. Require genuine strength AND the signal.
+    if cfg.min_base_score > 0.0 && signal.score < cfg.min_base_score {
+        return;
+    }
     if POSITIONS.contains_key(&mint) || BOUGHT_TOKEN_LIST.contains_key(&mint) {
         return;
     }
@@ -1923,6 +1945,17 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         else if pnl <= cfg.hard_stop_pct {
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
+        }
+        // 1b. Stagnation time-stop: a position that never reached the min PnL within
+        // the time window is a dud — cut it before it bleeds into a hard stop and free
+        // the slot. Uses peak (not current) so a spiked-then-faded token is left to the
+        // trailing stop instead.
+        else if cfg.stagnation_secs > 0
+            && now.saturating_sub(pos.entry_ts) >= cfg.stagnation_secs
+            && pos.peak_pnl < cfg.stagnation_min_pnl
+        {
+            pos.selling = true;
+            Decision::full(pos.remaining_fraction, format!("stagnation (peak {:.0}% after {}s)", pos.peak_pnl, now.saturating_sub(pos.entry_ts)), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
         // 2. Trailing stop: once a position has run past the activation threshold,
         // ride it and exit only when it gives back a chunk of its PEAK gain. This is
