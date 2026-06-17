@@ -117,9 +117,9 @@
       <div class="kv"><span class="k">session realized</span><span class="v" id="pnlSession">—</span></div>
       <div class="kv"><span class="k">today realized</span><span class="v" id="pnlToday">—</span></div>
       <div class="kv"><span class="k">buys / sells</span><span class="v" id="bs">—</span></div>
-      <div class="kv"><span class="k">win rate</span><span class="v" id="winrate">—</span></div>
+      <div class="kv"><span class="k">win rate <span class="dim">(recent)</span></span><span class="v" id="winrate">—</span></div>
       <div class="bar" id="winbar"><i style="width:0%"></i></div>
-      <div class="kv"><span class="k">avg / token</span><span class="v" id="avgtok">—</span></div>
+      <div class="kv"><span class="k">avg / buy</span><span class="v" id="avgtok">—</span></div>
     </div>
 
     <div class="panel">
@@ -317,8 +317,9 @@ function render(snap){
   const wr = exits.length? (wins/exits.length*100):0;
   $("winrate").textContent = exits.length? wr.toFixed(1)+"%  ("+wins+"/"+exits.length+")":"—";
   $("winbar").firstElementChild.style.width=wr+"%";
-  const tokens = new Set(feed.filter(e=>e.event==="BUY").map(e=>e.mint)).size;
-  $("avgtok").innerHTML = tokens? `<span class="${cls(sess)}">${fmtSol(sess/tokens)}</span>`:"—";
+  // True session avg per buy uses the full session buy count (not the feed window).
+  const buys = p.buys||0;
+  $("avgtok").innerHTML = buys? `<span class="${cls(sess)}">${fmtSol(sess/buys)}</span>`:"—";
 
   // capital
   const cap=snap.capital||{}; const c=snap.counts||{}; const cfg=snap.config||{};
