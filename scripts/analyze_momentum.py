@@ -59,10 +59,14 @@ def categorize(reason):
         return "insider/leader-dump exit"
     if "hard stop" in r:
         return "hard stop"
+    if "trailing" in r:
+        return "trailing stop (let it run)"
     if "collapse" in r:
         return "momentum collapse"
     if "scale-out" in r:
         return "scale-out (profit)"
+    if "migration" in r:
+        return "migration exit"
     return "other"
 
 
@@ -202,17 +206,7 @@ def main():
     cat_pnl = defaultdict(float)
     cat_n = defaultdict(int)
     for _mint, pnl, row in realized_rows(rows):
-        r = row["reason"].lower()
-        if "insider" in r or "leader" in r:
-            cat = "insider/leader-dump exit"
-        elif "hard stop" in r:
-            cat = "hard stop"
-        elif "collapse" in r:
-            cat = "momentum collapse"
-        elif "scale-out" in r:
-            cat = "scale-out (profit)"
-        else:
-            cat = "other"
+        cat = categorize(row["reason"])
         cat_pnl[cat] += pnl
         cat_n[cat] += 1
     if cat_n:
