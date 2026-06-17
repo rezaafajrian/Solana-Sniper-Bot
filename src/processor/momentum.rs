@@ -109,6 +109,10 @@ pub struct MomentumConfig {
     /// (round-tripping / wash trading). Above this, the score is cut.
     pub max_wash_fraction: f64,
     pub scale_out_targets: Vec<f64>,
+    /// Fraction of the ORIGINAL position to sell at each corresponding rung.
+    /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
+    /// migration) is whatever's left: 1.0 - sum(fractions).
+    pub scale_out_fractions: Vec<f64>,
     pub slippage_bps: u64,
     /// Allow buying a token again (after the exit cooldown) if it re-pumps.
     pub allow_reentry: bool,
@@ -250,6 +254,30 @@ impl MomentumConfig {
             .split(',')
             .filter_map(|s| s.trim().parse::<f64>().ok())
             .collect::<Vec<f64>>();
+        let scale_out_targets = if scale_out_targets.is_empty() {
+            vec![100.0, 200.0, 300.0, 400.0]
+        } else {
+            scale_out_targets
+        };
+
+        // Per-rung sell fractions (of the ORIGINAL position), aligned 1:1 with the
+        // targets. Default each rung to 0.20. Missing rungs default to 0.20, extras
+        // are dropped, and cumulative is clamped to <= 1.0 so the runner (what's left)
+        // is never negative. Sell less per rung to keep a fatter runner for moonshots.
+        let scale_out_fractions = {
+            let mut f = std::env::var("MOMENTUM_SCALE_OUT_FRACTIONS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .collect::<Vec<f64>>();
+            f.resize(scale_out_targets.len(), 0.20);
+            let mut cum: f64 = 0.0;
+            for x in f.iter_mut() {
+                *x = x.clamp(0.0, (1.0 - cum).max(0.0));
+                cum += *x;
+            }
+            f
+        };
 
         Self {
             position_size_sol: env_f64("MOMENTUM_POSITION_SIZE_SOL", 0.2),
@@ -265,11 +293,8 @@ impl MomentumConfig {
             max_wallet_concentration: env_f64("MOMENTUM_MAX_WALLET_CONCENTRATION", 0.50),
             min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
             max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
-            scale_out_targets: if scale_out_targets.is_empty() {
-                vec![100.0, 200.0, 300.0, 400.0]
-            } else {
-                scale_out_targets
-            },
+            scale_out_targets,
+            scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
             allow_reentry: std::env::var("MOMENTUM_ALLOW_REENTRY")
                 .map(|v| v.to_lowercase() != "false")
@@ -362,7 +387,10 @@ impl MomentumConfig {
             "Anti-fake: min buyer diversity {:.2}, max wash fraction {:.2}",
             self.min_buyer_diversity, self.max_wash_fraction,
         ));
-        logger.log(format!("Scale-out rungs (20% each): {:?}% PnL, then 20% runner", self.scale_out_targets));
+        let runner = (1.0 - self.scale_out_fractions.iter().sum::<f64>()).max(0.0);
+        let rungs: Vec<String> = self.scale_out_targets.iter().zip(self.scale_out_fractions.iter())
+            .map(|(t, f)| format!("+{:.0}%→sell {:.0}%", t, f * 100.0)).collect();
+        logger.log(format!("Scale-out: {} | runner {:.0}% (held to collapse/migration)", rungs.join(", "), runner * 100.0));
         logger.log(format!(
             "Edge: smart-money {} (boost <= {:.0} pts, >= {} distinct) | leader-dump exit {} (>= {} SOL) | conviction sizing {} (<= {:.1}x)",
             if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max, self.smart_money_min_distinct,
@@ -1811,29 +1839,37 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
-        // 3. Scale-out ladder: take 20% of the original at the next uncleared rung.
-        // NOTE: the rung is NOT marked hit here — that happens only after the sell
-        // confirms, so a failed sell never silently consumes a rung.
+        // 3. Scale-out ladder: take the configured fraction of the ORIGINAL at the
+        // next uncleared rung (default 20% each). NOTE: the rung is NOT marked hit
+        // here — that happens only after the sell confirms, so a failed sell never
+        // silently consumes a rung.
         else {
-            let mut chosen: Option<(usize, f64)> = None;
+            let mut chosen: Option<(usize, f64, f64)> = None;
             for (i, target) in cfg.scale_out_targets.iter().enumerate() {
                 if !pos.rungs_hit[i] && pnl >= *target {
-                    // Sell 0.2 of the original = (0.2 / remaining_fraction) of the current balance.
-                    let frac_of_current = (0.2 / pos.remaining_fraction).min(1.0);
-                    chosen = Some((i, frac_of_current));
+                    let frac_orig = cfg.scale_out_fractions.get(i).copied().unwrap_or(0.20);
+                    if frac_orig <= 0.0 {
+                        // A zero-size rung: mark it consumed-on-confirm with no sell
+                        // would be wrong; just skip it and let the next rung apply.
+                        continue;
+                    }
+                    // Sell frac_orig of the original = (frac_orig / remaining_fraction)
+                    // of the CURRENT balance.
+                    let frac_of_current = (frac_orig / pos.remaining_fraction).min(1.0);
+                    chosen = Some((i, frac_of_current, frac_orig));
                     break;
                 }
             }
             match chosen {
-                Some((i, frac_of_current)) => {
+                Some((i, frac_of_current, frac_orig)) => {
                     pos.selling = true; // lock the position while the sell is in flight
                     let tgt = cfg.scale_out_targets[i];
                     Decision {
                         action: ExitAction::Partial,
                         frac_of_current,
-                        frac_of_original: 0.2,
+                        frac_of_original: frac_orig,
                         rung_index: Some(i),
-                        reason: format!("scale-out +{:.0}% (pnl {:.1}%)", tgt, pnl),
+                        reason: format!("scale-out +{:.0}% (sell {:.0}%, pnl {:.1}%)", tgt, frac_orig * 100.0, pnl),
                         pnl,
                         entry_mcap,
                         current_mcap: signal.current_mcap,
