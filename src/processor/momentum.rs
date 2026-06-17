@@ -168,6 +168,19 @@ pub struct MomentumConfig {
     pub leader_track_top_n: usize,
     /// If tracked wallets sell at least this many SOL in the short window, exit.
     pub leader_dump_sol: f64,
+    /// Fraction of the held position to sell on an insider-dump signal (1.0 = full
+    /// exit, the protective default; lower keeps a runner that rides via the trail).
+    pub leader_dump_fraction: f64,
+
+    // ---- Edge: trailing stop (let winners run) ----
+    /// Once a position's peak PnL clears `trail_activate_pct`, ride it and exit only
+    /// when it gives back `trail_giveback_frac` of that peak — instead of dumping the
+    /// whole bag on the first momentum wobble. Captures continued pumps.
+    pub trail_enabled: bool,
+    /// Peak PnL% a position must reach before the trailing stop arms.
+    pub trail_activate_pct: f64,
+    /// Fraction of the peak gain given back (from the peak) that triggers the exit.
+    pub trail_giveback_frac: f64,
 
     // ---- Edge: conviction-based sizing ----
     /// Scale position size up with the entry score (higher conviction = bigger size).
@@ -334,6 +347,13 @@ impl MomentumConfig {
                 .unwrap_or(true),
             leader_track_top_n: env_usize("MOMENTUM_LEADER_TRACK_TOP_N", 5),
             leader_dump_sol: env_f64("MOMENTUM_LEADER_DUMP_SOL", 1.0),
+            leader_dump_fraction: env_f64("MOMENTUM_LEADER_DUMP_FRACTION", 1.0).clamp(0.0, 1.0),
+
+            trail_enabled: std::env::var("MOMENTUM_TRAIL_ENABLED")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            trail_activate_pct: env_f64("MOMENTUM_TRAIL_ACTIVATE_PCT", 50.0),
+            trail_giveback_frac: env_f64("MOMENTUM_TRAIL_GIVEBACK_FRAC", 0.35).clamp(0.05, 0.95),
 
             conviction_sizing: std::env::var("MOMENTUM_CONVICTION_SIZING")
                 .map(|v| v.to_lowercase() == "true")
@@ -395,6 +415,11 @@ impl MomentumConfig {
         let rungs: Vec<String> = self.scale_out_targets.iter().zip(self.scale_out_fractions.iter())
             .map(|(t, f)| format!("+{:.0}%→sell {:.0}%", t, f * 100.0)).collect();
         logger.log(format!("Scale-out: {} | runner {:.0}% (held to collapse/migration)", rungs.join(", "), runner * 100.0));
+        logger.log(format!(
+            "Trailing stop: {} | arms at +{:.0}% peak, exits on {:.0}% giveback from peak | insider-dump sells {:.0}% of position",
+            if self.trail_enabled { "ON (lets winners run)" } else { "off" },
+            self.trail_activate_pct, self.trail_giveback_frac * 100.0, self.leader_dump_fraction * 100.0,
+        ));
         logger.log(format!(
             "Edge: smart-money {} (boost <= {:.0} pts, >= {} distinct) | leader-dump exit {} (>= {} SOL) | conviction sizing {} (<= {:.1}x)",
             if self.smart_money_enabled { "on" } else { "off" }, self.smart_money_boost_max, self.smart_money_min_distinct,
@@ -1876,18 +1901,45 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("migration imminent ({:.1} SOL in curve, pnl {:.1}%)", curve_sol, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
-        // 0b. Insider/leader distribution -> exit immediately, ahead of everything.
+        // 0b. Insider/leader distribution -> exit (full by default; configurable to a
+        // partial so a runner can keep riding via the trailing stop).
         else if cfg.leader_dump_exit_enabled && leader_sell >= cfg.leader_dump_sol {
             pos.selling = true;
-            Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
+            let frac = cfg.leader_dump_fraction;
+            if frac >= 1.0 {
+                Decision::full(pos.remaining_fraction, format!("insider distribution ({:.2} SOL sold by tracked wallets, pnl {:.1}%)", leader_sell, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
+            } else {
+                Decision {
+                    action: ExitAction::Partial,
+                    frac_of_current: frac,
+                    frac_of_original: frac * pos.remaining_fraction,
+                    rung_index: None,
+                    reason: format!("insider distribution partial (sell {:.0}%, {:.2} SOL dumped, pnl {:.1}%)", frac * 100.0, leader_sell, pnl),
+                    pnl, entry_mcap, current_mcap: signal.current_mcap, entry_size_sol, cost_basis_sol,
+                }
+            }
         }
         // 1. Hard stop.
         else if pnl <= cfg.hard_stop_pct {
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("hard stop {:.1}%", pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
-        // 2. Momentum collapse / dump -> cut remaining regardless of rung.
-        else if signal.score < cfg.collapse_score || signal.sell_volume_short > signal.buy_volume_short * 1.5 {
+        // 2. Trailing stop: once a position has run past the activation threshold,
+        // ride it and exit only when it gives back a chunk of its PEAK gain. This is
+        // what lets winners keep pumping instead of being dumped on the first wobble.
+        else if cfg.trail_enabled
+            && pos.peak_pnl >= cfg.trail_activate_pct
+            && pnl <= pos.peak_pnl * (1.0 - cfg.trail_giveback_frac)
+        {
+            pos.selling = true;
+            Decision::full(pos.remaining_fraction, format!("trailing stop (peak {:.0}%, gave back to {:.0}%)", pos.peak_pnl, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
+        }
+        // 3. Momentum collapse / dump -> cut remaining. SKIPPED for armed winners:
+        // once the trailing stop is active, a brief sell spike during a pump no longer
+        // dumps the bag — the trailing stop governs the exit instead.
+        else if !(cfg.trail_enabled && pos.peak_pnl >= cfg.trail_activate_pct)
+            && (signal.score < cfg.collapse_score || signal.sell_volume_short > signal.buy_volume_short * 1.5)
+        {
             pos.selling = true;
             Decision::full(pos.remaining_fraction, format!("momentum collapse (score {:.1}, pnl {:.1}%)", signal.score, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
