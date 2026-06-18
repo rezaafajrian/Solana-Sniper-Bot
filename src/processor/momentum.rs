@@ -94,6 +94,10 @@ const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 #[derive(Clone)]
 pub struct MomentumConfig {
     pub position_size_sol: f64,
+    /// Position size as a FRACTION of current equity (bankroll mode only). When > 0,
+    /// each buy is `equity * this` instead of the fixed `position_size_sol` — so the
+    /// bet scales up as the account grows and shrinks as it draws down. e.g. 0.05 = 5%.
+    pub position_size_pct: f64,
     pub max_positions: usize,
     pub entry_score: f64,
     /// Minimum BASE momentum score (before KOL/alpha/GMGN boosts) required to enter.
@@ -220,6 +224,10 @@ pub struct MomentumConfig {
     /// you have, the account compounds on profit, and a margin call halts new entries
     /// when equity can no longer fund a position. 0 = legacy fixed max_deployed cap.
     pub start_capital_sol: f64,
+    /// Margin call when equity drops below this fraction of starting capital
+    /// (bankroll mode). Default 0.10 = "lost 90%, you're ruined". Works for both
+    /// fixed and percent-of-equity sizing.
+    pub bankruptcy_floor_frac: f64,
     /// Estimated entry-leg cost (fees + tip + slippage) as a fraction of size,
     /// folded into the cost basis so realized PnL isn't optimistic about the buy.
     pub buy_cost_fraction: f64,
@@ -332,6 +340,7 @@ impl MomentumConfig {
 
         Self {
             position_size_sol: env_f64("MOMENTUM_POSITION_SIZE_SOL", 0.2),
+            position_size_pct: env_f64("MOMENTUM_POSITION_SIZE_PCT", 0.0),
             max_positions: env_usize("MOMENTUM_MAX_POSITIONS", 5),
             entry_score: env_f64("MOMENTUM_ENTRY_SCORE", 65.0),
             min_base_score: env_f64("MOMENTUM_MIN_BASE_SCORE", 0.0),
@@ -404,6 +413,7 @@ impl MomentumConfig {
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             start_capital_sol: env_f64("MOMENTUM_START_CAPITAL_SOL", 0.0),
+            bankruptcy_floor_frac: env_f64("MOMENTUM_BANKRUPTCY_FLOOR_FRAC", 0.10),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
             fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
@@ -488,9 +498,14 @@ impl MomentumConfig {
             self.alpha_rep_min, self.alpha_min_samples, self.alpha_boost, self.alpha_window_secs, self.alpha_size_mult,
         ));
         if self.start_capital_sol > 0.0 {
+            let sizing = if self.position_size_pct > 0.0 {
+                format!("{:.1}% of equity/position (scales with account)", self.position_size_pct * 100.0)
+            } else {
+                format!("{:.3} SOL/position (fixed)", self.position_size_sol)
+            };
             logger.log(format!(
-                "💰 BANKROLL MODE: start {:.3} SOL | {:.3}/position | account compounds on profit, MARGIN CALL halts entries when equity < one position",
-                self.start_capital_sol, self.position_size_sol,
+                "💰 BANKROLL MODE: start {:.3} SOL | {} | compounds on profit | MARGIN CALL at {:.0}% of start ({:.3} SOL)",
+                self.start_capital_sol, sizing, self.bankruptcy_floor_frac * 100.0, self.start_capital_sol * self.bankruptcy_floor_frac,
             ).green().bold().to_string());
         } else {
             logger.log(format!(
@@ -1483,6 +1498,17 @@ fn available_capital(cfg: &MomentumConfig) -> f64 {
     equity(cfg) - deployed_sol()
 }
 
+/// Base position size before conviction/alpha multipliers. In bankroll mode with a
+/// percent set, it's a fraction of current equity (scales with the account); else
+/// the fixed position_size_sol.
+fn base_position_size(cfg: &MomentumConfig) -> f64 {
+    if cfg.start_capital_sol > 0.0 && cfg.position_size_pct > 0.0 {
+        (equity(cfg) * cfg.position_size_pct).max(0.0)
+    } else {
+        cfg.position_size_sol
+    }
+}
+
 fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     if let Some(ts) = RECENTLY_EXITED.get(mint) {
         // Re-allow after the cooldown; momentum can return, but avoid instant churn.
@@ -1677,33 +1703,39 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         crate::processor::sniper_bot::clear_bought_blacklist(&mint);
     }
 
-    // Conviction sizing: scale up with how far the score clears the entry bar.
+    // Base size: a fraction of equity in bankroll+percent mode (scales with the
+    // account), else the fixed position size. Conviction then scales up from there.
+    let base_size = base_position_size(&cfg);
     let mut entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
         let mult = (signal.score / cfg.entry_score).clamp(1.0, cfg.conviction_max_mult);
-        cfg.position_size_sol * mult
+        base_size * mult
     } else {
-        cfg.position_size_sol
+        base_size
     };
     // Following a proven wallet (curated KOL or learned alpha) is our highest-
     // conviction signal — size up. Capped so one trade can't dwarf the book.
     let following = kol.is_some() || alpha.is_some();
     if following && cfg.alpha_size_mult > 1.0 {
-        let cap = cfg.position_size_sol * cfg.conviction_max_mult.max(cfg.alpha_size_mult);
+        let cap = base_size * cfg.conviction_max_mult.max(cfg.alpha_size_mult);
         entry_size = (entry_size * cfg.alpha_size_mult).min(cap);
     }
 
     if cfg.start_capital_sol > 0.0 {
         // REAL bankroll: equity = start capital + realized PnL. You can only deploy
         // what you actually have, the account compounds on profit, and a margin call
-        // ends the session when equity can't fund a full position anymore.
+        // ends the session when equity falls below the bankruptcy floor (ruined).
         let eq = equity(&cfg);
-        if eq < cfg.position_size_sol {
+        let floor = (cfg.start_capital_sol * cfg.bankruptcy_floor_frac).max(0.0);
+        if eq <= floor {
             if !MARGIN_CALLED.swap(true, Ordering::SeqCst) {
                 logger.log(format!(
-                    "💀 MARGIN CALL — equity {:.3} SOL < one position ({:.3}). Account blown after {:+.3} SOL realized. Halting new entries; open positions still exit.",
-                    eq, cfg.position_size_sol, realized_pnl(),
+                    "💀 MARGIN CALL — equity {:.3} SOL <= floor {:.3} ({:.0}% of start). Account ruined after {:+.3} SOL realized. Halting new entries; open positions still exit.",
+                    eq, floor, cfg.bankruptcy_floor_frac * 100.0, realized_pnl(),
                 ).red().bold().to_string());
             }
+            return;
+        }
+        if entry_size <= 0.0 {
             return;
         }
         let avail = available_capital(&cfg);

@@ -31,9 +31,12 @@ PAIRS=(
   "MOMENTUM_FEED=ws"
   "MOMENTUM_SIM_COST_FRACTION=0.03"
 
-  # --- REAL bankroll: 1 SOL, 0.33/position, capital-scaled concurrency ---
+  # --- REAL bankroll: 1 SOL start, size = 5% of EQUITY (scales up as you win,
+  #     down as you lose), ruin at 10% of start. Survives variance AND compounds. ---
   "MOMENTUM_START_CAPITAL_SOL=1.0"
-  "MOMENTUM_POSITION_SIZE_SOL=0.33"
+  "MOMENTUM_POSITION_SIZE_PCT=0.05"
+  "MOMENTUM_POSITION_SIZE_SOL=0.05"
+  "MOMENTUM_BANKRUPTCY_FLOOR_FRAC=0.10"
   "MOMENTUM_MAX_POSITIONS=12"
   "MOMENTUM_MAX_DEPLOYED_SOL=1.0"
 
