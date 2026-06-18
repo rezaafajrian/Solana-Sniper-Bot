@@ -611,6 +611,10 @@ struct MomentumPosition {
     /// is halted so the bot stops spinning, and the position is surfaced for manual exit.
     #[serde(default)]
     quarantined: bool,
+    /// Cumulative realized PnL (SOL) booked across this position's sells (scale-outs +
+    /// final). Used to classify the whole position as a win/loss at full exit.
+    #[serde(default)]
+    realized_so_far: f64,
 }
 
 lazy_static! {
@@ -628,6 +632,11 @@ lazy_static! {
     /// Latched once the simulated bankroll is blown (margin call). New entries stop
     /// for the rest of the session; open positions still exit. Reset at startup.
     static ref MARGIN_CALLED: AtomicBool = AtomicBool::new(false);
+    /// Session-wide closed-position win/loss counts (honest win rate over the whole
+    /// run, not the recent feed window). A position is a win if its TOTAL realized
+    /// PnL across all sells is >= 0.
+    static ref SESSION_WINS: AtomicU64 = AtomicU64::new(0);
+    static ref SESSION_LOSSES: AtomicU64 = AtomicU64::new(0);
     /// Decision/learning log: mints already logged (one decision row per token),
     /// and per-token post-detection outcome tracking.
     static ref DECISION_LOGGED: DashMap<String, ()> = DashMap::new();
@@ -1098,6 +1107,8 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "today_realized": daily_realized(),
             "buys": buys,
             "sells": sells,
+            "wins": SESSION_WINS.load(Ordering::SeqCst),
+            "losses": SESSION_LOSSES.load(Ordering::SeqCst),
         },
         "capital": {
             "deployed_sol": deployed_sol(),
@@ -2134,6 +2145,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 kol_label: lead_label.clone().unwrap_or_default(),
                 sell_attempts: 0,
                 quarantined: false,
+                realized_so_far: 0.0,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
             record_decision(&parsed, &signal, &cfg, effective_score, "BUY", "");
@@ -2571,7 +2583,9 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     // Apply the bookkeeping that should only happen once a sell actually succeeds:
     // mark the scale-out rung hit and reduce the remaining fraction, or finalize
     // a full exit. On a partial, also release the `selling` lock.
-    let commit_sell = |succeeded: bool| {
+    // Returns the position's TOTAL realized PnL (all sells) when this is the closing
+    // full exit, so the caller can classify the whole position as a win or loss.
+    let commit_sell = |succeeded: bool, chunk_realized: f64| -> Option<f64> {
         if !succeeded {
             if let Some(mut p) = POSITIONS.get_mut(&mint) {
                 p.selling = false;
@@ -2588,10 +2602,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 }
             }
             save_positions();
-            return;
+            return None;
         }
         if is_full {
+            // Whole-position realized = prior scale-outs + this final chunk.
+            let total = POSITIONS.get(&mint).map(|p| p.realized_so_far + chunk_realized).unwrap_or(chunk_realized);
             finalize_exit(&mint); // persists via save_positions()
+            Some(total)
         } else {
             if let Some(mut p) = POSITIONS.get_mut(&mint) {
                 if let Some(i) = decision.rung_index {
@@ -2602,9 +2619,22 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 p.remaining_fraction = (p.remaining_fraction - decision.frac_of_original).max(0.0);
                 p.selling = false;
                 p.sell_attempts = 0; // a successful sell clears the failure streak
+                p.realized_so_far += chunk_realized; // accumulate for the win/loss tally
             }
             save_positions(); // persist the reduced position (rung hit + fraction)
+            None
         }
+    };
+
+    // Count a closed position as a win/loss by its TOTAL realized PnL (honest, whole-
+    // position win rate), and run the circuit breaker on that total.
+    let finalize_win_loss = |pos_total: f64, cfg: &MomentumConfig, logger: &Logger| {
+        if pos_total >= 0.0 {
+            SESSION_WINS.fetch_add(1, Ordering::SeqCst);
+        } else {
+            SESSION_LOSSES.fetch_add(1, Ordering::SeqCst);
+        }
+        record_full_exit(pos_total, cfg, logger);
     };
 
     if cfg.dry_run {
@@ -2629,10 +2659,10 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             "📝 [DRY] {} {:.0}% of {} ({}) | sim proceeds {:.4} SOL | sim PnL {:+.4} SOL",
             event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
         ).yellow().to_string());
-        commit_sell(true);
+        let pos_total = commit_sell(true, sim_realized);
         record_kol_pnl(&pos_kol, sim_realized, is_full, sim_realized);
         if is_full {
-            record_full_exit(sim_realized, &cfg, &logger);
+            finalize_win_loss(pos_total.unwrap_or(sim_realized), &cfg, &logger);
         }
         return;
     }
@@ -2653,17 +2683,17 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 est_realized_pnl_sol: est_realized_pnl,
                 signature: &sig,
             });
-            commit_sell(true);
+            let pos_total = commit_sell(true, est_realized_pnl);
             record_kol_pnl(&pos_kol, est_realized_pnl, is_full, est_realized_pnl);
             if is_full {
-                record_full_exit(est_realized_pnl, &cfg, &logger);
+                finalize_win_loss(pos_total.unwrap_or(est_realized_pnl), &cfg, &logger);
             }
             spawn_reconcile(recon_app, mint.clone(), sig, cost_basis,
                 est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.frac_of_original, decision.reason.clone());
         }
         Err(e) => {
             logger.log(format!("Sell error {}: {}", mint, e).red().to_string());
-            commit_sell(false);
+            commit_sell(false, 0.0);
         }
     }
 }
@@ -2851,6 +2881,8 @@ async fn momentum_startup(
 
     TRADING_HALTED.store(false, Ordering::SeqCst);
     MARGIN_CALLED.store(false, Ordering::SeqCst);
+    SESSION_WINS.store(0, Ordering::SeqCst);
+    SESSION_LOSSES.store(0, Ordering::SeqCst);
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
     DAY_INDEX.store(current_day(cfg), Ordering::SeqCst);
     if let Ok(mut base) = DAY_START_REALIZED.lock() {
