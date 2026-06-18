@@ -215,6 +215,11 @@ pub struct MomentumConfig {
     /// Hard cap on total SOL deployed across all open positions. New entries are
     /// blocked (or trimmed) so concurrent + conviction sizing can't overspend.
     pub max_deployed_sol: f64,
+    /// Starting capital for a REAL bankroll simulation. When > 0, the bot models a
+    /// finite account: equity = start_capital + realized PnL, you can only deploy what
+    /// you have, the account compounds on profit, and a margin call halts new entries
+    /// when equity can no longer fund a position. 0 = legacy fixed max_deployed cap.
+    pub start_capital_sol: f64,
     /// Estimated entry-leg cost (fees + tip + slippage) as a fraction of size,
     /// folded into the cost basis so realized PnL isn't optimistic about the buy.
     pub buy_cost_fraction: f64,
@@ -398,6 +403,7 @@ impl MomentumConfig {
             conviction_max_mult: env_f64("MOMENTUM_CONVICTION_MAX_MULT", 2.0),
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
+            start_capital_sol: env_f64("MOMENTUM_START_CAPITAL_SOL", 0.0),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
             fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
@@ -481,10 +487,17 @@ impl MomentumConfig {
             if self.alpha_follow_enabled { "ON (follows learned proven wallets)" } else { "off" },
             self.alpha_rep_min, self.alpha_min_samples, self.alpha_boost, self.alpha_window_secs, self.alpha_size_mult,
         ));
-        logger.log(format!(
-            "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}% | landing: {}",
-            self.max_deployed_sol, self.buy_cost_fraction * 100.0, self.landing,
-        ));
+        if self.start_capital_sol > 0.0 {
+            logger.log(format!(
+                "💰 BANKROLL MODE: start {:.3} SOL | {:.3}/position | account compounds on profit, MARGIN CALL halts entries when equity < one position",
+                self.start_capital_sol, self.position_size_sol,
+            ).green().bold().to_string());
+        } else {
+            logger.log(format!(
+                "Risk: max deployed {:.3} SOL | entry-cost basis +{:.1}% | landing: {}",
+                self.max_deployed_sol, self.buy_cost_fraction * 100.0, self.landing,
+            ));
+        }
         logger.log(format!(
             "Discipline: breaker at -{:.3} SOL daily loss or {} consecutive losses | {}{}",
             self.daily_loss_limit_sol, self.max_consecutive_losses,
@@ -579,6 +592,9 @@ lazy_static! {
     /// reconciliation lookup). Confirmed is a lower bound if get_transaction is flaky.
     static ref TX_SENT: AtomicU64 = AtomicU64::new(0);
     static ref TX_LANDED: AtomicU64 = AtomicU64::new(0);
+    /// Latched once the simulated bankroll is blown (margin call). New entries stop
+    /// for the rest of the session; open positions still exit. Reset at startup.
+    static ref MARGIN_CALLED: AtomicBool = AtomicBool::new(false);
     /// Serializes appends to the trade-log CSV.
     static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
@@ -1044,7 +1060,15 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "buys": buys,
             "sells": sells,
         },
-        "capital": { "deployed_sol": deployed_sol(), "max_deployed_sol": cfg.max_deployed_sol },
+        "capital": {
+            "deployed_sol": deployed_sol(),
+            "max_deployed_sol": cfg.max_deployed_sol,
+            "start_capital_sol": cfg.start_capital_sol,
+            "equity_sol": if cfg.start_capital_sol > 0.0 { equity(cfg) } else { 0.0 },
+            "available_sol": if cfg.start_capital_sol > 0.0 { available_capital(cfg) } else { 0.0 },
+            "bankroll_mode": cfg.start_capital_sol > 0.0,
+            "margin_called": MARGIN_CALLED.load(Ordering::SeqCst),
+        },
         "counts": {
             "open_positions": POSITIONS.len(),
             "max_positions": cfg.max_positions,
@@ -1442,6 +1466,23 @@ fn deployed_sol() -> f64 {
     POSITIONS.iter().map(|p| p.entry_size_sol * p.remaining_fraction).sum()
 }
 
+/// Realized PnL so far (the bankroll's running profit/loss).
+fn realized_pnl() -> f64 {
+    PNL_TALLY.lock().map(|g| g.0).unwrap_or(0.0)
+}
+
+/// Account equity in bankroll mode = starting capital + realized PnL. This is the
+/// money the account has actually made/lost (open positions count once they close).
+fn equity(cfg: &MomentumConfig) -> f64 {
+    cfg.start_capital_sol + realized_pnl()
+}
+
+/// SOL free to deploy right now in bankroll mode = equity minus what's already in
+/// open positions.
+fn available_capital(cfg: &MomentumConfig) -> f64 {
+    equity(cfg) - deployed_sol()
+}
+
 fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     if let Some(ts) = RECENTLY_EXITED.get(mint) {
         // Re-allow after the cooldown; momentum can return, but avoid instant churn.
@@ -1558,6 +1599,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     if trading_halted() {
         return;
     }
+    // Bankroll mode: once the account is blown, the session is over for new entries.
+    if MARGIN_CALLED.load(Ordering::SeqCst) {
+        return;
+    }
 
     let mint = parsed.mint.clone();
     let now = now_secs();
@@ -1647,18 +1692,38 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         entry_size = (entry_size * cfg.alpha_size_mult).min(cap);
     }
 
-    // Global capital cap: never let total exposure exceed the budget. Trim the
-    // last entry to the remaining headroom; skip if there isn't enough room.
-    let headroom = cfg.max_deployed_sol - deployed_sol();
-    if headroom < cfg.position_size_sol.min(entry_size) * 0.5 {
-        logger.log(format!(
-            "⛔ Skipping {} — capital cap reached ({:.3}/{:.3} SOL deployed)",
-            mint, deployed_sol(), cfg.max_deployed_sol,
-        ).yellow().to_string());
-        return;
-    }
-    if entry_size > headroom {
-        entry_size = headroom;
+    if cfg.start_capital_sol > 0.0 {
+        // REAL bankroll: equity = start capital + realized PnL. You can only deploy
+        // what you actually have, the account compounds on profit, and a margin call
+        // ends the session when equity can't fund a full position anymore.
+        let eq = equity(&cfg);
+        if eq < cfg.position_size_sol {
+            if !MARGIN_CALLED.swap(true, Ordering::SeqCst) {
+                logger.log(format!(
+                    "💀 MARGIN CALL — equity {:.3} SOL < one position ({:.3}). Account blown after {:+.3} SOL realized. Halting new entries; open positions still exit.",
+                    eq, cfg.position_size_sol, realized_pnl(),
+                ).red().bold().to_string());
+            }
+            return;
+        }
+        let avail = available_capital(&cfg);
+        if avail < entry_size {
+            // Fully deployed for the current equity — wait for capital to free up.
+            return;
+        }
+    } else {
+        // Legacy fixed cap: never let total exposure exceed max_deployed_sol.
+        let headroom = cfg.max_deployed_sol - deployed_sol();
+        if headroom < cfg.position_size_sol.min(entry_size) * 0.5 {
+            logger.log(format!(
+                "⛔ Skipping {} — capital cap reached ({:.3}/{:.3} SOL deployed)",
+                mint, deployed_sol(), cfg.max_deployed_sol,
+            ).yellow().to_string());
+            return;
+        }
+        if entry_size > headroom {
+            entry_size = headroom;
+        }
     }
 
     // True cost basis includes the estimated entry-leg cost so PnL isn't optimistic.
@@ -2444,6 +2509,7 @@ async fn momentum_startup(
     }
 
     TRADING_HALTED.store(false, Ordering::SeqCst);
+    MARGIN_CALLED.store(false, Ordering::SeqCst);
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
     DAY_INDEX.store(current_day(cfg), Ordering::SeqCst);
     if let Ok(mut base) = DAY_START_REALIZED.lock() {

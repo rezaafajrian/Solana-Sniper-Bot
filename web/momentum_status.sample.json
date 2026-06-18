@@ -4,7 +4,7 @@
   "halted": false,
   "consecutive_losses": 1,
   "pnl": { "session_realized": 0.1842, "today_realized": 0.0913, "buys": 14, "sells": 19 },
-  "capital": { "deployed_sol": 0.42, "max_deployed_sol": 1.0 },
+  "capital": { "deployed_sol": 0.66, "max_deployed_sol": 1.0, "start_capital_sol": 1.0, "equity_sol": 1.184, "available_sol": 0.524, "bankroll_mode": true, "margin_called": false },
   "counts": { "open_positions": 3, "max_positions": 5, "tokens_tracked": 412, "kol_wallets": 100, "kol_hot": 7, "gmgn_watchlist": 0, "wallet_rep": 4057, "alpha_proven": 12 },
   "config": { "position_size_sol": 0.2, "entry_score": 57, "hard_stop_pct": -35, "kol_enabled": true, "kol_require": false, "daily_loss_limit_sol": 0.15, "alpha_follow": true, "alpha_rep_min": 0.5, "alpha_min_samples": 5 },
   "positions": [
