@@ -128,6 +128,9 @@ pub struct MomentumConfig {
     /// Reject entry if the token creator holds more than this share of the net
     /// trader float (a proxy for bundled/insider supply). 0 disables.
     pub max_creator_share: f64,
+    /// Minimum distinct holders before the concentration veto applies — below this
+    /// the token is too young to judge concentration (top-N would be ~100%).
+    pub concentration_min_traders: usize,
     pub scale_out_targets: Vec<f64>,
     /// Fraction of the ORIGINAL position to sell at each corresponding rung.
     /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
@@ -342,6 +345,7 @@ impl MomentumConfig {
             max_top_holder_share: env_f64("MOMENTUM_MAX_TOP_HOLDER_SHARE", 0.0),
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
+            concentration_min_traders: env_usize("MOMENTUM_CONCENTRATION_MIN_TRADERS", 25),
             scale_out_targets,
             scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
@@ -1469,6 +1473,14 @@ fn concentration_veto(parsed: &TradeInfoFromToken, mint: &str, cfg: &MomentumCon
     let mut stakes: Vec<(&str, f64)> = net.into_iter().map(|(w, v)| (w, v.max(0.0))).collect();
     let total: f64 = stakes.iter().map(|(_, v)| *v).sum();
     if total <= 0.0 {
+        return None;
+    }
+    // Concentration is only meaningful once there's a crowd to measure it over. On a
+    // brand-new token only a few wallets have traded, so the top-N "naturally" hold
+    // ~100% of the float — vetoing on that would reject almost everything. Skip the
+    // check until at least `concentration_min_traders` distinct holders exist.
+    let holders = stakes.iter().filter(|(_, v)| *v > 0.0).count();
+    if holders < cfg.concentration_min_traders {
         return None;
     }
 

@@ -73,9 +73,10 @@ PAIRS=(
   "MOMENTUM_LEADER_DUMP_FRACTION=1.0"
 
   # --- anti-dump: free stream-based concentration veto (no API) ---
-  "MOMENTUM_MAX_TOP_HOLDER_SHARE=0.7"
+  "MOMENTUM_MAX_TOP_HOLDER_SHARE=0.85"
   "MOMENTUM_TOP_HOLDER_N=10"
-  "MOMENTUM_MAX_CREATOR_SHARE=0.15"
+  "MOMENTUM_MAX_CREATOR_SHARE=0.25"
+  "MOMENTUM_CONCENTRATION_MIN_TRADERS=25"
 
   # --- discipline: breaker OFF for an uninterrupted sample ---
   "MOMENTUM_DAILY_LOSS_LIMIT_SOL=0"
