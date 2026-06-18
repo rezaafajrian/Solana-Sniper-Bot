@@ -282,6 +282,10 @@ pub struct MomentumConfig {
     /// File to persist open positions so a crash/restart never loses exit
     /// management of money already in the market ("" disables persistence).
     pub positions_file: String,
+    /// Decision/learning log: record EVERY token evaluation (buy or reject) plus its
+    /// post-detection outcome, so the strategy can be studied and improved offline.
+    /// Empty base path disables it.
+    pub decision_log_file: String,
     /// Transaction landing route: "zeroslot" | "jito" | "multi" (jito+rpc broadcast).
     pub landing: String,
     /// Exit a held token when its real SOL reserves reach this (bonding curve is
@@ -443,6 +447,7 @@ impl MomentumConfig {
             kol_reload_secs: env_u64("MOMENTUM_KOL_RELOAD_SECS", 0),
             status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
             positions_file: std::env::var("MOMENTUM_POSITIONS_FILE").unwrap_or_else(|_| "momentum_positions.json".to_string()),
+            decision_log_file: std::env::var("MOMENTUM_DECISION_LOG").unwrap_or_else(|_| "momentum_decisions".to_string()),
             landing: std::env::var("MOMENTUM_LANDING").unwrap_or_else(|_| "zeroslot".to_string()).to_lowercase(),
             migration_exit_sol: env_f64("MOMENTUM_MIGRATION_EXIT_SOL", 82.0),
 
@@ -623,6 +628,12 @@ lazy_static! {
     /// Latched once the simulated bankroll is blown (margin call). New entries stop
     /// for the rest of the session; open positions still exit. Reset at startup.
     static ref MARGIN_CALLED: AtomicBool = AtomicBool::new(false);
+    /// Decision/learning log: mints already logged (one decision row per token),
+    /// and per-token post-detection outcome tracking.
+    static ref DECISION_LOGGED: DashMap<String, ()> = DashMap::new();
+    static ref OUTCOMES: DashMap<String, OutcomeTrack> = DashMap::new();
+    static ref DECISION_LOG_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    static ref DECISION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Serializes appends to the trade-log CSV.
     static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
@@ -1434,6 +1445,9 @@ fn ingest_trade(parsed: &TradeInfoFromToken, trader: String, now: u64, cfg: &Mom
     let tick_mcap = entry.last_mcap;
     let tick_sol = parsed.sol_change.abs();
 
+    // Outcome tracking: update the post-detection price stats for any evaluated token.
+    update_outcome(&parsed.mint, tick_mcap, now);
+
     // Smart-money learning: queue meaningful buys for later outcome grading.
     if cfg.smart_money_enabled
         && parsed.is_buy
@@ -1635,6 +1649,225 @@ fn insider_distribution_veto(mint: &str, cfg: &MomentumConfig) -> Option<String>
     None
 }
 
+// ===========================================================================
+// Decision logging + outcome tracking (the learning system)
+// ===========================================================================
+
+/// Post-detection price tracking for one evaluated token, so we can label its
+/// outcome (rug/loss/2x/...) and study which features predicted it.
+struct OutcomeTrack {
+    detect_ts: u64,
+    detect_mcap: f64,
+    peak_mcap: f64,
+    trough_mcap: f64,
+    last_mcap: f64,
+    decision: String,
+    overall_score: f64,
+    // forward-return marks (mcap ratio - 1) captured the first time each elapses
+    m15: Option<f64>,
+    m30: Option<f64>,
+    m60: Option<f64>,
+    m120: Option<f64>,
+    finalized: bool,
+}
+
+/// Concentration (top-N net float share) and insider sold-ratio as plain numbers
+/// for the log — same math as the vetoes, but always returns a value.
+fn concentration_metrics(parsed: &TradeInfoFromToken, mint: &str, cfg: &MomentumConfig) -> (f64, f64, f64, u32) {
+    let state = match TOKEN_STATE.get(mint) {
+        Some(s) => s,
+        None => return (0.0, 0.0, 0.0, 0),
+    };
+    let mut net: HashMap<&str, f64> = HashMap::new();
+    let mut bought: HashMap<&str, f64> = HashMap::new();
+    let mut sold: HashMap<&str, f64> = HashMap::new();
+    let mut smart = 0u32;
+    let mut counted_smart: HashSet<&str> = HashSet::new();
+    for t in state.ticks.iter() {
+        if t.trader.is_empty() { continue; }
+        let e = net.entry(t.trader.as_str()).or_insert(0.0);
+        if t.is_buy {
+            *e += t.sol;
+            *bought.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
+            if !counted_smart.contains(t.trader.as_str()) {
+                if let Some(r) = WALLET_REP.get(t.trader.as_str()) {
+                    if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+                        smart += 1; counted_smart.insert(t.trader.as_str());
+                    }
+                }
+            }
+        } else {
+            *e -= t.sol;
+            *sold.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
+        }
+    }
+    // top-N holder concentration (net float share)
+    let mut stakes: Vec<f64> = net.values().map(|v| v.max(0.0)).collect();
+    let total: f64 = stakes.iter().sum();
+    stakes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let topn: f64 = stakes.iter().take(cfg.top_holder_n.max(1)).sum();
+    let conc = if total > 0.0 { topn / total } else { 0.0 };
+    // insider sold-ratio over top-N early buyers
+    let mut ranked: Vec<(&str, f64)> = bought.iter().map(|(w, v)| (*w, *v)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut tb, mut ts) = (0.0, 0.0);
+    for (w, b) in ranked.into_iter().take(cfg.insider_distrib_top_n.max(1)) {
+        tb += b; ts += sold.get(w).copied().unwrap_or(0.0);
+    }
+    let insider = if tb > 0.0 { ts / tb } else { 0.0 };
+    // creator buy amount
+    let creator_buy = parsed.coin_creator.as_ref()
+        .and_then(|c| bought.get(c.as_str()).copied()).unwrap_or(0.0);
+    (conc, insider, creator_buy, smart)
+}
+
+/// Record one token evaluation (BUY or REJECT) to the CSV + JSONL decision log and
+/// register it for post-detection outcome tracking. One row per mint (first
+/// decision wins). Best-effort; never blocks trading.
+fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &MomentumConfig, effective_score: f64, decision: &str, reason: &str) {
+    let base = { DECISION_LOG_PATH.lock().map(|p| p.clone()).unwrap_or_default() };
+    if base.is_empty() {
+        return;
+    }
+    let mint = parsed.mint.clone();
+    let is_buy = decision == "BUY";
+    // Rejects log once per token (first reason wins); a BUY always logs and wins.
+    if is_buy {
+        DECISION_LOGGED.insert(mint.clone(), ());
+    } else if DECISION_LOGGED.insert(mint.clone(), ()).is_some() {
+        return;
+    }
+    let now = now_secs();
+    let creator = parsed.coin_creator.clone().unwrap_or_default();
+    let (conc, insider, creator_buy, smart_cnt) = concentration_metrics(parsed, &mint, cfg);
+    let creator_score = if creator.is_empty() { 0.0 } else { WALLET_REP.get(&creator).map(|r| r.score).unwrap_or(0.0) };
+    let liquidity = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+    let confidence = if cfg.entry_score > 0.0 { effective_score / cfg.entry_score } else { 0.0 };
+    let mcap = signal.current_mcap;
+
+    // Register outcome tracking from the detection point (upgrade decision to BUY if
+    // a token previously logged as REJECT is now bought).
+    OUTCOMES.entry(mint.clone())
+        .and_modify(|o| { if is_buy { o.decision = "BUY".to_string(); } })
+        .or_insert_with(|| OutcomeTrack {
+            detect_ts: now, detect_mcap: mcap, peak_mcap: mcap, trough_mcap: mcap, last_mcap: mcap,
+            decision: decision.to_string(), overall_score: effective_score,
+            m15: None, m30: None, m60: None, m120: None, finalized: false,
+        });
+
+    use std::io::Write;
+    let _guard = DECISION_LOG_LOCK.lock().map(|g| g).unwrap_or_else(|p| p.into_inner());
+    let safe = |s: &str| s.replace('"', "'").replace(',', ";");
+    let iso = chrono::Utc::now().to_rfc3339();
+
+    // CSV
+    let csv_path = format!("{}.csv", base);
+    let need_header = !std::path::Path::new(&csv_path).exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path) {
+        if need_header {
+            let _ = writeln!(f, "timestamp,ca,creator,creator_buy,creator_score,wallet_score,insider_score,smart_wallet_count,holder_concentration,marketcap,volume,liquidity,overall_score,decision,rejection_reason,confidence");
+        }
+        let _ = writeln!(f, "{},{},{},{:.4},{:.3},{:.2},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{:.3}",
+            iso, mint, creator, creator_buy, creator_score, signal.smart_money_boost, insider, smart_cnt,
+            conc, mcap, signal.buy_volume_short, liquidity, effective_score, decision,
+            safe(if decision == "BUY" { "" } else { reason }), confidence);
+    }
+    // JSONL
+    let jsonl_path = format!("{}.jsonl", base);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&jsonl_path) {
+        let obj = serde_json::json!({
+            "timestamp": iso, "ca": mint, "creator": creator, "creator_buy": creator_buy,
+            "creator_score": creator_score, "wallet_score": signal.smart_money_boost,
+            "insider_score": insider, "smart_wallet_count": smart_cnt, "holder_concentration": conc,
+            "marketcap": mcap, "volume": signal.buy_volume_short, "liquidity": liquidity,
+            "overall_score": effective_score, "decision": decision,
+            "rejection_reason": if decision == "BUY" { "" } else { reason }, "confidence": confidence,
+        });
+        let _ = writeln!(f, "{}", obj);
+    }
+}
+
+/// Update a tracked token's post-detection price stats on each new tick.
+fn update_outcome(mint: &str, mcap: f64, now: u64) {
+    if mcap <= 0.0 {
+        return;
+    }
+    if let Some(mut o) = OUTCOMES.get_mut(mint) {
+        if o.finalized || o.detect_mcap <= 0.0 {
+            return;
+        }
+        o.last_mcap = mcap;
+        if mcap > o.peak_mcap { o.peak_mcap = mcap; }
+        if mcap < o.trough_mcap { o.trough_mcap = mcap; }
+        let elapsed = now.saturating_sub(o.detect_ts);
+        let ret = mcap / o.detect_mcap - 1.0;
+        if o.m15.is_none() && elapsed >= 900 { o.m15 = Some(ret); }
+        if o.m30.is_none() && elapsed >= 1800 { o.m30 = Some(ret); }
+        if o.m60.is_none() && elapsed >= 3600 { o.m60 = Some(ret); }
+        if o.m120.is_none() && elapsed >= 7200 { o.m120 = Some(ret); }
+    }
+}
+
+/// Label an outcome from its peak return and final return.
+fn outcome_label(max_ret: f64, final_ret: f64) -> &'static str {
+    if final_ret <= -0.9 { "RUG" }
+    else if max_ret >= 20.0 { "20X+" }
+    else if max_ret >= 10.0 { "10X" }
+    else if max_ret >= 5.0 { "5X" }
+    else if max_ret >= 1.0 { "2X" }
+    else if final_ret <= -0.3 { "LOSS" }
+    else if final_ret >= 0.15 { "WIN" }
+    else { "BREAKEVEN" }
+}
+
+/// Background task: finalize outcomes older than 2h, append a labeled row to the
+/// outcomes CSV, and drop them from memory.
+async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
+    use std::io::Write;
+    let base = cfg.decision_log_file.clone();
+    if base.is_empty() {
+        return;
+    }
+    let path = format!("{}_outcomes.csv", base);
+    let mut interval = time::interval(Duration::from_secs(30));
+    while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
+        interval.tick().await;
+        let now = now_secs();
+        let due: Vec<String> = OUTCOMES.iter()
+            .filter(|e| !e.finalized && now.saturating_sub(e.detect_ts) >= 7200)
+            .map(|e| e.key().clone()).collect();
+        for mint in due {
+            if let Some(mut o) = OUTCOMES.get_mut(&mint) {
+                o.finalized = true;
+                let dm = o.detect_mcap;
+                if dm <= 0.0 { continue; }
+                let max_ret = o.peak_mcap / dm - 1.0;
+                let dd = o.trough_mcap / dm - 1.0;
+                let final_ret = o.last_mcap / dm - 1.0;
+                let label = outcome_label(max_ret, final_ret);
+                let need_header = !std::path::Path::new(&path).exists();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    if need_header {
+                        let _ = writeln!(f, "ca,detect_ts,detect_mcap,ret_15m,ret_30m,ret_1h,ret_2h,max_return,max_drawdown,final_return,final_label,decision,overall_score");
+                    }
+                    let g = |v: Option<f64>| v.map(|x| format!("{:.4}", x)).unwrap_or_default();
+                    let _ = writeln!(f, "{},{},{:.3},{},{},{},{},{:.4},{:.4},{:.4},{},{},{:.2}",
+                        mint, o.detect_ts, dm, g(o.m15), g(o.m30), g(o.m60), g(o.m120),
+                        max_ret, dd, final_ret, label, o.decision, o.overall_score);
+                }
+            }
+            OUTCOMES.remove(&mint);
+        }
+        // Bound memory: if the map grows huge, drop the oldest unfinalized beyond 3h.
+        if OUTCOMES.len() > 50_000 {
+            let stale: Vec<String> = OUTCOMES.iter()
+                .filter(|e| now.saturating_sub(e.detect_ts) >= 10800)
+                .map(|e| e.key().clone()).collect();
+            for m in stale { OUTCOMES.remove(&m); }
+        }
+    }
+}
+
 /// Creator + top early buyers (by short-window volume) — the wallets whose
 /// selling is the strongest early warning of a rug/distribution.
 fn build_tracked_wallets(parsed: &TradeInfoFromToken, mint: &str, now: u64, cfg: &MomentumConfig) -> HashSet<String> {
@@ -1714,11 +1947,13 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts + alpha_pts;
 
     if effective_score < cfg.entry_score {
+        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "score below entry bar");
         return;
     }
     // Base-momentum floor: a boost (KOL/alpha/GMGN) can't drag in a token that has
     // no real momentum of its own. Require genuine strength AND the signal.
     if cfg.min_base_score > 0.0 && signal.score < cfg.min_base_score {
+        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "base momentum below floor");
         return;
     }
     if POSITIONS.contains_key(&mint) || BOUGHT_TOKEN_LIST.contains_key(&mint) {
@@ -1728,6 +1963,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         return;
     }
     if !position_slots_available(&cfg) {
+        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "no position slot / capacity");
         return;
     }
     if signal.current_mcap <= 0.0 {
@@ -1738,12 +1974,14 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // tokens). Checked before the GMGN call so we reject dump setups without an API hit.
     if let Some(reason) = concentration_veto(&parsed, &mint, &cfg) {
         logger.log(format!("🛑 Concentration veto {} — {}", mint, reason).yellow().to_string());
+        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("concentration: {}", reason));
         return;
     }
     // MELT-inspired: don't buy into a token whose biggest early buyers are already
     // distributing — that's the trash-coin / coordinated-dump pattern.
     if let Some(reason) = insider_distribution_veto(&mint, &cfg) {
         logger.log(format!("🛑 Insider-distribution veto {} — {}", mint, reason).yellow().to_string());
+        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("insider-distribution: {}", reason));
         return;
     }
 
@@ -1753,10 +1991,12 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             match client.security_verdict(&mint).await {
                 SecurityVerdict::Reject(reason) => {
                     logger.log(format!("🛑 GMGN veto {} — {}", mint, reason).red().to_string());
+                    record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("gmgn: {}", reason));
                     return;
                 }
                 SecurityVerdict::Unknown if client.veto_on_unknown() => {
                     logger.log(format!("🛑 GMGN veto {} — security unknown (fail-closed)", mint).yellow().to_string());
+                    record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "gmgn: security unknown");
                     return;
                 }
                 _ => {}
@@ -1896,6 +2136,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 quarantined: false,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
+            record_decision(&parsed, &signal, &cfg, effective_score, "BUY", "");
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
                 mint: &mint,
@@ -2688,6 +2929,21 @@ async fn momentum_startup(
     if cfg.smart_money_enabled {
         let cfg = cfg.clone();
         tokio::spawn(async move { run_attribution(cfg).await });
+    }
+
+    // Decision/learning log + post-detection outcome tracking.
+    if !cfg.decision_log_file.is_empty() {
+        if let Ok(mut p) = DECISION_LOG_PATH.lock() {
+            *p = cfg.decision_log_file.clone();
+        }
+        DECISION_LOGGED.clear();
+        OUTCOMES.clear();
+        logger.log(format!(
+            "📒 Decision log ON: {}.csv / .jsonl (every evaluation) + {}_outcomes.csv (2h labeled outcomes)",
+            cfg.decision_log_file, cfg.decision_log_file,
+        ).cyan().to_string());
+        let cfg = cfg.clone();
+        tokio::spawn(async move { run_outcome_tracker(cfg).await });
     }
 
     {

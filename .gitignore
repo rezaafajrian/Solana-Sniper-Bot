@@ -39,3 +39,6 @@ momentum_status.json
 web/momentum_status.json
 momentum_positions.json
 momentum_positions.json.tmp
+momentum_decisions.csv
+momentum_decisions.jsonl
+momentum_decisions_outcomes.csv
