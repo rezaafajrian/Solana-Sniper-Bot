@@ -52,14 +52,17 @@ These are the ways a *technically working* bot still loses your money.
 recovered positions stays in Phase 2 as a refinement.
 
 ## Phase 2 — Execution quality (makes live match the backtest)
-- 🟡 **Exact on-chain PnL reconciliation.** Buy-leg reconcile exists; extend to every
-      sell leg + fees so the ledger is ground truth, not estimate.
-- 🟡 Transaction landing (zeroslot / jito / multi) — **built**; needs live
+- ✅ **Exact on-chain PnL reconciliation.** Both legs reconcile: spawn_buy_reconcile
+      and spawn_reconcile read the true on-chain SOL delta and write BUY_ACTUAL /
+      SELL_ACTUAL rows, correcting the live realized-PnL tally.
+- ✅ **Slippage calibration from live fills.** The analyzer now matches each leg's
+      estimate to its *_ACTUAL row and reports real buy/sell-leg slippage + the
+      recommended MOMENTUM_SIM_COST_FRACTION so dry runs stop being optimistic. This
+      is the "is the simulated PnL real?" answer — it just needs live fills to chew on.
+- 🟡 Transaction landing (zeroslot / jito / multi) — **built**; still needs live
       success-rate measurement and a fallback when the primary route is failing.
 - ❌ Blockhash/expiry + retry policy hardened for live (stale blockhash, dropped tx,
       re-sign vs re-quote).
-- ❌ Slippage model calibrated from live fills (feed real slippage back into the sim
-      cost fraction so dry runs stop lying).
 
 ## Phase 3 — Reliability & operations (unattended uptime)
 - 🟡 Feed reconnect with backoff — **built** for the ws feed; verify under long runs.

@@ -136,17 +136,35 @@ def main():
         score_n[b["mint"]] += 1
     avg_score = {m: score_sum[m] / score_n[m] for m in score_sum if score_n[m]}
 
-    # ---- Cost drag (estimate vs actual, matched by signature) ----
-    est_by_sig = {}
+    # ---- Slippage calibration (estimate vs on-chain actual, matched by signature) ----
+    # Each leg logs an estimate; the *_ACTUAL row logs the true on-chain figure. The
+    # gap between them is the real slippage the dry-run sim should account for.
+    sell_est, buy_est = {}, {}
     for r in rows:
-        if r["event"] in ("SELL_PARTIAL", "SELL_FULL") and r["signature"] not in ("", "DRY_RUN"):
-            est_by_sig[r["signature"]] = f(r, "est_realized_pnl_sol")
+        sig = r["signature"]
+        if sig in ("", "DRY_RUN"):
+            continue
+        if r["event"] in ("SELL_PARTIAL", "SELL_FULL"):
+            sell_est[sig] = (f(r, "est_sol"), f(r, "est_realized_pnl_sol"))
+        elif r["event"] == "BUY":
+            buy_est[sig] = f(r, "est_sol")  # negative (cost)
+    sell_slip, buy_slip = [], []  # per-leg fraction worse than estimated
     drag = 0.0
     drag_n = 0
     for r in rows:
-        if r["event"] == "SELL_ACTUAL" and r["signature"] in est_by_sig:
-            drag += est_by_sig[r["signature"]] - f(r, "est_realized_pnl_sol")
+        sig = r["signature"]
+        if r["event"] == "SELL_ACTUAL" and sig in sell_est:
+            est_proceeds, est_real = sell_est[sig]
+            act_proceeds = f(r, "est_sol")
+            if est_proceeds > 0:
+                sell_slip.append((est_proceeds - act_proceeds) / est_proceeds)
+            drag += est_real - f(r, "est_realized_pnl_sol")
             drag_n += 1
+        elif r["event"] == "BUY_ACTUAL" and sig in buy_est:
+            est_cost = -buy_est[sig]
+            act_cost = -f(r, "est_sol")
+            if est_cost > 0:
+                buy_slip.append((act_cost - est_cost) / est_cost)
 
     # ---- Win/loss split ----
     closed = {m: v for m, v in per_token.items()}
@@ -278,14 +296,26 @@ def main():
     except FileNotFoundError:
         print(f"   No reputation file at '{rep_path}' yet (builds as the bot runs).")
 
-    print("\n6. COST DRAG (estimate minus on-chain actual)")
+    print("\n6. SLIPPAGE CALIBRATION (real fills vs the simulation)")
     if dry:
-        print("   Dry run — costs are already baked into MOMENTUM_SIM_COST_FRACTION.")
-    elif drag_n:
-        print(f"   Reconciled sells   : {drag_n}")
-        print(f"   Total drag         : {drag:+.4f} SOL  (estimate overstated realized by this much)")
+        print("   Dry run — no real fills to measure. The simulated PnL assumes you fill")
+        print("   at the marked price minus MOMENTUM_SIM_COST_FRACTION. Run a small LIVE")
+        print("   session to learn the TRUE cost — it's the only way to know if PnL is real.")
+    elif not (sell_slip or buy_slip):
+        print("   No reconciled (*_ACTUAL) rows yet — run longer, or check RPC")
+        print("   get_transaction access (reconciliation needs it).")
     else:
-        print("   No reconciled (SELL_ACTUAL) rows yet — run longer or check RPC get_transaction access.")
+        avg = lambda x: sum(x) / len(x) if x else 0.0
+        bs, ss = avg(buy_slip), avg(sell_slip)
+        per_leg = avg(buy_slip + sell_slip)
+        print(f"   Reconciled buys / sells : {len(buy_slip)} / {len(sell_slip)}")
+        print(f"   Avg buy-leg slippage    : {bs*100:+.2f}%  (paid this much more than estimated)")
+        print(f"   Avg sell-leg slippage   : {ss*100:+.2f}%  (received this much less than estimated)")
+        print(f"   Est-vs-actual PnL drag  : {drag:+.4f} SOL  (estimate overstated realized by this)")
+        print(f"   -> REAL per-fill cost ≈ {per_leg*100:.2f}%  (round-trip ≈ {(bs+ss)*100:.2f}%).")
+        print(f"      Set MOMENTUM_SIM_COST_FRACTION={max(per_leg,0.0):.3f} so dry runs match reality.")
+        if drag < 0:
+            print("      NOTE: drag is negative — actual fills BEAT the estimate this sample (rare; small sample?).")
 
     print("\n" + "=" * 64)
     if total_realized <= 0:
