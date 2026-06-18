@@ -117,6 +117,15 @@ pub struct MomentumConfig {
     /// Max share of buy volume from wallets that ALSO sold in the window
     /// (round-tripping / wash trading). Above this, the score is cut.
     pub max_wash_fraction: f64,
+    // ---- Anti-dump: stream-based concentration veto (no API, works on fresh tokens) ----
+    /// Reject entry if the top-N traders hold more than this share of the net
+    /// trader-held float (a free proxy for holder concentration). 0 disables.
+    pub max_top_holder_share: f64,
+    /// How many top traders to sum for the concentration check.
+    pub top_holder_n: usize,
+    /// Reject entry if the token creator holds more than this share of the net
+    /// trader float (a proxy for bundled/insider supply). 0 disables.
+    pub max_creator_share: f64,
     pub scale_out_targets: Vec<f64>,
     /// Fraction of the ORIGINAL position to sell at each corresponding rung.
     /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
@@ -321,6 +330,9 @@ impl MomentumConfig {
             max_wallet_concentration: env_f64("MOMENTUM_MAX_WALLET_CONCENTRATION", 0.50),
             min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
             max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
+            max_top_holder_share: env_f64("MOMENTUM_MAX_TOP_HOLDER_SHARE", 0.0),
+            top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
+            max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
             scale_out_targets,
             scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
@@ -418,6 +430,12 @@ impl MomentumConfig {
             "Entry filters: base-momentum floor {} | stagnation stop {}",
             if self.min_base_score > 0.0 { format!(">= {:.0} (boosts can't bypass)", self.min_base_score) } else { "off".to_string() },
             if self.stagnation_secs > 0 { format!("cut if peak < {:.0}% after {}s", self.stagnation_min_pnl, self.stagnation_secs) } else { "off".to_string() },
+        ));
+        logger.log(format!(
+            "Anti-dump concentration: top-{} traders {} | creator share {}",
+            self.top_holder_n,
+            if self.max_top_holder_share > 0.0 { format!("<= {:.0}% of float", self.max_top_holder_share * 100.0) } else { "off".to_string() },
+            if self.max_creator_share > 0.0 { format!("<= {:.0}% of float", self.max_creator_share * 100.0) } else { "off".to_string() },
         ));
         logger.log(format!("Windows: short {}s / baseline {}s", self.short_window_secs, self.medium_window_secs));
         logger.log(format!(
@@ -1403,6 +1421,54 @@ fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
     false
 }
 
+/// Stream-based anti-dump concentration check (no API). Approximates each wallet's
+/// holdings as net SOL bought (buys - sells, floored at 0) from the token's tick
+/// history, then flags tokens where the top-N traders or the creator control too
+/// large a share of that net trader-held float. A free, instant proxy for
+/// "top-10 holders / bundled supply" that works on the freshest tokens GMGN can't
+/// see yet. Returns a rejection reason, or None to allow.
+fn concentration_veto(parsed: &TradeInfoFromToken, mint: &str, cfg: &MomentumConfig) -> Option<String> {
+    if cfg.max_top_holder_share <= 0.0 && cfg.max_creator_share <= 0.0 {
+        return None;
+    }
+    let state = TOKEN_STATE.get(mint)?;
+    let mut net: HashMap<&str, f64> = HashMap::new();
+    for t in state.ticks.iter() {
+        if t.trader.is_empty() {
+            continue;
+        }
+        let e = net.entry(t.trader.as_str()).or_insert(0.0);
+        if t.is_buy { *e += t.sol; } else { *e -= t.sol; }
+    }
+    // Each wallet's "holdings" = positive net SOL in; total float = sum of those.
+    let mut stakes: Vec<(&str, f64)> = net.into_iter().map(|(w, v)| (w, v.max(0.0))).collect();
+    let total: f64 = stakes.iter().map(|(_, v)| *v).sum();
+    if total <= 0.0 {
+        return None;
+    }
+
+    if cfg.max_top_holder_share > 0.0 {
+        stakes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let topn: f64 = stakes.iter().take(cfg.top_holder_n.max(1)).map(|(_, v)| *v).sum();
+        let share = topn / total;
+        if share > cfg.max_top_holder_share {
+            return Some(format!("top-{} traders hold {:.0}% of float > {:.0}%", cfg.top_holder_n, share * 100.0, cfg.max_top_holder_share * 100.0));
+        }
+    }
+    if cfg.max_creator_share > 0.0 {
+        if let Some(creator) = &parsed.coin_creator {
+            if !creator.is_empty() {
+                let cstake = stakes.iter().find(|(w, _)| *w == creator.as_str()).map(|(_, v)| *v).unwrap_or(0.0);
+                let share = cstake / total;
+                if share > cfg.max_creator_share {
+                    return Some(format!("creator holds {:.0}% of float > {:.0}%", share * 100.0, cfg.max_creator_share * 100.0));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Creator + top early buyers (by short-window volume) — the wallets whose
 /// selling is the strongest early warning of a rug/distribution.
 fn build_tracked_wallets(parsed: &TradeInfoFromToken, mint: &str, now: u64, cfg: &MomentumConfig) -> HashSet<String> {
@@ -1495,6 +1561,13 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         return;
     }
     if signal.current_mcap <= 0.0 {
+        return;
+    }
+
+    // Stream-based anti-dump concentration veto (free, instant, works on fresh
+    // tokens). Checked before the GMGN call so we reject dump setups without an API hit.
+    if let Some(reason) = concentration_veto(&parsed, &mint, &cfg) {
+        logger.log(format!("🛑 Concentration veto {} — {}", mint, reason).yellow().to_string());
         return;
     }
 
