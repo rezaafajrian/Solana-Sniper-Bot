@@ -91,6 +91,25 @@ recovered positions stays in Phase 2 as a refinement.
 - ❌ Continuous edge monitoring: alert when live win-rate / avg-PnL drifts from the
       validated baseline (the edge decays as more people copy it).
 
+## Planned deployment — gRPC + VPS, runs 24/7 ("the monster can't be stopped")
+Decided direction for production hosting:
+- **gRPC feed**: switch from the websocket feed to Yellowstone gRPC for lower latency.
+  Already supported — set `MOMENTUM_FEED=grpc` + `YELLOWSTONE_GRPC_HTTP`/`_TOKEN`.
+  (ws was the no-gRPC fallback; gRPC is the faster path once an endpoint is available.)
+- **VPS, always-on**: run on a VPS so it isn't tied to the local machine's power. The
+  bot is already VPS-ready — position persistence + crash recovery (Phase 1) means a
+  restart re-adopts open positions, and the decision/outcome logs keep accumulating.
+
+What an unattended 24/7 deployment makes NON-optional (do these before leaving it
+running on real money):
+- **Process supervision** (systemd/docker `restart=always`) — safe now that crash
+  recovery exists.
+- **Remote alerting** (Telegram/Discord) — if it halts, margin-calls, or the feed
+  drops while you're away, you must be told. This is the top Phase-3 gap for 24/7.
+- **The risk controls ARE the kill switch**: an always-on bot can't be babysat, so the
+  margin call (bankroll floor), circuit breaker, and slippage calibration are what stop
+  it quietly bleeding. Keep them ON in live; only disable for dry-run data gathering.
+
 ---
 
 ## The blunt summary
