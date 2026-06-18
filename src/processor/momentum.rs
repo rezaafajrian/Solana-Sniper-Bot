@@ -135,6 +135,13 @@ pub struct MomentumConfig {
     /// Minimum distinct holders before the concentration veto applies — below this
     /// the token is too young to judge concentration (top-N would be ~100%).
     pub concentration_min_traders: usize,
+    // ---- Anti-dump: insider-distribution entry veto (MELT-inspired) ----
+    /// Reject entry if the top early buyers have already SOLD back more than this
+    /// fraction of what they bought — insiders are distributing, you'd be exit
+    /// liquidity. Age-independent (a sold/bought ratio). 0 disables.
+    pub insider_distrib_max_sold: f64,
+    /// How many top early buyers (by buy volume) to check for distribution.
+    pub insider_distrib_top_n: usize,
     pub scale_out_targets: Vec<f64>,
     /// Fraction of the ORIGINAL position to sell at each corresponding rung.
     /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
@@ -360,6 +367,8 @@ impl MomentumConfig {
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
             concentration_min_traders: env_usize("MOMENTUM_CONCENTRATION_MIN_TRADERS", 25),
+            insider_distrib_max_sold: env_f64("MOMENTUM_INSIDER_DISTRIB_MAX_SOLD", 0.0),
+            insider_distrib_top_n: env_usize("MOMENTUM_INSIDER_DISTRIB_TOP_N", 5),
             scale_out_targets,
             scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
@@ -467,6 +476,10 @@ impl MomentumConfig {
             self.top_holder_n,
             if self.max_top_holder_share > 0.0 { format!("<= {:.0}% of float", self.max_top_holder_share * 100.0) } else { "off".to_string() },
             if self.max_creator_share > 0.0 { format!("<= {:.0}% of float", self.max_creator_share * 100.0) } else { "off".to_string() },
+        ));
+        logger.log(format!(
+            "Insider-distribution veto: {} (MELT-inspired)",
+            if self.insider_distrib_max_sold > 0.0 { format!("skip if top {} early buyers sold > {:.0}% of buys", self.insider_distrib_top_n, self.insider_distrib_max_sold * 100.0) } else { "off".to_string() },
         ));
         logger.log(format!("Windows: short {}s / baseline {}s", self.short_window_secs, self.medium_window_secs));
         logger.log(format!(
@@ -1573,6 +1586,55 @@ fn concentration_veto(parsed: &TradeInfoFromToken, mint: &str, cfg: &MomentumCon
     None
 }
 
+/// MELT-inspired insider-distribution veto. Among the top early buyers (by total
+/// buy volume on this token), what fraction of what they bought have they already
+/// sold back? A high ratio means the biggest early money is distributing — you'd be
+/// buying their exit liquidity. Age-independent (it's their own sold/bought ratio,
+/// not a share of supply), so it doesn't false-trigger on young tokens the way a
+/// concentration % does. Returns a rejection reason, or None to allow.
+fn insider_distribution_veto(mint: &str, cfg: &MomentumConfig) -> Option<String> {
+    if cfg.insider_distrib_max_sold <= 0.0 {
+        return None;
+    }
+    let state = TOKEN_STATE.get(mint)?;
+    // Per-wallet bought and sold SOL over the token's tracked history.
+    let mut bought: HashMap<&str, f64> = HashMap::new();
+    let mut sold: HashMap<&str, f64> = HashMap::new();
+    for t in state.ticks.iter() {
+        if t.trader.is_empty() {
+            continue;
+        }
+        if t.is_buy {
+            *bought.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
+        } else {
+            *sold.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
+        }
+    }
+    if bought.is_empty() {
+        return None;
+    }
+    // Rank buyers by how much they bought; check the top N.
+    let mut ranked: Vec<(&str, f64)> = bought.iter().map(|(w, v)| (*w, *v)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top_bought = 0.0;
+    let mut top_sold = 0.0;
+    for (w, b) in ranked.into_iter().take(cfg.insider_distrib_top_n.max(1)) {
+        top_bought += b;
+        top_sold += sold.get(w).copied().unwrap_or(0.0);
+    }
+    if top_bought <= 0.0 {
+        return None;
+    }
+    let sold_ratio = top_sold / top_bought;
+    if sold_ratio > cfg.insider_distrib_max_sold {
+        return Some(format!(
+            "top {} early buyers already sold {:.0}% of what they bought (> {:.0}%) — distributing",
+            cfg.insider_distrib_top_n, sold_ratio * 100.0, cfg.insider_distrib_max_sold * 100.0,
+        ));
+    }
+    None
+}
+
 /// Creator + top early buyers (by short-window volume) — the wallets whose
 /// selling is the strongest early warning of a rug/distribution.
 fn build_tracked_wallets(parsed: &TradeInfoFromToken, mint: &str, now: u64, cfg: &MomentumConfig) -> HashSet<String> {
@@ -1676,6 +1738,12 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // tokens). Checked before the GMGN call so we reject dump setups without an API hit.
     if let Some(reason) = concentration_veto(&parsed, &mint, &cfg) {
         logger.log(format!("🛑 Concentration veto {} — {}", mint, reason).yellow().to_string());
+        return;
+    }
+    // MELT-inspired: don't buy into a token whose biggest early buyers are already
+    // distributing — that's the trash-coin / coordinated-dump pattern.
+    if let Some(reason) = insider_distribution_veto(&mint, &cfg) {
+        logger.log(format!("🛑 Insider-distribution veto {} — {}", mint, reason).yellow().to_string());
         return;
     }
 
