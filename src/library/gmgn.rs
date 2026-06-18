@@ -45,6 +45,10 @@ pub struct GmgnConfig {
     pub security_cache_secs: u64,
     /// Veto a buy if rug_ratio exceeds this (0..1).
     pub max_rug_ratio: f64,
+    /// Veto a buy if the top-10 holders control more than this share (0..1). 1.0 = off.
+    pub max_top10_holder_rate: f64,
+    /// Veto a buy if bundled/sniped supply exceeds this share (0..1). 1.0 = off.
+    pub max_bundle_rate: f64,
     /// If true, a security lookup that fails (timeout/error) blocks the buy
     /// (fail-closed). If false, an unknown token is allowed through (fail-open).
     pub veto_on_unknown: bool,
@@ -71,6 +75,8 @@ impl GmgnConfig {
             ),
             security_cache_secs: std::env::var("GMGN_SECURITY_CACHE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
             max_rug_ratio: std::env::var("GMGN_MAX_RUG_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3),
+            max_top10_holder_rate: std::env::var("GMGN_MAX_TOP10_HOLDER_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            max_bundle_rate: std::env::var("GMGN_MAX_BUNDLE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             veto_on_unknown: std::env::var("GMGN_VETO_ON_UNKNOWN").map(|v| v.to_lowercase() == "true").unwrap_or(false),
         }
     }
@@ -174,6 +180,23 @@ impl GmgnClient {
                 return SecurityVerdict::Reject(format!("rug_ratio {:.2} > {:.2}", r, self.cfg.max_rug_ratio));
             }
         }
+        // Holder concentration: a few wallets holding most of the supply can dump and
+        // crash it. GMGN field names vary, so try the common ones.
+        if self.cfg.max_top10_holder_rate < 1.0 {
+            if let Some(rate) = first_f64(v, &["top_10_holder_rate", "top10_holder_rate", "top_10_holders_rate", "top10HolderRate"]) {
+                if rate > self.cfg.max_top10_holder_rate {
+                    return SecurityVerdict::Reject(format!("top-10 holders {:.0}% > {:.0}%", rate * 100.0, self.cfg.max_top10_holder_rate * 100.0));
+                }
+            }
+        }
+        // Bundled / sniped supply: insiders controlling supply from launch will dump.
+        if self.cfg.max_bundle_rate < 1.0 {
+            if let Some(rate) = first_f64(v, &["bundler_rate", "bundle_rate", "bundled_rate", "bundlerRate", "insider_rate"]) {
+                if rate > self.cfg.max_bundle_rate {
+                    return SecurityVerdict::Reject(format!("bundled {:.0}% > {:.0}%", rate * 100.0, self.cfg.max_bundle_rate * 100.0));
+                }
+            }
+        }
         SecurityVerdict::Ok
     }
 
@@ -236,6 +259,20 @@ fn as_f64(v: Option<&Value>) -> Option<f64> {
         Some(Value::String(s)) => s.parse().ok(),
         _ => None,
     }
+}
+
+/// First parseable f64 among several possible field names (GMGN naming varies),
+/// checked at the top level and inside a nested "data"/"token" object.
+fn first_f64(v: &Value, keys: &[&str]) -> Option<f64> {
+    let nests = [Some(v), v.get("data"), v.get("token")];
+    for obj in nests.into_iter().flatten() {
+        for k in keys {
+            if let Some(x) = as_f64(obj.get(*k)) {
+                return Some(x);
+            }
+        }
+    }
+    None
 }
 
 fn as_u64(v: Option<&Value>) -> Option<u64> {
