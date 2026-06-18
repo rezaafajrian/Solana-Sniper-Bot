@@ -2,10 +2,11 @@
 # ============================================================================
 # MAXIMAL-POWER DRY RUN preset for the momentum bot.
 #
-# Turns ON every edge and every protection at once so a single dry run exercises
-# the whole system (alpha-follow + KOL boost + smart-money + anti-dump filters +
-# trailing stop + scale-out + stagnation + persistence), with the circuit breaker
-# OFF so it never halts mid-run and you get a full sample.
+# Turns on the PROVEN stack (alpha-follow + KOL boost + smart-money + trailing stop
+# + scale-out + conviction + persistence) with the circuit breaker OFF so it runs
+# uninterrupted. The UNPROVEN entry filters (base-momentum floor, stagnation stop,
+# concentration veto) are left OFF — they over-filter and should be A/B'd one at a
+# time, not switched on blind. This is the +5.66 SOL config, fully loaded.
 #
 # It SETS each MOMENTUM_* key in your existing .env (removing duplicates first, so
 # the value actually takes effect) and ADDS any keys your .env is missing. It does
@@ -32,9 +33,9 @@ PAIRS=(
   "MOMENTUM_MAX_POSITIONS=3"
   "MOMENTUM_MAX_DEPLOYED_SOL=1.0"
 
-  # --- entry: real momentum required, boosts can't drag in dead charts ---
+  # --- entry (proven config; experimental floor OFF by default) ---
   "MOMENTUM_ENTRY_SCORE=57"
-  "MOMENTUM_MIN_BASE_SCORE=45"
+  "MOMENTUM_MIN_BASE_SCORE=0"
   "MOMENTUM_COLLAPSE_SCORE=35"
   "MOMENTUM_SHORT_WINDOW_SECS=30"
   "MOMENTUM_MEDIUM_WINDOW_SECS=120"
@@ -64,7 +65,7 @@ PAIRS=(
   "MOMENTUM_SCALE_OUT_TARGETS=100,200,300,400"
   "MOMENTUM_SCALE_OUT_FRACTIONS=0.2,0.2,0.2,0.2"
   "MOMENTUM_HARD_STOP_PCT=-35"
-  "MOMENTUM_STAGNATION_SECS=120"
+  "MOMENTUM_STAGNATION_SECS=0"
   "MOMENTUM_STAGNATION_MIN_PNL=20"
 
   # --- exit: insider/leader-dump (full exit; protective) ---
@@ -72,10 +73,11 @@ PAIRS=(
   "MOMENTUM_LEADER_DUMP_SOL=1.0"
   "MOMENTUM_LEADER_DUMP_FRACTION=1.0"
 
-  # --- anti-dump: free stream-based concentration veto (no API) ---
-  "MOMENTUM_MAX_TOP_HOLDER_SHARE=0.85"
+  # --- anti-dump concentration veto: OFF by default (unproven; over-filters fresh
+  #     tokens). Opt in and A/B it one at a time: set SHARE=0.85, CREATOR=0.25. ---
+  "MOMENTUM_MAX_TOP_HOLDER_SHARE=0"
   "MOMENTUM_TOP_HOLDER_N=10"
-  "MOMENTUM_MAX_CREATOR_SHARE=0.25"
+  "MOMENTUM_MAX_CREATOR_SHARE=0"
   "MOMENTUM_CONCENTRATION_MIN_TRADERS=25"
 
   # --- discipline: breaker OFF for an uninterrupted sample ---
