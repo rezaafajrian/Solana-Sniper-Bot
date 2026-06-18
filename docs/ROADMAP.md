@@ -59,8 +59,9 @@ recovered positions stays in Phase 2 as a refinement.
       estimate to its *_ACTUAL row and reports real buy/sell-leg slippage + the
       recommended MOMENTUM_SIM_COST_FRACTION so dry runs stop being optimistic. This
       is the "is the simulated PnL real?" answer — it just needs live fills to chew on.
-- 🟡 Transaction landing (zeroslot / jito / multi) — **built**; still needs live
-      success-rate measurement and a fallback when the primary route is failing.
+- 🟡 Transaction landing (zeroslot / jito / multi) — **built**; success-rate
+      telemetry added (tx_sent / tx_landed in the status snapshot). Still needs an
+      automatic fallback when the primary route's land rate is poor.
 - ❌ Blockhash/expiry + retry policy hardened for live (stale blockhash, dropped tx,
       re-sign vs re-quote).
 

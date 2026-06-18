@@ -571,6 +571,10 @@ lazy_static! {
     static ref RECENTLY_EXITED: DashMap<String, u64> = DashMap::new();
     static ref IN_FLIGHT_BUYS: AtomicUsize = AtomicUsize::new(0);
     static ref MOMENTUM_RUNNING: AtomicBool = AtomicBool::new(true);
+    /// Landing telemetry: transactions submitted vs confirmed on-chain (via the
+    /// reconciliation lookup). Confirmed is a lower bound if get_transaction is flaky.
+    static ref TX_SENT: AtomicU64 = AtomicU64::new(0);
+    static ref TX_LANDED: AtomicU64 = AtomicU64::new(0);
     /// Serializes appends to the trade-log CSV.
     static ref TRADE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Running tallies for the live PnL summary: (realized_pnl_sol, buys, sells).
@@ -1046,6 +1050,8 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "gmgn_watchlist": GMGN_WATCHLIST.len(),
             "wallet_rep": WALLET_REP.len(),
             "alpha_proven": proven,
+            "tx_sent": TX_SENT.load(Ordering::Relaxed),
+            "tx_landed": TX_LANDED.load(Ordering::Relaxed),
         },
         "config": {
             "position_size_sol": cfg.position_size_sol,
@@ -1748,8 +1754,10 @@ fn spawn_buy_reconcile(app_state: Arc<AppState>, mint: String, signature: String
     if signature.is_empty() {
         return;
     }
+    TX_SENT.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         if let Some(delta) = fetch_actual_sol_delta(&app_state, &signature).await {
+            TX_LANDED.fetch_add(1, Ordering::Relaxed);
             // A buy spends SOL -> wallet delta is negative; actual cost = -delta.
             let actual_cost = (-delta).max(0.0);
             if actual_cost <= 0.0 {
@@ -2262,8 +2270,10 @@ fn spawn_reconcile(
     if signature.is_empty() {
         return;
     }
+    TX_SENT.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         if let Some(proceeds) = fetch_actual_sol_delta(&app_state, &signature).await {
+            TX_LANDED.fetch_add(1, Ordering::Relaxed);
             let actual_realized = proceeds - cost_basis;
             if let Ok(mut t) = PNL_TALLY.lock() {
                 t.0 += actual_realized - est_realized;
