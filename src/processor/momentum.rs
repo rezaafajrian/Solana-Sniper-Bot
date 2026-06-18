@@ -72,6 +72,8 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeRequestPing, SubscribeUpdateTransaction,
 };
 
+use solana_sdk::signer::Signer;
+
 use crate::common::config::{AppState, SwapConfig};
 use crate::common::logger::Logger;
 use crate::library::gmgn::{GmgnClient, GmgnConfig, SecurityVerdict};
@@ -213,6 +215,10 @@ pub struct MomentumConfig {
     /// Estimated entry-leg cost (fees + tip + slippage) as a fraction of size,
     /// folded into the cost basis so realized PnL isn't optimistic about the buy.
     pub buy_cost_fraction: f64,
+    /// SOL to keep in reserve for fees/tips so a live buy never drains the wallet
+    /// below what it needs to pay for the eventual sell. Buys are skipped if the
+    /// wallet balance is below entry_size + this reserve.
+    pub fee_reserve_sol: f64,
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
@@ -386,6 +392,7 @@ impl MomentumConfig {
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
+            fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
             gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
@@ -1764,6 +1771,22 @@ async fn momentum_buy(
     cfg: &MomentumConfig,
     logger: &Logger,
 ) -> Result<String, String> {
+    // Pre-buy balance + fee-reserve guard: never send a buy the wallet can't afford,
+    // and always keep a reserve so there's SOL left to pay for the eventual sell.
+    // Best-effort: if the balance lookup fails we proceed (the tx would fail on-chain).
+    if let Ok(pubkey) = app_state.wallet.try_pubkey() {
+        if let Ok(lamports) = app_state.rpc_nonblocking_client.get_balance(&pubkey).await {
+            let balance = lamports as f64 / LAMPORTS_PER_SOL;
+            let needed = amount_sol + cfg.fee_reserve_sol;
+            if balance < needed {
+                return Err(format!(
+                    "insufficient balance: have {:.4} SOL, need {:.4} (size {:.4} + reserve {:.4})",
+                    balance, needed, amount_sol, cfg.fee_reserve_sol,
+                ));
+            }
+        }
+    }
+
     let buy_config = SwapConfig {
         swap_direction: SwapDirection::Buy,
         in_type: SwapInType::Qty,
