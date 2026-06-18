@@ -219,6 +219,9 @@ pub struct MomentumConfig {
     /// below what it needs to pay for the eventual sell. Buys are skipped if the
     /// wallet balance is below entry_size + this reserve.
     pub fee_reserve_sol: f64,
+    /// Failed sell attempts before a position is quarantined (auto-sell halted, alerted)
+    /// — stops the bot spinning forever on an illiquid/honeypot token. 0 = never quarantine.
+    pub max_sell_retries: u32,
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
@@ -393,6 +396,7 @@ impl MomentumConfig {
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
             fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
+            max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
             gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
@@ -550,6 +554,13 @@ struct MomentumPosition {
     entry_ts: u64,
     /// KOL label that triggered this entry, if any (for the dashboard).
     kol_label: String,
+    /// Consecutive failed sell attempts (resets on a successful partial sell).
+    #[serde(default)]
+    sell_attempts: u32,
+    /// Set once sells have failed too many times (likely illiquid/honeypot): auto-sell
+    /// is halted so the bot stops spinning, and the position is surfaced for manual exit.
+    #[serde(default)]
+    quarantined: bool,
 }
 
 lazy_static! {
@@ -977,6 +988,7 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "age_secs": now.saturating_sub(p.entry_ts),
             "kol": p.kol_label,
             "selling": p.selling,
+            "quarantined": p.quarantined,
         }));
     }
     positions.sort_by(|a, b| b["pnl_pct"].as_f64().unwrap_or(0.0).partial_cmp(&a["pnl_pct"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
@@ -1697,6 +1709,8 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 tracked_wallets,
                 entry_ts: now,
                 kol_label: lead_label.clone().unwrap_or_default(),
+                sell_attempts: 0,
+                quarantined: false,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
             log_trade_event(&TradeLogEvent {
@@ -1998,7 +2012,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             Some(p) => p,
             None => return,
         };
-        if pos.selling {
+        if pos.selling || pos.quarantined {
             return;
         }
         if signal.current_mcap <= 0.0 || pos.entry_mcap <= 0.0 {
@@ -2135,7 +2149,19 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         if !succeeded {
             if let Some(mut p) = POSITIONS.get_mut(&mint) {
                 p.selling = false;
+                p.sell_attempts += 1;
+                // Unsellable-token guard: after too many failed sells the token is
+                // likely illiquid/honeypot. Quarantine it (halt auto-sell) and alert,
+                // instead of spinning forever every evaluation tick.
+                if cfg.max_sell_retries > 0 && p.sell_attempts >= cfg.max_sell_retries && !p.quarantined {
+                    p.quarantined = true;
+                    logger.log(format!(
+                        "🚨 QUARANTINE {} — sell failed {} times (likely illiquid/honeypot). Auto-sell halted; check your wallet and exit manually.",
+                        mint, p.sell_attempts,
+                    ).red().bold().to_string());
+                }
             }
+            save_positions();
             return;
         }
         if is_full {
@@ -2149,6 +2175,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 }
                 p.remaining_fraction = (p.remaining_fraction - decision.frac_of_original).max(0.0);
                 p.selling = false;
+                p.sell_attempts = 0; // a successful sell clears the failure streak
             }
             save_positions(); // persist the reduced position (rung hit + fraction)
         }

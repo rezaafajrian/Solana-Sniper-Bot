@@ -30,20 +30,26 @@ No feature matters if it isn't profitable on real fills. This is the bottleneck.
 ## Phase 1 — Survival-critical hardening (GATE: no real capital until this passes)
 These are the ways a *technically working* bot still loses your money.
 
-- ❌ **Open-position persistence + crash recovery.** `POSITIONS` is in-memory only.
-      If the bot crashes or you restart it with open positions, it **forgets them and
-      stops managing exits** — you silently hold bags with no stop-loss running. Must:
-      persist positions to disk on every change, and on startup reconcile against
-      actual on-chain token balances (adopt orphans, drop dust) before trading.
+- ✅ **Open-position persistence + crash recovery.** Positions persist to disk on every
+      change (entry/scale-out/exit) and are re-adopted on startup so the exit monitor
+      resumes managing them. (Live on-chain balance reconciliation of recovered
+      positions is still a refinement — see Phase 2.)
 - 🟡 **Secret management.** Private key sits in plaintext `.env`. At minimum: confirm
       `.env` is gitignored (it is), **rotate the keys that were exposed in chat**, use
       a dedicated low-balance hot wallet (never your main), and never log key material.
-- ❌ **Pre-buy balance + fee-reserve check.** Verify the wallet has size + fee buffer
-      before sending a buy, so live buys fail *gracefully* instead of half-landing.
-- ❌ **Unsellable-token handling.** A token that passes the rug veto can still become
-      illiquid/honeypot post-buy. Need a max-retry sell, then quarantine + alert rather
-      than retrying forever or marking a phantom exit.
+- ✅ **Pre-buy balance + fee-reserve check.** momentum_buy verifies wallet balance >=
+      size + MOMENTUM_FEE_RESERVE_SOL before sending; short balance skips the entry.
+- ✅ **Anti-dump entry filters.** Base-momentum floor (boosts can't drag in dead charts),
+      GMGN top-10-holder + bundle vetoes, and a free stream-based concentration veto,
+      plus a stagnation time-stop that cuts dead positions before they bleed.
+- ✅ **Unsellable-token handling.** After MOMENTUM_MAX_SELL_RETRIES failed sells a
+      position is quarantined (auto-sell halted, alerted, surfaced on the dashboard)
+      instead of spinning forever on an illiquid/honeypot token.
 - ✅ Circuit breaker (daily loss limit, consecutive losses, daily reset) + go-live gate.
+
+**Phase 1 is now functionally complete** — the remaining item is operational
+(rotate exposed keys, use a dedicated hot wallet). Live on-chain reconciliation of
+recovered positions stays in Phase 2 as a refinement.
 
 ## Phase 2 — Execution quality (makes live match the backtest)
 - 🟡 **Exact on-chain PnL reconciliation.** Buy-leg reconcile exists; extend to every
