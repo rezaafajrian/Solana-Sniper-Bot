@@ -238,9 +238,66 @@ def main():
         w = sum(1 for r in rs if is_winner(r)); l = sum(1 for r in rs if is_loser(r))
         print(f"  {key:12} {len(rs):>7} {pct(w,w+l):>7.0f}% {mean([f(r,'o_max_return') for r in rs]):>+8.2f}x")
 
+    # ---- EV-optimal thresholds: the settings that MAXIMIZE expected value ----
+    section("7. EV-OPTIMAL THRESHOLDS (the cutoff that maximizes avg return)")
+    fr = lambda r: f(r, "o_final_return")
+    ev_all = mean([fr(r) for r in rows if not math.isnan(fr(r))])
+    print(f"  baseline EV (avg final return, all entries): {ev_all:+.3f}  over {len(rows)} tokens")
+    print(f"  {'feature':22} {'best cutoff':>11} {'EV>=cut':>9} {'kept':>6} {'lift':>8}")
+    ev_recs = []
+    for k in NUM_FEATURES:
+        vals = sorted(f(r, k) for r in rows if not math.isnan(f(r, k)))
+        if len(vals) < 15:
+            continue
+        best = None  # (ev, cutoff, kept_n)
+        # sweep candidate cutoffs across the feature's range (deciles)
+        for q in range(1, 10):
+            cut = vals[int(len(vals) * q / 10)]
+            kept = [r for r in rows if not math.isnan(f(r, k)) and f(r, k) >= cut]
+            if len(kept) < max(8, len(rows) // 10):
+                continue
+            ev = mean([fr(r) for r in kept if not math.isnan(fr(r))])
+            if best is None or ev > best[0]:
+                best = (ev, cut, len(kept))
+        if best and best[0] - ev_all > 0.05:  # only show meaningful EV lift
+            lift = best[0] - ev_all
+            print(f"  {k:22} {best[1]:>11.3f} {best[0]:>+8.3f} {best[2]:>6} {lift:>+7.3f}")
+            ev_recs.append((lift, k, best[1], best[0]))
+    if not ev_recs:
+        print("  no single-feature cutoff beats the baseline by >0.05 yet (need more data,")
+        print("  or the edge is multi-feature / in the exits, not the entry filter).")
+
+    # ---- Moonshot attribution: which signals catch the 5x+? ----
+    section("8. MOONSHOT ATTRIBUTION (what precedes the 5x+ winners)")
+    moon = [r for r in rows if label_of(r) in {"5X", "10X", "20X+"} or f(r, "o_max_return") >= 4.0]
+    moon_cas = {r.get("ca") for r in moon}
+    nonmoon = [r for r in rows if r.get("ca") not in moon_cas]
+    print(f"  moonshots (>=5x peak): {len(moon)} of {len(rows)}  (base rate {pct(len(moon),len(rows)):.1f}%)")
+    if len(moon) >= 3:
+        print(f"  {'feature':22} {'moonshots':>10} {'others':>10} {'gap':>8}")
+        moon_ranked = []
+        for k in NUM_FEATURES:
+            mm, om = mean([f(r, k) for r in moon]), mean([f(r, k) for r in nonmoon])
+            if math.isnan(mm) or math.isnan(om):
+                continue
+            scale = max(abs(mm), abs(om), 1e-9)
+            moon_ranked.append((abs((mm-om)/scale), k, mm, om))
+        moon_ranked.sort(reverse=True)
+        for g, k, mm, om in moon_ranked[:6]:
+            flag = "  <<" if g > 0.3 else ""
+            print(f"  {k:22} {mm:>10.3f} {om:>10.3f} {g:>+7.0%}{flag}")
+        print("  ('<<' = this feature is notably elevated before the big winners)")
+    else:
+        print("  not enough 5x+ tokens yet to fingerprint them — keep accumulating.")
+
     # ---- 5. Recommendations ----
-    section("7. RECOMMENDATIONS (data-driven, verify before trusting)")
+    section("9. RECOMMENDATIONS (data-driven, verify before trusting)")
     recs = []
+    # EV-optimal threshold recommendations (the maximize lever)
+    ev_recs.sort(reverse=True)
+    for lift, k, cut, ev in ev_recs[:3]:
+        recs.append(f"Gating on {k} >= {cut:.2f} lifts avg return from {ev_all:+.3f} to {ev:+.3f} "
+                    f"(+{lift:.3f}/token). Strong EV-maximizing filter — A/B it.")
     # rug predictors
     rugs = [r for r in rows if label_of(r) == "RUG"]
     nonrugs = [r for r in rows if label_of(r) != "RUG"]
