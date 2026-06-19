@@ -202,6 +202,17 @@ pub struct MomentumConfig {
     /// Extra position-size multiple when convergence fires (on top of alpha_size_mult).
     pub convergence_size_mult: f64,
 
+    // ---- "Ones to Watch": high-conviction composite watchlist ----
+    /// Composite watch score = market-structure sub-score + smart-money convergence.
+    /// Tokens clearing `watch_score_min` are flagged & tracked. In beta (autobuy off)
+    /// they only alert; once learn.py validates them, autobuy buys them at watch_size.
+    pub watch_enabled: bool,
+    pub watch_score_min: f64,
+    pub watch_autobuy: bool,
+    pub watch_size_sol: f64,
+    /// Weight on the market-structure half of the composite (rest goes to convergence).
+    pub watch_ms_weight: f64,
+
     // ---- Edge: insider / leader-dump exit ----
     /// Exit immediately when the creator or top early buyers start distributing.
     pub leader_dump_exit_enabled: bool,
@@ -415,6 +426,11 @@ impl MomentumConfig {
             convergence_min: env_usize("MOMENTUM_CONVERGENCE_MIN", 2),
             convergence_boost: env_f64("MOMENTUM_CONVERGENCE_BOOST", 55.0),
             convergence_size_mult: env_f64("MOMENTUM_CONVERGENCE_SIZE_MULT", 1.5),
+            watch_enabled: std::env::var("MOMENTUM_WATCH_ENABLED").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            watch_score_min: env_f64("MOMENTUM_WATCH_SCORE", 70.0),
+            watch_autobuy: std::env::var("MOMENTUM_WATCH_AUTOBUY").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            watch_size_sol: env_f64("MOMENTUM_WATCH_SIZE_SOL", 0.5),
+            watch_ms_weight: env_f64("MOMENTUM_WATCH_MS_WEIGHT", 0.5).clamp(0.0, 1.0),
 
             leader_dump_exit_enabled: std::env::var("MOMENTUM_LEADER_DUMP_EXIT")
                 .map(|v| v.to_lowercase() != "false")
@@ -529,6 +545,13 @@ impl MomentumConfig {
             "🤝 Convergence: {} proven wallets accumulating together -> boost +{:.0}, extra size x{:.2} (the most reliable signal)",
             self.convergence_min, self.convergence_boost, self.convergence_size_mult,
         ));
+        if self.watch_enabled {
+            logger.log(format!(
+                "👁  Ones to Watch: composite >= {:.0} (structure {:.0}% + convergence {:.0}%) -> {}",
+                self.watch_score_min, self.watch_ms_weight * 100.0, (1.0 - self.watch_ms_weight) * 100.0,
+                if self.watch_autobuy { format!("AUTOBUY @ {:.2} SOL", self.watch_size_sol) } else { "ALERT-ONLY (beta — validate with learn.py first)".to_string() },
+            ).magenta().bold().to_string());
+        }
         if self.start_capital_sol > 0.0 {
             let sizing = if self.position_size_pct > 0.0 {
                 format!("{:.1}% of equity/position (scales with account)", self.position_size_pct * 100.0)
@@ -655,6 +678,8 @@ lazy_static! {
     /// and per-token post-detection outcome tracking.
     static ref DECISION_LOGGED: DashMap<String, ()> = DashMap::new();
     static ref OUTCOMES: DashMap<String, OutcomeTrack> = DashMap::new();
+    /// "Ones to Watch": mint -> (watch_score, market_structure, convergence, ts).
+    static ref WATCHLIST: DashMap<String, (f64, f64, f64, u64)> = DashMap::new();
     static ref DECISION_LOG_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
     static ref DECISION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Serializes appends to the trade-log CSV.
@@ -976,6 +1001,28 @@ fn smart_convergence(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(usiz
     best.map(|(w, _)| (count, summed_rep, w))
 }
 
+/// "Ones to Watch" composite score (0..100) from two independent signals:
+///   1) Market structure — turnover (vol/mc), the validated momentum/structure
+///      composite, and bonding-curve liquidity health. (Multi-day metrics like
+///      5d MC change / token-tier from established-token products don't apply to
+///      fresh launches, so this is the bot-window equivalent of "market structure".)
+///   2) Smart-money convergence — how many PROVEN wallets are accumulating at once.
+/// Returns (total, market_structure, convergence_subscore).
+fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, cfg: &MomentumConfig) -> (f64, f64, f64) {
+    // --- market structure (0..100) ---
+    let vol_mc = if signal.current_mcap > 0.0 { signal.buy_volume_short / signal.current_mcap } else { 0.0 };
+    let vol_mc_norm = (vol_mc / 0.5).clamp(0.0, 1.0); // ~0.5 turnover = strong
+    let liq = TOKEN_STATE.get(mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+    let liq_norm = (liq / 50.0).clamp(0.0, 1.0);      // ~50 SOL in curve = healthy
+    let struct_norm = (signal.score / 100.0).clamp(0.0, 1.0);
+    let ms = (struct_norm * 0.6 + vol_mc_norm * 0.25 + liq_norm * 0.15) * 100.0;
+    // --- smart-money convergence (0..100) ---
+    let conv_full = (cfg.convergence_min + 2).max(1) as f64;
+    let conv = (conv_count as f64 / conv_full).clamp(0.0, 1.0) * 100.0;
+    let total = cfg.watch_ms_weight * ms + (1.0 - cfg.watch_ms_weight) * conv;
+    (total, ms, conv)
+}
+
 /// Queue a buy for later outcome grading (smart-money learning).
 fn enqueue_attribution(wallet: String, mint: String, entry_mcap: f64, eval_at: u64) {
     if let Ok(mut q) = ATTR_QUEUE.lock() {
@@ -1116,6 +1163,16 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
         }
     }
 
+    // "Ones to Watch" — prune entries older than 10 min, then take the top by score.
+    WATCHLIST.retain(|_, v| now.saturating_sub(v.3) < 600);
+    let mut watch: Vec<(String, f64, f64, f64, u64)> = WATCHLIST.iter()
+        .map(|e| (e.key().clone(), e.value().0, e.value().1, e.value().2, e.value().3)).collect();
+    watch.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    watch.truncate(15);
+    let watchlist: Vec<serde_json::Value> = watch.into_iter()
+        .map(|(m, s, ms, cv, ts)| serde_json::json!({ "mint": m, "score": s, "structure": ms, "convergence": cv, "age_secs": now.saturating_sub(ts) }))
+        .collect();
+
     // Per-KOL leaderboard (best realized PnL first) — keep the green, hunt alts.
     let mut kol_board: Vec<serde_json::Value> = KOL_PNL.iter().map(|e| {
         let (realized, wins, losses) = *e.value();
@@ -1184,11 +1241,15 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "alpha_follow": cfg.alpha_follow_enabled,
             "alpha_rep_min": cfg.alpha_rep_min,
             "alpha_min_samples": cfg.alpha_min_samples,
+            "watch_enabled": cfg.watch_enabled,
+            "watch_autobuy": cfg.watch_autobuy,
+            "watch_score_min": cfg.watch_score_min,
         },
         "positions": positions,
         "feed": feed,
         "kol_leaderboard": kol_board,
         "top_alpha": top_alpha,
+        "watchlist": watchlist,
     });
 
     let tmp = format!("{}.tmp", cfg.status_file);
@@ -1997,6 +2058,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // this token at once. Convergence (several at once) is the strongest, most
     // reliable signal — boosted and sized harder than a single proven wallet.
     let conv = if kol.is_none() { smart_convergence(&mint, now, &cfg) } else { None };
+    let conv_count = conv.as_ref().map(|(c, _, _)| *c).unwrap_or(0);
     let is_convergence = conv.as_ref().map(|(c, _, _)| *c >= cfg.convergence_min).unwrap_or(false);
     let alpha = conv.as_ref().map(|(_, _, w)| (w.clone(), 0.0));
     let alpha_pts = if is_convergence {
@@ -2018,13 +2080,39 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         else if gmgn_hot { "gmgn" }
         else { "momentum" };
 
-    if effective_score < cfg.entry_score {
+    // "Ones to Watch": high-conviction composite (market structure + convergence).
+    // In beta (autobuy off) this only flags + alerts + tracks the token for learn.py
+    // to validate; with autobuy on it becomes a large-size entry that bypasses the
+    // normal score gate (but still respects the safety vetoes + capital below).
+    let (wscore, ms_sub, conv_sub) = if cfg.watch_enabled {
+        watch_score(&signal, &mint, conv_count, &cfg)
+    } else { (0.0, 0.0, 0.0) };
+    let is_watch = cfg.watch_enabled && wscore >= cfg.watch_score_min && signal.current_mcap > 0.0;
+    if is_watch {
+        WATCHLIST.insert(mint.clone(), (wscore, ms_sub, conv_sub, now));
+        if !DECISION_LOGGED.contains_key(&mint) {
+            logger.log(format!(
+                "👁  ONE TO WATCH {} | watch {:.0} (structure {:.0}, convergence {:.0}, {} whales) | mcap {:.1} SOL{}",
+                mint, wscore, ms_sub, conv_sub, conv_count, signal.current_mcap,
+                if cfg.watch_autobuy { " | AUTOBUY" } else { " | alert-only (beta)" },
+            ).magenta().bold().to_string());
+        }
+        record_decision(&parsed, &signal, &cfg, wscore, "watch",
+            if cfg.watch_autobuy { "WATCH" } else { "WATCH" },
+            &format!("watch {:.0} (ms {:.0}, conv {:.0})", wscore, ms_sub, conv_sub));
+    }
+    // A watch token in autobuy mode is its own entry trigger — let it bypass the
+    // normal momentum score/floor gates (it has its own, higher composite bar).
+    let watch_buy = is_watch && cfg.watch_autobuy;
+    let signal_type = if watch_buy { "watch" } else { signal_type };
+
+    if effective_score < cfg.entry_score && !watch_buy {
         record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "score below entry bar");
         return;
     }
     // Base-momentum floor: a boost (KOL/alpha/GMGN) can't drag in a token that has
     // no real momentum of its own. Require genuine strength AND the signal.
-    if cfg.min_base_score > 0.0 && signal.score < cfg.min_base_score {
+    if cfg.min_base_score > 0.0 && signal.score < cfg.min_base_score && !watch_buy {
         record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "base momentum below floor");
         return;
     }
@@ -2100,6 +2188,11 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         let follow_mult = if is_convergence { cfg.alpha_size_mult * cfg.convergence_size_mult } else { cfg.alpha_size_mult };
         let cap = base_size * cfg.conviction_max_mult.max(follow_mult);
         entry_size = (entry_size * follow_mult).min(cap);
+    }
+    // "Ones to Watch" autobuy: these are the highest-conviction setups, so they get
+    // the larger watch size (not the usual position size).
+    if watch_buy {
+        entry_size = entry_size.max(cfg.watch_size_sol);
     }
 
     if cfg.start_capital_sol > 0.0 {
@@ -2950,6 +3043,7 @@ async fn momentum_startup(
     MARGIN_CALLED.store(false, Ordering::SeqCst);
     SESSION_WINS.store(0, Ordering::SeqCst);
     SESSION_LOSSES.store(0, Ordering::SeqCst);
+    WATCHLIST.clear();
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
     DAY_INDEX.store(current_day(cfg), Ordering::SeqCst);
     if let Ok(mut base) = DAY_START_REALIZED.lock() {

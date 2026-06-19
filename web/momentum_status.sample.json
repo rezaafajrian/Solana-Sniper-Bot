@@ -39,7 +39,10 @@
     "daily_loss_limit_sol": 0.15,
     "alpha_follow": true,
     "alpha_rep_min": 0.5,
-    "alpha_min_samples": 5
+    "alpha_min_samples": 5,
+    "watch_enabled": true,
+    "watch_autobuy": false,
+    "watch_score_min": 70
   },
   "positions": [
     {
@@ -168,6 +171,22 @@
       "score": 0.533,
       "samples": 6,
       "win_rate": 0.63
+    }
+  ],
+  "watchlist": [
+    {
+      "mint": "GVDvcDaRY3eijmnBfw9dwE9pGT5H52geYmm8AFcopump",
+      "score": 88,
+      "structure": 82,
+      "convergence": 95,
+      "age_secs": 40
+    },
+    {
+      "mint": "8jQofPhVSGGt8JnGSXGKu3MMLJjcYDGj8Pj9JaN1pump",
+      "score": 74,
+      "structure": 78,
+      "convergence": 66,
+      "age_secs": 120
     }
   ]
 }

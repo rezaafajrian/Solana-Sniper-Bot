@@ -207,6 +207,13 @@
       <tbody id="exitBody"></tbody>
     </table>
   </div>
+  <div class="panel" style="grid-column:1/-1">
+    <div class="ph"><span class="x">👁 ONES TO WATCH · high-conviction composite</span><span class="c" id="watchMode"></span></div>
+    <table>
+      <thead><tr><th>mint</th><th>watch</th><th>structure</th><th>convergence</th><th>age</th></tr></thead>
+      <tbody id="watchBody"></tbody>
+    </table>
+  </div>
 </div>
 
 <footer>
@@ -424,6 +431,22 @@ function render(snap){
     eb.appendChild(tr);
   });
   if(!Object.keys(mix).length) eb.innerHTML=`<tr><td colspan=3 class="dim">no exits yet</td></tr>`;
+
+  // ones to watch
+  const wb=$("watchBody"); wb.innerHTML="";
+  (snap.watchlist||[]).forEach(w=>{
+    const tr=document.createElement("tr");
+    const sc=(w.score||0);
+    const col = sc>=85?"up":(sc>=70?"am":"dim");
+    tr.innerHTML=`<td class="cy">${shortMint(w.mint)}</td>`+
+      `<td class="${col}">${sc.toFixed(0)}</td>`+
+      `<td class="dim">${(w.structure||0).toFixed(0)}</td>`+
+      `<td class="dim">${(w.convergence||0).toFixed(0)}</td>`+
+      `<td class="dim">${ago(Math.floor(Date.now()/1000)-(w.age_secs||0))}</td>`;
+    wb.appendChild(tr);
+  });
+  if(!(snap.watchlist||[]).length) wb.innerHTML=`<tr><td colspan=5 class="dim">no tokens on watch yet — needs composite ≥ threshold</td></tr>`;
+  $("watchMode").textContent = cfg.watch_autobuy? "AUTOBUY" : "alert-only (beta)";
 
   // stamps
   const age=Math.floor(Date.now()/1000)-(snap.updated||0);
