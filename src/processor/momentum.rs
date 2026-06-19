@@ -194,6 +194,13 @@ pub struct MomentumConfig {
     pub alpha_window_secs: u64,
     /// Position-size multiple applied when following a proven wallet (KOL or alpha).
     pub alpha_size_mult: f64,
+    /// Convergence: distinct proven wallets net-accumulating the same token at once.
+    /// At/above this count it's treated as a high-conviction "convergence" entry.
+    pub convergence_min: usize,
+    /// Score boost when convergence fires (stronger than a single alpha wallet).
+    pub convergence_boost: f64,
+    /// Extra position-size multiple when convergence fires (on top of alpha_size_mult).
+    pub convergence_size_mult: f64,
 
     // ---- Edge: insider / leader-dump exit ----
     /// Exit immediately when the creator or top early buyers start distributing.
@@ -405,6 +412,9 @@ impl MomentumConfig {
             alpha_boost: env_f64("MOMENTUM_ALPHA_BOOST", 35.0),
             alpha_window_secs: env_u64("MOMENTUM_ALPHA_WINDOW_SECS", 60),
             alpha_size_mult: env_f64("MOMENTUM_ALPHA_SIZE_MULT", 1.5),
+            convergence_min: env_usize("MOMENTUM_CONVERGENCE_MIN", 2),
+            convergence_boost: env_f64("MOMENTUM_CONVERGENCE_BOOST", 55.0),
+            convergence_size_mult: env_f64("MOMENTUM_CONVERGENCE_SIZE_MULT", 1.5),
 
             leader_dump_exit_enabled: std::env::var("MOMENTUM_LEADER_DUMP_EXIT")
                 .map(|v| v.to_lowercase() != "false")
@@ -511,9 +521,13 @@ impl MomentumConfig {
             if self.conviction_sizing { "on" } else { "off" }, self.conviction_max_mult,
         ));
         logger.log(format!(
-            "🧠 Alpha-follow: {} | rep >= {:.2} over >= {} samples | boost +{:.0} | window {}s | size x{:.2}",
+            "🧠 Alpha-follow: {} | rep >= {:.2} over >= {} samples | accumulation in {}s window | single +{:.0} (xz{:.2})",
             if self.alpha_follow_enabled { "ON (follows learned proven wallets)" } else { "off" },
-            self.alpha_rep_min, self.alpha_min_samples, self.alpha_boost, self.alpha_window_secs, self.alpha_size_mult,
+            self.alpha_rep_min, self.alpha_min_samples, self.alpha_window_secs, self.alpha_boost, self.alpha_size_mult,
+        ));
+        logger.log(format!(
+            "🤝 Convergence: {} proven wallets accumulating together -> boost +{:.0}, extra size x{:.2} (the most reliable signal)",
+            self.convergence_min, self.convergence_boost, self.convergence_size_mult,
         ));
         if self.start_capital_sol > 0.0 {
             let sizing = if self.position_size_pct > 0.0 {
@@ -907,33 +921,49 @@ fn smart_money_boost<'a>(buyers: impl Iterator<Item = &'a str>, cfg: &MomentumCo
     (cfg.smart_money_boost_max * clamp01(sum / cfg.smart_money_boost_scale.max(1e-9))).min(cfg.smart_money_boost_max)
 }
 
-/// The single best PROVEN wallet currently buying this token, if any.
+/// Smart-money accumulation + convergence on a token.
 ///
-/// "Proven" = learned reputation >= `alpha_rep_min` over >= `alpha_min_samples`
-/// graded buys. This is the bot acting on its own memory: it follows wallets that
-/// have repeatedly bought before pumps. Returns `(wallet, reputation)` of the
-/// strongest such buyer in the alpha window. Self-strengthening: as more buys get
-/// graded, more wallets cross the bar, so coverage grows the longer the bot runs.
-fn alpha_hot(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(String, f64)> {
+/// A wallet counts if it is PROVEN (learned reputation >= `alpha_rep_min` over
+/// >= `alpha_min_samples` grades) AND is net-ACCUMULATING in the window — i.e. its
+/// buys minus sells exceed `smart_money_min_sol` (so a wallet that bought then
+/// dumped doesn't count; it must actually be holding what it bought). Returns
+/// `(count, summed_reputation, best_wallet)`:
+/// - count == 1 → a single proven wallet accumulating (the alpha-follow signal)
+/// - count >= convergence_min → CONVERGENCE: several proven wallets piling into the
+///   same token at once — the most reliable smart-money signal there is.
+fn smart_convergence(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(usize, f64, String)> {
     if !cfg.alpha_follow_enabled {
         return None;
     }
     let cut = now.saturating_sub(cfg.alpha_window_secs);
     let state = TOKEN_STATE.get(mint)?;
-    let mut best: Option<(String, f64)> = None;
+    // Net SOL (buys - sells) per wallet within the window.
+    let mut net: HashMap<&str, f64> = HashMap::new();
     for t in state.ticks.iter() {
-        if !t.is_buy || t.ts < cut || t.trader.is_empty() || t.sol < cfg.smart_money_min_sol {
+        if t.ts < cut || t.trader.is_empty() {
             continue;
         }
-        if let Some(r) = WALLET_REP.get(&t.trader) {
+        let e = net.entry(t.trader.as_str()).or_insert(0.0);
+        if t.is_buy { *e += t.sol; } else { *e -= t.sol; }
+    }
+    let mut count = 0usize;
+    let mut summed_rep = 0.0;
+    let mut best: Option<(String, f64)> = None;
+    for (w, n) in net.iter() {
+        if *n < cfg.smart_money_min_sol {
+            continue; // not net-accumulating enough
+        }
+        if let Some(r) = WALLET_REP.get(*w) {
             if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+                count += 1;
+                summed_rep += r.score;
                 if best.as_ref().map(|(_, s)| r.score > *s).unwrap_or(true) {
-                    best = Some((t.trader.clone(), r.score));
+                    best = Some(((*w).to_string(), r.score));
                 }
             }
         }
     }
-    best
+    best.map(|(w, _)| (count, summed_rep, w))
 }
 
 /// Queue a buy for later outcome grading (smart-money learning).
@@ -1950,8 +1980,19 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // Alpha-follow edge: a wallet the bot LEARNED is reliable is buying this token.
     // Only when no curated KOL already fired (avoid stacking two big boosts). This is
     // the memory in action — and it strengthens every run as more wallets earn the bar.
-    let alpha = if kol.is_none() { alpha_hot(&mint, now, &cfg) } else { None };
-    let alpha_pts = alpha.as_ref().map(|_| cfg.alpha_boost).unwrap_or(0.0);
+    // Smart-money accumulation + convergence: how many proven wallets are net-buying
+    // this token at once. Convergence (several at once) is the strongest, most
+    // reliable signal — boosted and sized harder than a single proven wallet.
+    let conv = if kol.is_none() { smart_convergence(&mint, now, &cfg) } else { None };
+    let is_convergence = conv.as_ref().map(|(c, _, _)| *c >= cfg.convergence_min).unwrap_or(false);
+    let alpha = conv.as_ref().map(|(_, _, w)| (w.clone(), 0.0));
+    let alpha_pts = if is_convergence {
+        cfg.convergence_boost
+    } else if conv.is_some() {
+        cfg.alpha_boost
+    } else {
+        0.0
+    };
 
     // GMGN smart-money / trenches confirmation adds score points for the gate.
     let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
@@ -2035,8 +2076,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // conviction signal — size up. Capped so one trade can't dwarf the book.
     let following = kol.is_some() || alpha.is_some();
     if following && cfg.alpha_size_mult > 1.0 {
-        let cap = base_size * cfg.conviction_max_mult.max(cfg.alpha_size_mult);
-        entry_size = (entry_size * cfg.alpha_size_mult).min(cap);
+        // Convergence (several proven wallets) earns an extra size bump over a single one.
+        let follow_mult = if is_convergence { cfg.alpha_size_mult * cfg.convergence_size_mult } else { cfg.alpha_size_mult };
+        let cap = base_size * cfg.conviction_max_mult.max(follow_mult);
+        entry_size = (entry_size * follow_mult).min(cap);
     }
 
     if cfg.start_capital_sol > 0.0 {
@@ -2087,19 +2130,23 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // Reserve a slot before the async buy to prevent overshooting max positions.
     IN_FLIGHT_BUYS.fetch_add(1, Ordering::SeqCst);
 
-    // Attribution label: the wallet we're following. Curated KOLs keep their label;
-    // learned alpha wallets get an "α:<prefix>" label so the per-KOL leaderboard
-    // tracks the bot's self-discovered edge alongside the curated one.
+    // Attribution label: the wallet(s) we're following. Curated KOLs keep their
+    // label; convergence gets a "conv:N" label; a single learned wallet gets "α:<w>".
+    let conv_count = conv.as_ref().map(|(c, _, _)| *c).unwrap_or(0);
     let lead_label: Option<String> = if let Some((_, l)) = &kol {
         Some(l.clone())
+    } else if is_convergence {
+        Some(format!("conv:{}", conv_count))
     } else {
         alpha.as_ref().map(|(w, _)| format!("α:{}", &w[..w.len().min(8)]))
     };
 
     let lead_tag = if let Some((_, l)) = &kol {
         format!(", KOL:{} +{:.0}", l, kol_pts)
-    } else if let Some((w, rep)) = &alpha {
-        format!(", ALPHA:{} (rep {:.2}) +{:.0}", &w[..w.len().min(8)], rep, alpha_pts)
+    } else if is_convergence {
+        format!(", CONVERGENCE x{} +{:.0}", conv_count, alpha_pts)
+    } else if let Some((w, _)) = &alpha {
+        format!(", ALPHA:{} +{:.0}", &w[..w.len().min(8)], alpha_pts)
     } else {
         String::new()
     };
