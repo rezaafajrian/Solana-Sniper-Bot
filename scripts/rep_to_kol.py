@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--label", default="learned")
     ap.add_argument("--weight-min", type=float, default=1.0)
     ap.add_argument("--weight-max", type=float, default=2.5)
+    ap.add_argument("--min-winrate", type=float, default=0.0,
+                    help="only keep wallets whose graded win rate >= this (0..1)")
     args = ap.parse_args()
 
     rows = []
@@ -53,13 +55,15 @@ def main():
                 try:
                     score = float(r.get("score", "nan"))
                     samples = int(r.get("samples", "0"))
+                    wins = int(r.get("wins", "0") or "0")
                 except (ValueError, TypeError):
                     continue
                 wallet = (r.get("wallet") or "").strip()
                 if not wallet:
                     continue
-                if samples >= args.min_samples and score >= args.min_rep:
-                    rows.append((wallet, score, samples))
+                win_rate = wins / samples if samples else 0.0
+                if samples >= args.min_samples and score >= args.min_rep and win_rate >= args.min_winrate:
+                    rows.append((wallet, score, samples, win_rate))
     except FileNotFoundError:
         sys.stderr.write(f"No reputation file at '{args.rep_csv}'. "
                          "Run the bot first so it can learn.\n")
@@ -89,14 +93,19 @@ def main():
     print(f"# filter: rep >= {args.min_rep}, samples >= {args.min_samples}"
           + (f", top {args.top}" if args.top else "") )
     print(f"# {len(rows)} wallets | format: wallet,weight,label")
-    for wallet, score, samples in rows:
+    for wallet, score, samples, win_rate in rows:
         weight = args.weight_min + wspan * ((score - lo) / span)
         print(f"{wallet},{weight:.2f},{args.label}")
 
+    # Show the benchmark on stderr: the proven wallets ranked, with win rate.
     sys.stderr.write(
-        f"Exported {len(rows)} proven wallets "
-        f"(rep {lo:.2f}..{hi:.2f}, >= {args.min_samples} samples). "
-        "Set MOMENTUM_KOL_ENABLED=true and point MOMENTUM_KOL_FILE at the output.\n")
+        f"Exported {len(rows)} proven wallets (rep {lo:.2f}..{hi:.2f}, "
+        f">= {args.min_samples} samples"
+        + (f", win-rate >= {args.min_winrate*100:.0f}%" if args.min_winrate > 0 else "") + ").\n")
+    sys.stderr.write("Top wallets (rep / win-rate / samples):\n")
+    for wallet, score, samples, win_rate in sorted(rows, key=lambda x: x[3], reverse=True)[:15]:
+        sys.stderr.write(f"  {wallet[:10]}…  rep {score:+.2f}  win {win_rate*100:3.0f}%  n={samples}\n")
+    sys.stderr.write("Set MOMENTUM_KOL_ENABLED=true and point MOMENTUM_KOL_FILE at the output.\n")
 
 
 if __name__ == "__main__":

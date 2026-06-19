@@ -878,10 +878,20 @@ async fn run_gmgn_pollers(cfg: Arc<MomentumConfig>, logger: Logger) {
 struct WalletRep {
     score: f64,
     samples: u32,
+    /// Graded buys that were winners (token up after they bought) — for a literal
+    /// win-rate classification on top of the returns-weighted `score`.
+    wins: u32,
     /// When the reputation was last updated (for time decay).
     last_update: u64,
     /// Last token graded, to dampen reputation farmed by buying one token repeatedly.
     last_mint: String,
+}
+
+impl WalletRep {
+    /// Literal win rate = winning graded buys / total graded buys (0..1).
+    fn win_rate(&self) -> f64 {
+        if self.samples == 0 { 0.0 } else { self.wins as f64 / self.samples as f64 }
+    }
 }
 
 /// A buy awaiting outcome grading at `eval_at`.
@@ -1013,6 +1023,7 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             let alpha = if r.last_mint == a.mint { 0.02 } else { 0.1 };
             r.score = (1.0 - alpha) * r.score + alpha * ret;
             r.samples += 1;
+            if ret > 0.0 { r.wins += 1; } // count it as a win if the token rose after the buy
             r.last_update = now;
             r.last_mint = a.mint.clone();
         }
@@ -1037,7 +1048,9 @@ fn load_wallet_rep(path: &str) {
             if let (Ok(score), Ok(samples)) = (s.parse::<f64>(), n.parse::<u32>()) {
                 let last_update = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
                 let last_mint = it.next().unwrap_or("").to_string();
-                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, last_update, last_mint });
+                // `wins` appended last for backward-compat with older rep files.
+                let wins = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, wins, last_update, last_mint });
             }
         }
     }
@@ -1051,10 +1064,10 @@ fn save_wallet_rep(path: &str) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint");
+    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint,wins");
     for e in WALLET_REP.iter() {
         let r = e.value();
-        let _ = writeln!(file, "{},{:.6},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint);
+        let _ = writeln!(file, "{},{:.6},{},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint, r.wins);
     }
     let _ = std::fs::rename(&tmp, path);
 }
@@ -1113,18 +1126,18 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
     // The bot's self-discovered "scout list": wallets it learned are proven, plus
     // the strongest few — this is the compounding memory made visible.
     let mut proven = 0usize;
-    let mut top_alpha: Vec<(String, f64, u32)> = Vec::new();
+    let mut top_alpha: Vec<(String, f64, u32, f64)> = Vec::new();
     for e in WALLET_REP.iter() {
         let r = e.value();
         if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
             proven += 1;
-            top_alpha.push((e.key().clone(), r.score, r.samples));
+            top_alpha.push((e.key().clone(), r.score, r.samples, r.win_rate()));
         }
     }
     top_alpha.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     top_alpha.truncate(15);
     let top_alpha: Vec<serde_json::Value> = top_alpha.into_iter()
-        .map(|(w, s, n)| serde_json::json!({ "wallet": w, "score": s, "samples": n }))
+        .map(|(w, s, n, wr)| serde_json::json!({ "wallet": w, "score": s, "samples": n, "win_rate": wr }))
         .collect();
 
     let snap = serde_json::json!({

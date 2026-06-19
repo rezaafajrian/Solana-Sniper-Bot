@@ -3,32 +3,171 @@
   "mode": "DRY RUN",
   "halted": false,
   "consecutive_losses": 1,
-  "pnl": { "session_realized": 0.1842, "today_realized": 0.0913, "buys": 14, "sells": 19, "wins": 41, "losses": 92 },
-  "capital": { "deployed_sol": 0.66, "max_deployed_sol": 1.0, "start_capital_sol": 1.0, "equity_sol": 1.184, "available_sol": 0.524, "bankroll_mode": true, "margin_called": false },
-  "counts": { "open_positions": 3, "max_positions": 5, "tokens_tracked": 412, "kol_wallets": 100, "kol_hot": 7, "gmgn_watchlist": 0, "wallet_rep": 4057, "alpha_proven": 12 },
-  "config": { "position_size_sol": 0.2, "entry_score": 57, "hard_stop_pct": -35, "kol_enabled": true, "kol_require": false, "daily_loss_limit_sol": 0.15, "alpha_follow": true, "alpha_rep_min": 0.5, "alpha_min_samples": 5 },
+  "pnl": {
+    "session_realized": 0.1842,
+    "today_realized": 0.0913,
+    "buys": 14,
+    "sells": 19,
+    "wins": 41,
+    "losses": 92
+  },
+  "capital": {
+    "deployed_sol": 0.66,
+    "max_deployed_sol": 1.0,
+    "start_capital_sol": 1.0,
+    "equity_sol": 1.184,
+    "available_sol": 0.524,
+    "bankroll_mode": true,
+    "margin_called": false
+  },
+  "counts": {
+    "open_positions": 3,
+    "max_positions": 5,
+    "tokens_tracked": 412,
+    "kol_wallets": 100,
+    "kol_hot": 7,
+    "gmgn_watchlist": 0,
+    "wallet_rep": 4057,
+    "alpha_proven": 12
+  },
+  "config": {
+    "position_size_sol": 0.2,
+    "entry_score": 57,
+    "hard_stop_pct": -35,
+    "kol_enabled": true,
+    "kol_require": false,
+    "daily_loss_limit_sol": 0.15,
+    "alpha_follow": true,
+    "alpha_rep_min": 0.5,
+    "alpha_min_samples": 5
+  },
   "positions": [
-    { "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE", "entry_mcap": 31.4, "current_mcap": 88.2, "pnl_pct": 180.9, "peak_pnl": 210.0, "size_sol": 0.2, "remaining_pct": 60.0, "rungs_hit": 2, "age_secs": 142, "kol": "couldbebasic", "selling": false },
-    { "mint": "9RA4V5baQ7pGn8nhzYKScd7v5JcoM8zQrUdGnwtocRie", "entry_mcap": 42.0, "current_mcap": 49.6, "pnl_pct": 18.1, "peak_pnl": 33.0, "size_sol": 0.2, "remaining_pct": 100.0, "rungs_hit": 0, "age_secs": 38, "kol": "adam_alpha", "selling": false },
-    { "mint": "DRiP2Pn2K6fuMLKQmt5rZWxa91wuwq7vfV3kvJ9eY1z", "entry_mcap": 55.0, "current_mcap": 41.2, "pnl_pct": -25.1, "peak_pnl": 12.0, "size_sol": 0.2, "remaining_pct": 100.0, "rungs_hit": 0, "age_secs": 96, "kol": "", "selling": true }
+    {
+      "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE",
+      "entry_mcap": 31.4,
+      "current_mcap": 88.2,
+      "pnl_pct": 180.9,
+      "peak_pnl": 210.0,
+      "size_sol": 0.2,
+      "remaining_pct": 60.0,
+      "rungs_hit": 2,
+      "age_secs": 142,
+      "kol": "couldbebasic",
+      "selling": false
+    },
+    {
+      "mint": "9RA4V5baQ7pGn8nhzYKScd7v5JcoM8zQrUdGnwtocRie",
+      "entry_mcap": 42.0,
+      "current_mcap": 49.6,
+      "pnl_pct": 18.1,
+      "peak_pnl": 33.0,
+      "size_sol": 0.2,
+      "remaining_pct": 100.0,
+      "rungs_hit": 0,
+      "age_secs": 38,
+      "kol": "adam_alpha",
+      "selling": false
+    },
+    {
+      "mint": "DRiP2Pn2K6fuMLKQmt5rZWxa91wuwq7vfV3kvJ9eY1z",
+      "entry_mcap": 55.0,
+      "current_mcap": 41.2,
+      "pnl_pct": -25.1,
+      "peak_pnl": 12.0,
+      "size_sol": 0.2,
+      "remaining_pct": 100.0,
+      "rungs_hit": 0,
+      "age_secs": 96,
+      "kol": "",
+      "selling": true
+    }
   ],
   "feed": [
-    { "ts": 1749599996, "event": "SELL_PARTIAL", "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE", "reason": "scale-out +100% (pnl 105%)", "pnl_sol": 0.038 },
-    { "ts": 1749599981, "event": "BUY", "mint": "9RA4V5baQ7pGn8nhzYKScd7v5JcoM8zQrUdGnwtocRie", "reason": "momentum entry [KOL:adam_alpha]", "pnl_sol": 0.0 },
-    { "ts": 1749599950, "event": "SELL_FULL", "mint": "FakeMint1111111111111111111111111111111111", "reason": "hard stop -35.0%", "pnl_sol": -0.074 },
-    { "ts": 1749599902, "event": "BUY", "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE", "reason": "momentum entry [KOL:couldbebasic]", "pnl_sol": 0.0 }
+    {
+      "ts": 1749599996,
+      "event": "SELL_PARTIAL",
+      "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE",
+      "reason": "scale-out +100% (pnl 105%)",
+      "pnl_sol": 0.038
+    },
+    {
+      "ts": 1749599981,
+      "event": "BUY",
+      "mint": "9RA4V5baQ7pGn8nhzYKScd7v5JcoM8zQrUdGnwtocRie",
+      "reason": "momentum entry [KOL:adam_alpha]",
+      "pnl_sol": 0.0
+    },
+    {
+      "ts": 1749599950,
+      "event": "SELL_FULL",
+      "mint": "FakeMint1111111111111111111111111111111111",
+      "reason": "hard stop -35.0%",
+      "pnl_sol": -0.074
+    },
+    {
+      "ts": 1749599902,
+      "event": "BUY",
+      "mint": "8TwThfKn7AHATYRVXceyuP7KfYHsx8m7eKe1vg3QLAtE",
+      "reason": "momentum entry [KOL:couldbebasic]",
+      "pnl_sol": 0.0
+    }
   ],
   "kol_leaderboard": [
-    { "kol": "couldbebasic", "realized_sol": 0.2914, "wins": 4, "losses": 1 },
-    { "kol": "adam_alpha", "realized_sol": 0.0631, "wins": 2, "losses": 2 },
-    { "kol": "α:5JTvwLFy", "realized_sol": 0.0488, "wins": 3, "losses": 1 },
-    { "kol": "whale_07", "realized_sol": -0.1120, "wins": 1, "losses": 5 }
+    {
+      "kol": "couldbebasic",
+      "realized_sol": 0.2914,
+      "wins": 4,
+      "losses": 1
+    },
+    {
+      "kol": "adam_alpha",
+      "realized_sol": 0.0631,
+      "wins": 2,
+      "losses": 2
+    },
+    {
+      "kol": "\u03b1:5JTvwLFy",
+      "realized_sol": 0.0488,
+      "wins": 3,
+      "losses": 1
+    },
+    {
+      "kol": "whale_07",
+      "realized_sol": -0.112,
+      "wins": 1,
+      "losses": 5
+    }
   ],
   "top_alpha": [
-    { "wallet": "5JTvwLFy1EPWoSWbVqjp4x9rfg961P9iKV3vsSubDFXd", "score": 0.847, "samples": 8 },
-    { "wallet": "MFQKMm2NPcVtnmBZFouvQpowvD4EJDWjWs238NdXL9P", "score": 0.824, "samples": 8 },
-    { "wallet": "sR4QwzCRt7yJ14x6oxqcAWLXTN8Q7feS4CkiVYhdX7F", "score": 0.654, "samples": 7 },
-    { "wallet": "9R6fxLZVnjuPyeX4ns6UnhwkKh9XNpUaHuJSUSyxjGQT", "score": 0.561, "samples": 5 },
-    { "wallet": "EUj7KUbkMMhfs5yCajaFWx1BvX4HdfGgrdyWjaY42yp7", "score": 0.533, "samples": 6 }
+    {
+      "wallet": "5JTvwLFy1EPWoSWbVqjp4x9rfg961P9iKV3vsSubDFXd",
+      "score": 0.847,
+      "samples": 8,
+      "win_rate": 0.75
+    },
+    {
+      "wallet": "MFQKMm2NPcVtnmBZFouvQpowvD4EJDWjWs238NdXL9P",
+      "score": 0.824,
+      "samples": 8,
+      "win_rate": 0.75
+    },
+    {
+      "wallet": "sR4QwzCRt7yJ14x6oxqcAWLXTN8Q7feS4CkiVYhdX7F",
+      "score": 0.654,
+      "samples": 7,
+      "win_rate": 0.75
+    },
+    {
+      "wallet": "9R6fxLZVnjuPyeX4ns6UnhwkKh9XNpUaHuJSUSyxjGQT",
+      "score": 0.561,
+      "samples": 5,
+      "win_rate": 0.66
+    },
+    {
+      "wallet": "EUj7KUbkMMhfs5yCajaFWx1BvX4HdfGgrdyWjaY42yp7",
+      "score": 0.533,
+      "samples": 6,
+      "win_rate": 0.63
+    }
   ]
 }
