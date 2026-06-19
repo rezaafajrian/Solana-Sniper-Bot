@@ -1778,7 +1778,7 @@ fn concentration_metrics(parsed: &TradeInfoFromToken, mint: &str, cfg: &Momentum
 /// Record one token evaluation (BUY or REJECT) to the CSV + JSONL decision log and
 /// register it for post-detection outcome tracking. One row per mint (first
 /// decision wins). Best-effort; never blocks trading.
-fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &MomentumConfig, effective_score: f64, decision: &str, reason: &str) {
+fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &MomentumConfig, effective_score: f64, signal_type: &str, decision: &str, reason: &str) {
     let base = { DECISION_LOG_PATH.lock().map(|p| p.clone()).unwrap_or_default() };
     if base.is_empty() {
         return;
@@ -1819,11 +1819,11 @@ fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &M
     let need_header = !std::path::Path::new(&csv_path).exists();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path) {
         if need_header {
-            let _ = writeln!(f, "timestamp,ca,creator,creator_buy,creator_score,wallet_score,insider_score,smart_wallet_count,holder_concentration,marketcap,volume,liquidity,overall_score,decision,rejection_reason,confidence");
+            let _ = writeln!(f, "timestamp,ca,creator,creator_buy,creator_score,wallet_score,insider_score,smart_wallet_count,holder_concentration,marketcap,volume,liquidity,overall_score,signal,decision,rejection_reason,confidence");
         }
-        let _ = writeln!(f, "{},{},{},{:.4},{:.3},{:.2},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{:.3}",
+        let _ = writeln!(f, "{},{},{},{:.4},{:.3},{:.2},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3}",
             iso, mint, creator, creator_buy, creator_score, signal.smart_money_boost, insider, smart_cnt,
-            conc, mcap, signal.buy_volume_short, liquidity, effective_score, decision,
+            conc, mcap, signal.buy_volume_short, liquidity, effective_score, signal_type, decision,
             safe(if decision == "BUY" { "" } else { reason }), confidence);
     }
     // JSONL
@@ -1834,7 +1834,7 @@ fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &M
             "creator_score": creator_score, "wallet_score": signal.smart_money_boost,
             "insider_score": insider, "smart_wallet_count": smart_cnt, "holder_concentration": conc,
             "marketcap": mcap, "volume": signal.buy_volume_short, "liquidity": liquidity,
-            "overall_score": effective_score, "decision": decision,
+            "overall_score": effective_score, "signal": signal_type, "decision": decision,
             "rejection_reason": if decision == "BUY" { "" } else { reason }, "confidence": confidence,
         });
         let _ = writeln!(f, "{}", obj);
@@ -2011,14 +2011,21 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
     let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts + alpha_pts;
 
+    // Which signal drove this evaluation (for per-signal learning/attribution).
+    let signal_type = if is_convergence { "convergence" }
+        else if conv.is_some() { "alpha" }
+        else if kol.is_some() { "kol" }
+        else if gmgn_hot { "gmgn" }
+        else { "momentum" };
+
     if effective_score < cfg.entry_score {
-        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "score below entry bar");
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "score below entry bar");
         return;
     }
     // Base-momentum floor: a boost (KOL/alpha/GMGN) can't drag in a token that has
     // no real momentum of its own. Require genuine strength AND the signal.
     if cfg.min_base_score > 0.0 && signal.score < cfg.min_base_score {
-        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "base momentum below floor");
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "base momentum below floor");
         return;
     }
     if POSITIONS.contains_key(&mint) || BOUGHT_TOKEN_LIST.contains_key(&mint) {
@@ -2028,7 +2035,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         return;
     }
     if !position_slots_available(&cfg) {
-        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "no position slot / capacity");
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "no position slot / capacity");
         return;
     }
     if signal.current_mcap <= 0.0 {
@@ -2039,14 +2046,14 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // tokens). Checked before the GMGN call so we reject dump setups without an API hit.
     if let Some(reason) = concentration_veto(&parsed, &mint, &cfg) {
         logger.log(format!("🛑 Concentration veto {} — {}", mint, reason).yellow().to_string());
-        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("concentration: {}", reason));
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("concentration: {}", reason));
         return;
     }
     // MELT-inspired: don't buy into a token whose biggest early buyers are already
     // distributing — that's the trash-coin / coordinated-dump pattern.
     if let Some(reason) = insider_distribution_veto(&mint, &cfg) {
         logger.log(format!("🛑 Insider-distribution veto {} — {}", mint, reason).yellow().to_string());
-        record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("insider-distribution: {}", reason));
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("insider-distribution: {}", reason));
         return;
     }
 
@@ -2056,12 +2063,12 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
             match client.security_verdict(&mint).await {
                 SecurityVerdict::Reject(reason) => {
                     logger.log(format!("🛑 GMGN veto {} — {}", mint, reason).red().to_string());
-                    record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", &format!("gmgn: {}", reason));
+                    record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("gmgn: {}", reason));
                     return;
                 }
                 SecurityVerdict::Unknown if client.veto_on_unknown() => {
                     logger.log(format!("🛑 GMGN veto {} — security unknown (fail-closed)", mint).yellow().to_string());
-                    record_decision(&parsed, &signal, &cfg, effective_score, "REJECT", "gmgn: security unknown");
+                    record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "gmgn: security unknown");
                     return;
                 }
                 _ => {}
@@ -2208,7 +2215,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 realized_so_far: 0.0,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
-            record_decision(&parsed, &signal, &cfg, effective_score, "BUY", "");
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "BUY", "");
             log_trade_event(&TradeLogEvent {
                 event: "BUY",
                 mint: &mint,

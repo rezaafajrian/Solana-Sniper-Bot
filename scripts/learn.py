@@ -238,6 +238,27 @@ def main():
         w = sum(1 for r in rs if is_winner(r)); l = sum(1 for r in rs if is_loser(r))
         print(f"  {key:12} {len(rs):>7} {pct(w,w+l):>7.0f}% {mean([f(r,'o_max_return') for r in rs]):>+8.2f}x")
 
+    # ---- Per-signal performance: which signal type actually earns the most ----
+    section("6b. PER-SIGNAL PERFORMANCE (which edge earns the most per token)")
+    by_signal = defaultdict(list)
+    for r in rows:
+        by_signal[(r.get("signal") or "?")].append(r)
+    if len(by_signal) > 1 or "?" not in by_signal:
+        print(f"  {'signal':14} {'tokens':>7} {'winrate':>8} {'EV/token':>9} {'moonshot%':>10}")
+        sig_rows = []
+        for sig, rs in by_signal.items():
+            w = sum(1 for r in rs if is_winner(r)); l = sum(1 for r in rs if is_loser(r))
+            ev = mean([f(r, "o_final_return") for r in rs if not math.isnan(f(r, "o_final_return"))])
+            moon = sum(1 for r in rs if label_of(r) in {"5X","10X","20X+"} or f(r,"o_max_return") >= 4.0)
+            sig_rows.append((ev, sig, len(rs), pct(w, w+l), pct(moon, len(rs))))
+        for ev, sig, n, wr, mp in sorted(sig_rows, reverse=True):
+            print(f"  {sig:14} {n:>7} {wr:>7.0f}% {ev:>+8.3f} {mp:>9.1f}%")
+        print("  (EV = avg final return per evaluated token. The signal with the highest")
+        print("   EV is your real edge — lean into it; cut or down-weight the negative ones.)")
+    else:
+        print("  no signal-type data yet (older log without the 'signal' column, or no")
+        print("  evaluations recorded). It populates on the next run.")
+
     # ---- EV-optimal thresholds: the settings that MAXIMIZE expected value ----
     section("7. EV-OPTIMAL THRESHOLDS (the cutoff that maximizes avg return)")
     fr = lambda r: f(r, "o_final_return")
@@ -293,6 +314,23 @@ def main():
     # ---- 5. Recommendations ----
     section("9. RECOMMENDATIONS (data-driven, verify before trusting)")
     recs = []
+    # Per-signal edge: lean into the best, cut the worst.
+    sig_ev = []
+    for sig, rs in by_signal.items():
+        if sig == "?" or len(rs) < 8:
+            continue
+        ev = mean([f(r, "o_final_return") for r in rs if not math.isnan(f(r, "o_final_return"))])
+        if not math.isnan(ev):
+            sig_ev.append((ev, sig, len(rs)))
+    sig_ev.sort(reverse=True)
+    if sig_ev:
+        bev, bsig, bn = sig_ev[0]
+        recs.append(f"Best signal by EV: '{bsig}' ({bev:+.3f}/token over {bn}). Lean into it — "
+                    "raise its boost/size or require it.")
+        wev, wsig, wn = sig_ev[-1]
+        if wev < 0 and wsig != bsig:
+            recs.append(f"Worst signal: '{wsig}' is EV-negative ({wev:+.3f} over {wn}). "
+                        "Down-weight or stop entering on it alone.")
     # EV-optimal threshold recommendations (the maximize lever)
     ev_recs.sort(reverse=True)
     for lift, k, cut, ev in ev_recs[:3]:
