@@ -186,6 +186,9 @@ pub struct MomentumConfig {
     pub alpha_follow_enabled: bool,
     /// Minimum learned reputation (EMA of forward returns) for a wallet to be "alpha".
     pub alpha_rep_min: f64,
+    /// Minimum recency-weighted wallet score (0..100) for a wallet to be "proven"
+    /// and followable. 60 = WATCHLIST tier and up. Recent performance dominates it.
+    pub alpha_min_wallet_score: f64,
     /// Minimum reputation samples before a wallet can be followed as alpha.
     pub alpha_min_samples: u32,
     /// Score points added when an alpha wallet is buying (0..100 scale).
@@ -423,6 +426,7 @@ impl MomentumConfig {
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
             alpha_rep_min: env_f64("MOMENTUM_ALPHA_REP_MIN", 0.5),
+            alpha_min_wallet_score: env_f64("MOMENTUM_ALPHA_MIN_WALLET_SCORE", 60.0),
             alpha_min_samples: env_u64("MOMENTUM_ALPHA_MIN_SAMPLES", 5) as u32,
             alpha_boost: env_f64("MOMENTUM_ALPHA_BOOST", 35.0),
             alpha_window_secs: env_u64("MOMENTUM_ALPHA_WINDOW_SECS", 60),
@@ -549,6 +553,10 @@ impl MomentumConfig {
         logger.log(format!(
             "🤝 Convergence: {} proven wallets accumulating together -> boost +{:.0}, extra size x{:.2} (the most reliable signal)",
             self.convergence_min, self.convergence_boost, self.convergence_size_mult,
+        ));
+        logger.log(format!(
+            "🏅 Wallet score: recency-weighted win rate (50%/30%/20% recent50/recent200/lifetime), confidence-adjusted. Proven >= {:.0} (WATCHLIST+). Tiers: 90 ELITE / 75 STRONG / 60 WATCHLIST / 40 WEAK",
+            self.alpha_min_wallet_score,
         ));
         if self.watch_enabled {
             logger.log(format!(
@@ -902,26 +910,81 @@ async fn run_gmgn_pollers(cfg: Arc<MomentumConfig>, logger: Logger) {
     }
 }
 
-/// Reputation for a wallet: an EMA of the clamped forward returns of tokens it
-/// bought. Positive means its buys tend to precede pumps.
+/// Reputation for a wallet. Beyond the legacy forward-return EMA (`score`), it
+/// keeps a rolling window of recent win/loss outcomes so the wallet score can be
+/// recency-weighted and confidence-adjusted — recent performance dominates, and a
+/// formerly-good wallet loses standing fast when it starts losing.
 #[derive(Clone, Default)]
 struct WalletRep {
     score: f64,
     samples: u32,
-    /// Graded buys that were winners (token up after they bought) — for a literal
-    /// win-rate classification on top of the returns-weighted `score`.
+    /// Graded buys that were winners (token up after they bought) — lifetime.
     wins: u32,
+    /// Rolling window of the last (up to) 200 outcomes, newest at the back.
+    recent: VecDeque<bool>,
     /// When the reputation was last updated (for time decay).
     last_update: u64,
     /// Last token graded, to dampen reputation farmed by buying one token repeatedly.
     last_mint: String,
 }
 
+const WALLET_RECENT_CAP: usize = 200;
+const WALLET_CONF_K: f64 = 30.0; // sample-size smoothing: confidence = n/(n+K)
+
 impl WalletRep {
-    /// Literal win rate = winning graded buys / total graded buys (0..1).
-    fn win_rate(&self) -> f64 {
+    /// Record one graded outcome (win = token rose after the buy).
+    fn push_outcome(&mut self, win: bool) {
+        self.samples += 1;
+        if win { self.wins += 1; }
+        if self.recent.len() >= WALLET_RECENT_CAP { self.recent.pop_front(); }
+        self.recent.push_back(win);
+    }
+    /// Lifetime win rate (0..1).
+    fn lifetime_winrate(&self) -> f64 {
         if self.samples == 0 { 0.0 } else { self.wins as f64 / self.samples as f64 }
     }
+    /// Win rate over the most recent `n` outcomes (0..1); falls back to lifetime if
+    /// the rolling window is empty (e.g. an old rep file with no recent data).
+    fn recent_winrate(&self, n: usize) -> f64 {
+        if self.recent.is_empty() { return self.lifetime_winrate(); }
+        let mut w = 0usize; let mut c = 0usize;
+        for &b in self.recent.iter().rev().take(n) { c += 1; if b { w += 1; } }
+        if c == 0 { self.lifetime_winrate() } else { w as f64 / c as f64 }
+    }
+    /// Confidence from sample size (0..1): n/(n+K). 10 trades -> 0.25, 300 -> 0.91.
+    fn confidence(&self) -> f64 {
+        let n = self.samples as f64;
+        n / (n + WALLET_CONF_K)
+    }
+    /// Final recency-weighted, confidence-adjusted score (0..100):
+    ///   raw = 0.50*recent50 + 0.30*recent200 + 0.20*lifetime
+    /// then shrink toward 0.50 (neutral) by sample-size confidence so a 90% over 10
+    /// trades scores LESS than a 65% over 300.
+    fn final_score(&self) -> f64 {
+        let raw = 0.50 * self.recent_winrate(50)
+                + 0.30 * self.recent_winrate(200)
+                + 0.20 * self.lifetime_winrate();
+        let c = self.confidence();
+        (c * raw + (1.0 - c) * 0.5) * 100.0
+    }
+    /// Tier per the classification bands. < min_samples = "IGNORE".
+    fn tier(&self, min_samples: u32) -> &'static str {
+        if self.samples < min_samples.max(5) { return "IGNORE"; }
+        let s = self.final_score();
+        if s >= 90.0 { "ELITE" }
+        else if s >= 75.0 { "STRONG" }
+        else if s >= 60.0 { "WATCHLIST" }
+        else if s >= 40.0 { "WEAK" }
+        else { "AVOID" }
+    }
+    fn low_confidence(&self) -> bool { self.samples < 20 }
+    fn win_rate(&self) -> f64 { self.lifetime_winrate() }
+}
+
+/// A wallet is "proven" (followable by alpha/convergence) when it has enough graded
+/// trades and its recency-weighted score clears the bar — recent performance first.
+fn wallet_is_proven(r: &WalletRep, cfg: &MomentumConfig) -> bool {
+    r.samples >= cfg.alpha_min_samples && r.final_score() >= cfg.alpha_min_wallet_score
 }
 
 /// A buy awaiting outcome grading at `eval_at`.
@@ -994,8 +1057,8 @@ fn smart_convergence(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(usiz
             continue; // not net-accumulating enough
         }
         if let Some(r) = WALLET_REP.get(*w) {
-            if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
-                count += 1;
+            if wallet_is_proven(&r, cfg) {
+                count += 1; // (ref derefs to WalletRep)
                 summed_rep += r.score;
                 if best.as_ref().map(|(_, s)| r.score > *s).unwrap_or(true) {
                     best = Some(((*w).to_string(), r.score));
@@ -1074,8 +1137,7 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             // Dampen reputation farmed by repeatedly buying the same token.
             let alpha = if r.last_mint == a.mint { 0.02 } else { 0.1 };
             r.score = (1.0 - alpha) * r.score + alpha * ret;
-            r.samples += 1;
-            if ret > 0.0 { r.wins += 1; } // count it as a win if the token rose after the buy
+            r.push_outcome(ret > 0.0); // updates samples, wins, and the recent window
             r.last_update = now;
             r.last_mint = a.mint.clone();
         }
@@ -1100,9 +1162,11 @@ fn load_wallet_rep(path: &str) {
             if let (Ok(score), Ok(samples)) = (s.parse::<f64>(), n.parse::<u32>()) {
                 let last_update = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
                 let last_mint = it.next().unwrap_or("").to_string();
-                // `wins` appended last for backward-compat with older rep files.
+                // `wins` then the recent-outcomes window appended last (backward-compat).
                 let wins = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, wins, last_update, last_mint });
+                let recent: VecDeque<bool> = it.next().unwrap_or("").chars()
+                    .filter(|c| *c == '0' || *c == '1').map(|c| c == '1').collect();
+                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, wins, recent, last_update, last_mint });
             }
         }
     }
@@ -1116,10 +1180,11 @@ fn save_wallet_rep(path: &str) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint,wins");
+    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint,wins,recent");
     for e in WALLET_REP.iter() {
         let r = e.value();
-        let _ = writeln!(file, "{},{:.6},{},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint, r.wins);
+        let recent: String = r.recent.iter().map(|&b| if b { '1' } else { '0' }).collect();
+        let _ = writeln!(file, "{},{:.6},{},{},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint, r.wins, recent);
     }
     let _ = std::fs::rename(&tmp, path);
 }
@@ -1188,18 +1253,18 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
     // The bot's self-discovered "scout list": wallets it learned are proven, plus
     // the strongest few — this is the compounding memory made visible.
     let mut proven = 0usize;
-    let mut top_alpha: Vec<(String, f64, u32, f64)> = Vec::new();
+    let mut top_alpha: Vec<(String, f64, u32, f64, String)> = Vec::new();
     for e in WALLET_REP.iter() {
         let r = e.value();
-        if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+        if wallet_is_proven(&r, cfg) {
             proven += 1;
-            top_alpha.push((e.key().clone(), r.score, r.samples, r.win_rate()));
+            top_alpha.push((e.key().clone(), r.final_score(), r.samples, r.recent_winrate(50), r.tier(cfg.alpha_min_samples).to_string()));
         }
     }
     top_alpha.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     top_alpha.truncate(15);
     let top_alpha: Vec<serde_json::Value> = top_alpha.into_iter()
-        .map(|(w, s, n, wr)| serde_json::json!({ "wallet": w, "score": s, "samples": n, "win_rate": wr }))
+        .map(|(w, s, n, wr, tier)| serde_json::json!({ "wallet": w, "score": s, "samples": n, "win_rate": wr, "tier": tier }))
         .collect();
 
     let snap = serde_json::json!({
@@ -1811,7 +1876,7 @@ fn concentration_metrics(parsed: &TradeInfoFromToken, mint: &str, cfg: &Momentum
             *bought.entry(t.trader.as_str()).or_insert(0.0) += t.sol;
             if !counted_smart.contains(t.trader.as_str()) {
                 if let Some(r) = WALLET_REP.get(t.trader.as_str()) {
-                    if r.samples >= cfg.alpha_min_samples && r.score >= cfg.alpha_rep_min {
+                    if wallet_is_proven(&r, cfg) {
                         smart += 1; counted_smart.insert(t.trader.as_str());
                     }
                 }
@@ -3083,7 +3148,7 @@ async fn momentum_startup(
         load_wallet_rep(&cfg.wallet_rep_file);
         let proven = WALLET_REP
             .iter()
-            .filter(|e| e.value().samples >= cfg.alpha_min_samples && e.value().score >= cfg.alpha_rep_min)
+            .filter(|e| wallet_is_proven(e.value(), &cfg))
             .count();
         logger.log(format!(
             "🧠 Loaded reputation for {} wallets from {} — {} already proven (rep >= {:.2}, >= {} samples) and will be followed",

@@ -144,33 +144,38 @@
   "top_alpha": [
     {
       "wallet": "5JTvwLFy1EPWoSWbVqjp4x9rfg961P9iKV3vsSubDFXd",
-      "score": 0.847,
+      "score": 96,
       "samples": 8,
-      "win_rate": 0.75
+      "win_rate": 0.95,
+      "tier": "ELITE"
     },
     {
       "wallet": "MFQKMm2NPcVtnmBZFouvQpowvD4EJDWjWs238NdXL9P",
-      "score": 0.824,
+      "score": 82,
       "samples": 8,
-      "win_rate": 0.75
+      "win_rate": 0.87,
+      "tier": "STRONG"
     },
     {
       "wallet": "sR4QwzCRt7yJ14x6oxqcAWLXTN8Q7feS4CkiVYhdX7F",
-      "score": 0.654,
+      "score": 68,
       "samples": 7,
-      "win_rate": 0.75
+      "win_rate": 0.73,
+      "tier": "WATCHLIST"
     },
     {
       "wallet": "9R6fxLZVnjuPyeX4ns6UnhwkKh9XNpUaHuJSUSyxjGQT",
-      "score": 0.561,
+      "score": 63,
       "samples": 5,
-      "win_rate": 0.66
+      "win_rate": 0.68,
+      "tier": "WATCHLIST"
     },
     {
       "wallet": "EUj7KUbkMMhfs5yCajaFWx1BvX4HdfGgrdyWjaY42yp7",
-      "score": 0.533,
+      "score": 55,
       "samples": 6,
-      "win_rate": 0.63
+      "win_rate": 0.6,
+      "tier": "WEAK"
     }
   ],
   "watchlist": [

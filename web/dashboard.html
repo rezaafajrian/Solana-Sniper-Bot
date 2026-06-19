@@ -196,7 +196,7 @@
   <div class="panel">
     <div class="ph"><span class="x">SCOUT LIST · TOP LEARNED ALPHA</span></div>
     <table>
-      <thead><tr><th>wallet</th><th>samples</th><th>win%</th><th>rep</th></tr></thead>
+      <thead><tr><th>wallet</th><th>tier</th><th>win%</th><th>score</th><th>n</th></tr></thead>
       <tbody id="alphaBody"></tbody>
     </table>
   </div>
@@ -413,11 +413,14 @@ function render(snap){
   (snap.top_alpha||[]).forEach(a=>{
     const tr=document.createElement("tr");
     const wrp=a.win_rate!=null?(a.win_rate*100).toFixed(0)+"%":"—";
-    tr.innerHTML=`<td class="cy">${shortMint(a.wallet)}</td><td class="dim">${a.samples}</td>`+
-      `<td>${wrp}</td><td class="up">+${(a.score||0).toFixed(3)}</td>`;
+    const sc=(a.score||0);
+    const tcol = sc>=90?"up":(sc>=75?"up":(sc>=60?"am":"dim"));
+    tr.innerHTML=`<td class="cy">${shortMint(a.wallet)}</td>`+
+      `<td class="${tcol}">${a.tier||"—"}</td>`+
+      `<td>${wrp}</td><td class="${tcol}">${sc.toFixed(0)}</td><td class="dim">${a.samples}</td>`;
     ab.appendChild(tr);
   });
-  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=4 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
+  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=5 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
 
   // exit mix (from the recent feed window — a live sample, not the full session)
   const mix={};
