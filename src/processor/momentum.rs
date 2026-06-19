@@ -304,6 +304,10 @@ pub struct MomentumConfig {
     /// post-detection outcome, so the strategy can be studied and improved offline.
     /// Empty base path disables it.
     pub decision_log_file: String,
+    /// How long to track a token's post-detection price before finalizing its outcome
+    /// label (seconds). Longer captures bigger/slower pumps for the "why did it pump"
+    /// research; shorter labels faster. Default 2h.
+    pub outcome_horizon_secs: u64,
     /// Transaction landing route: "zeroslot" | "jito" | "multi" (jito+rpc broadcast).
     pub landing: String,
     /// Exit a held token when its real SOL reserves reach this (bonding curve is
@@ -474,6 +478,7 @@ impl MomentumConfig {
             status_file: std::env::var("MOMENTUM_STATUS_FILE").unwrap_or_else(|_| "momentum_status.json".to_string()),
             positions_file: std::env::var("MOMENTUM_POSITIONS_FILE").unwrap_or_else(|_| "momentum_positions.json".to_string()),
             decision_log_file: std::env::var("MOMENTUM_DECISION_LOG").unwrap_or_else(|_| "momentum_decisions".to_string()),
+            outcome_horizon_secs: env_u64("MOMENTUM_OUTCOME_HORIZON_SECS", 7200),
             landing: std::env::var("MOMENTUM_LANDING").unwrap_or_else(|_| "zeroslot".to_string()).to_lowercase(),
             migration_exit_sol: env_f64("MOMENTUM_MIGRATION_EXIT_SOL", 82.0),
 
@@ -1949,7 +1954,7 @@ async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
         interval.tick().await;
         let now = now_secs();
         let due: Vec<String> = OUTCOMES.iter()
-            .filter(|e| !e.finalized && now.saturating_sub(e.detect_ts) >= 7200)
+            .filter(|e| !e.finalized && now.saturating_sub(e.detect_ts) >= cfg.outcome_horizon_secs)
             .map(|e| e.key().clone()).collect();
         for mint in due {
             if let Some(mut o) = OUTCOMES.get_mut(&mint) {
@@ -1976,7 +1981,7 @@ async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
         // Bound memory: if the map grows huge, drop the oldest unfinalized beyond 3h.
         if OUTCOMES.len() > 50_000 {
             let stale: Vec<String> = OUTCOMES.iter()
-                .filter(|e| now.saturating_sub(e.detect_ts) >= 10800)
+                .filter(|e| now.saturating_sub(e.detect_ts) >= cfg.outcome_horizon_secs + 3600)
                 .map(|e| e.key().clone()).collect();
             for m in stale { OUTCOMES.remove(&m); }
         }
