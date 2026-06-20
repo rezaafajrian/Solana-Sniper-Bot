@@ -1,5 +1,18 @@
 # Production Readiness Roadmap
 
+## ⭐ North Star (the goal — remember this)
+Turn a small stake into a large one — serious account growth. That ambition is the
+point of the project. But the way you reach a big number is NOT one oversized bet
+(e.g. 14 SOL into a 29 SOL mcap — that PnL is fantasy, you can't exit it). You reach
+it by **compounding a PROVEN edge over many trades**:
+- a real edge (validated live, not just simulated),
+- percent-of-equity sizing so wins compound (size grows as the account grows),
+- liquidity-aware caps so every position stays exitable (never be the exit liquidity),
+- as equity grows, deploy across more positions and larger-mcap tokens that can
+  absorb the size.
+Big numbers = edge × compounding × time. The caps don't kill the dream — they make
+it reachable instead of a sim illusion.
+
 Honest path from "working dry-run momentum bot" to "trades real money safely and
 profitably, unattended." Ordered by what actually gates production — not by what's
 easiest to build.
