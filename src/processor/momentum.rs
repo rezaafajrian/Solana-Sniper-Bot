@@ -98,6 +98,12 @@ pub struct MomentumConfig {
     /// each buy is `equity * this` instead of the fixed `position_size_sol` — so the
     /// bet scales up as the account grows and shrinks as it draws down. e.g. 0.05 = 5%.
     pub position_size_pct: f64,
+    /// Liquidity caps so a position can never be so large you become the token's exit
+    /// liquidity. entry_size <= mcap*max_mcap_fraction AND curve_liq*max_liq_fraction.
+    pub max_mcap_fraction: f64,
+    pub max_liq_fraction: f64,
+    /// Skip a token if its liquidity caps the size below this (too illiquid to bother).
+    pub min_position_sol: f64,
     pub max_positions: usize,
     pub entry_score: f64,
     /// Minimum BASE momentum score (before KOL/alpha/GMGN boosts) required to enter.
@@ -405,6 +411,9 @@ impl MomentumConfig {
         Self {
             position_size_sol: env_f64("MOMENTUM_POSITION_SIZE_SOL", 0.2),
             position_size_pct: env_f64("MOMENTUM_POSITION_SIZE_PCT", 0.0),
+            max_mcap_fraction: env_f64("MOMENTUM_MAX_MCAP_FRACTION", 0.02),
+            max_liq_fraction: env_f64("MOMENTUM_MAX_LIQ_FRACTION", 0.10),
+            min_position_sol: env_f64("MOMENTUM_MIN_POSITION_SOL", 0.01),
             max_positions: env_usize("MOMENTUM_MAX_POSITIONS", 5),
             entry_score: env_f64("MOMENTUM_ENTRY_SCORE", 65.0),
             min_base_score: env_f64("MOMENTUM_MIN_BASE_SCORE", 0.0),
@@ -544,6 +553,10 @@ impl MomentumConfig {
             logger.log("💰 LIVE — real transactions, real money.".red().bold().to_string());
         }
         logger.log(format!("Buy strength not age | position {} SOL x {} slots", self.position_size_sol, self.max_positions));
+        logger.log(format!(
+            "Liquidity cap: size <= {:.0}% of mcap AND {:.0}% of curve liquidity (never be the exit liquidity) | min size {:.3} SOL",
+            self.max_mcap_fraction * 100.0, self.max_liq_fraction * 100.0, self.min_position_sol,
+        ));
         logger.log(format!("Entry score >= {} | collapse < {} | hard stop {}%", self.entry_score, self.collapse_score, self.hard_stop_pct));
         logger.log(format!(
             "Entry filters: base-momentum floor {} | stagnation stop {}",
@@ -2476,6 +2489,25 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // the larger watch size (not the usual position size).
     if watch_buy {
         entry_size = entry_size.max(cfg.watch_size_sol);
+    }
+
+    // LIQUIDITY CAP: never take a position so large you become the token's exit
+    // liquidity (e.g. 14 SOL into a 29 SOL mcap). Cap to a fraction of mcap AND of
+    // bonding-curve liquidity, so size scales with the token — small on tiny tokens,
+    // bigger as they grow — while wallet equity still scales the base size up.
+    if cfg.max_mcap_fraction > 0.0 && signal.current_mcap > 0.0 {
+        entry_size = entry_size.min(signal.current_mcap * cfg.max_mcap_fraction);
+    }
+    let curve_liq = parsed.liquidity;
+    if cfg.max_liq_fraction > 0.0 && curve_liq > 0.0 {
+        entry_size = entry_size.min(curve_liq * cfg.max_liq_fraction);
+    }
+    // Too illiquid to size meaningfully — skip rather than take a dust position that
+    // also can't exit cleanly.
+    if entry_size < cfg.min_position_sol {
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT",
+            &format!("too illiquid: capped size {:.4} < min {:.4} (mcap {:.1}, liq {:.1})", entry_size, cfg.min_position_sol, signal.current_mcap, curve_liq));
+        return;
     }
 
     if cfg.start_capital_sol > 0.0 {
