@@ -111,6 +111,10 @@ pub struct MomentumConfig {
     /// 0 secs disables.
     pub stagnation_secs: u64,
     pub stagnation_min_pnl: f64,
+    /// Hard max hold time (seconds): force-close any position older than this — kills
+    /// "zombies" (tokens that stopped trading, incl. positions recovered from a prior
+    /// run with no live price feed) that would otherwise hold a slot forever. 0 = off.
+    pub max_hold_secs: u64,
     pub short_window_secs: u64,
     pub medium_window_secs: u64,
     pub min_buy_volume_sol: f64,
@@ -401,6 +405,7 @@ impl MomentumConfig {
             hard_stop_pct: env_f64("MOMENTUM_HARD_STOP_PCT", -35.0),
             stagnation_secs: env_u64("MOMENTUM_STAGNATION_SECS", 0),
             stagnation_min_pnl: env_f64("MOMENTUM_STAGNATION_MIN_PNL", 20.0),
+            max_hold_secs: env_u64("MOMENTUM_MAX_HOLD_SECS", 10800),
             short_window_secs: env_u64("MOMENTUM_SHORT_WINDOW_SECS", 30),
             medium_window_secs: env_u64("MOMENTUM_MEDIUM_WINDOW_SECS", 120),
             min_buy_volume_sol: env_f64("MOMENTUM_MIN_BUY_VOLUME_SOL", 2.0),
@@ -534,6 +539,10 @@ impl MomentumConfig {
             "Entry filters: base-momentum floor {} | stagnation stop {}",
             if self.min_base_score > 0.0 { format!(">= {:.0} (boosts can't bypass)", self.min_base_score) } else { "off".to_string() },
             if self.stagnation_secs > 0 { format!("cut if peak < {:.0}% after {}s", self.stagnation_min_pnl, self.stagnation_secs) } else { "off".to_string() },
+        ));
+        logger.log(format!(
+            "Max-hold reaper: {} (force-closes zombie / recovered-dead positions so they can't hold a slot forever)",
+            if self.max_hold_secs > 0 { format!("{}s", self.max_hold_secs) } else { "off".to_string() },
         ));
         logger.log(format!(
             "Anti-dump concentration: top-{} traders {} | creator share {}",
@@ -2828,8 +2837,59 @@ fn load_positions(path: &str) -> Vec<String> {
 }
 
 /// Evaluate one position against the live signal and act.
+/// Force-close a position that's exceeded the max hold time (a zombie). Prices it at
+/// the last-known mcap if available, else entry mcap (breakeven write-off). In live
+/// mode it attempts a real sell; either way the slot is freed and PnL booked.
+async fn force_close(mint: &str, app_state: &Arc<AppState>, cfg: &Arc<MomentumConfig>, logger: &Logger) {
+    let snap = match POSITIONS.get(mint) {
+        Some(p) => (p.entry_mcap, p.entry_size_sol, p.cost_basis_sol, p.remaining_fraction,
+                    p.realized_so_far, p.kol_label.clone(), p.creator.clone(),
+                    p.signal_type.clone(), p.entry_conv, p.entry_base_score),
+        None => return,
+    };
+    let (entry_mcap, entry_size, cost_basis, frac, prior_realized, kol_label, creator, sig_type, conv, base_score) = snap;
+    if let Some(mut p) = POSITIONS.get_mut(mint) { p.selling = true; }
+
+    let cur_mcap = TOKEN_STATE.get(mint).map(|s| s.last_mcap).filter(|m| *m > 0.0).unwrap_or(entry_mcap);
+    let ratio = if entry_mcap > 0.0 { cur_mcap / entry_mcap } else { 1.0 };
+    let cost = frac * cost_basis;
+    let proceeds = frac * entry_size * ratio * if cfg.dry_run { 1.0 - cfg.sim_cost_fraction } else { 1.0 };
+    let realized = proceeds - cost;
+
+    if !cfg.dry_run {
+        // Best-effort real sell; if it fails, the position is still finalized below
+        // (unsellable quarantine already handles tokens that truly can't be sold).
+        let _ = momentum_sell(mint, 1.0, app_state.clone(), cfg, "max hold", logger).await;
+    }
+
+    log_trade_event(&TradeLogEvent {
+        event: "SELL_FULL", mint, reason: "max hold / zombie reaped",
+        score: base_score, entry_mcap, current_mcap: cur_mcap,
+        pnl_pct: (ratio - 1.0) * 100.0, fraction_of_original: frac,
+        est_sol: proceeds, est_realized_pnl_sol: realized, signature: if cfg.dry_run { "DRY_RUN" } else { "" },
+    });
+    let pos_total = prior_realized + realized;
+    learn_avoidance(&creator, &token_bands(&sig_type, conv, entry_mcap, base_score), pos_total);
+    record_kol_pnl(&kol_label, realized, true, realized);
+    if pos_total >= 0.0 { SESSION_WINS.fetch_add(1, Ordering::SeqCst); } else { SESSION_LOSSES.fetch_add(1, Ordering::SeqCst); }
+    finalize_exit(mint);
+    record_full_exit(pos_total, cfg, logger);
+    logger.log(format!("⏱  Force-closed {} — held past max ({}s) | PnL {:+.4} SOL (priced at {:.1} mcap)", mint, cfg.max_hold_secs, realized, cur_mcap).yellow().to_string());
+}
+
 async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, logger: Logger) {
     let now = now_secs();
+
+    // Max-hold reaper: force-close a position held past the hard limit — this catches
+    // "zombies" (tokens that stopped trading, or positions recovered from a prior run
+    // with no live price feed) that the normal exit logic can never price/close.
+    if cfg.max_hold_secs > 0 {
+        let stale = POSITIONS.get(&mint).map(|p| !p.selling && now.saturating_sub(p.entry_ts) >= cfg.max_hold_secs).unwrap_or(false);
+        if stale {
+            force_close(&mint, &app_state, &cfg, &logger).await;
+            return;
+        }
+    }
 
     // Snapshot the live signal.
     let signal = match TOKEN_STATE.get(&mint) {
