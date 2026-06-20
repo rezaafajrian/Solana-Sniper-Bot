@@ -115,6 +115,9 @@ pub struct MomentumConfig {
     /// "zombies" (tokens that stopped trading, incl. positions recovered from a prior
     /// run with no live price feed) that would otherwise hold a slot forever. 0 = off.
     pub max_hold_secs: u64,
+    /// Fast reaper: force-close a position whose token hasn't traded in this many
+    /// seconds (a dead token) — clears zombies in minutes, not hours. 0 = off.
+    pub stale_exit_secs: u64,
     pub short_window_secs: u64,
     pub medium_window_secs: u64,
     pub min_buy_volume_sol: f64,
@@ -406,6 +409,7 @@ impl MomentumConfig {
             stagnation_secs: env_u64("MOMENTUM_STAGNATION_SECS", 0),
             stagnation_min_pnl: env_f64("MOMENTUM_STAGNATION_MIN_PNL", 20.0),
             max_hold_secs: env_u64("MOMENTUM_MAX_HOLD_SECS", 10800),
+            stale_exit_secs: env_u64("MOMENTUM_STALE_EXIT_SECS", 180),
             short_window_secs: env_u64("MOMENTUM_SHORT_WINDOW_SECS", 30),
             medium_window_secs: env_u64("MOMENTUM_MEDIUM_WINDOW_SECS", 120),
             min_buy_volume_sol: env_f64("MOMENTUM_MIN_BUY_VOLUME_SOL", 2.0),
@@ -2874,7 +2878,7 @@ async fn force_close(mint: &str, app_state: &Arc<AppState>, cfg: &Arc<MomentumCo
     if pos_total >= 0.0 { SESSION_WINS.fetch_add(1, Ordering::SeqCst); } else { SESSION_LOSSES.fetch_add(1, Ordering::SeqCst); }
     finalize_exit(mint);
     record_full_exit(pos_total, cfg, logger);
-    logger.log(format!("⏱  Force-closed {} — held past max ({}s) | PnL {:+.4} SOL (priced at {:.1} mcap)", mint, cfg.max_hold_secs, realized, cur_mcap).yellow().to_string());
+    logger.log(format!("⏱  Force-closed {} — stale/dead position reaped | PnL {:+.4} SOL (priced at {:.1} mcap)", mint, realized, cur_mcap).yellow().to_string());
 }
 
 async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, logger: Logger) {
@@ -2886,6 +2890,19 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     if cfg.max_hold_secs > 0 {
         let stale = POSITIONS.get(&mint).map(|p| !p.selling && now.saturating_sub(p.entry_ts) >= cfg.max_hold_secs).unwrap_or(false);
         if stale {
+            force_close(&mint, &app_state, &cfg, &logger).await;
+            return;
+        }
+    }
+    // Fast no-activity reaper: a token that's stopped trading is dead. If the position
+    // is old enough AND its token hasn't traded in `stale_exit_secs`, force-close it —
+    // catches zombies in minutes instead of waiting for the 3h max-hold.
+    if cfg.stale_exit_secs > 0 {
+        let pos_age = POSITIONS.get(&mint).map(|p| if p.selling { 0 } else { now.saturating_sub(p.entry_ts) }).unwrap_or(0);
+        let last_tick_age = TOKEN_STATE.get(&mint)
+            .and_then(|s| s.ticks.back().map(|t| now.saturating_sub(t.ts)))
+            .unwrap_or(u64::MAX);
+        if pos_age >= cfg.stale_exit_secs && last_tick_age >= cfg.stale_exit_secs {
             force_close(&mint, &app_state, &cfg, &logger).await;
             return;
         }
