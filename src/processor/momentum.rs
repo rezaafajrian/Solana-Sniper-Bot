@@ -149,6 +149,10 @@ pub struct MomentumConfig {
     pub insider_distrib_max_sold: f64,
     /// How many top early buyers (by buy volume) to check for distribution.
     pub insider_distrib_top_n: usize,
+    /// Auto-mute a curated KOL once its tracked PnL goes net-negative over enough
+    /// trades — so a losing KOL stops boosting entries without manual list edits.
+    pub kol_automute: bool,
+    pub kol_automute_min: u32,
     pub scale_out_targets: Vec<f64>,
     /// Fraction of the ORIGINAL position to sell at each corresponding rung.
     /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
@@ -422,8 +426,10 @@ impl MomentumConfig {
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
             concentration_min_traders: env_usize("MOMENTUM_CONCENTRATION_MIN_TRADERS", 25),
-            insider_distrib_max_sold: env_f64("MOMENTUM_INSIDER_DISTRIB_MAX_SOLD", 0.0),
+            insider_distrib_max_sold: env_f64("MOMENTUM_INSIDER_DISTRIB_MAX_SOLD", 0.5),
             insider_distrib_top_n: env_usize("MOMENTUM_INSIDER_DISTRIB_TOP_N", 5),
+            kol_automute: std::env::var("MOMENTUM_KOL_AUTOMUTE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            kol_automute_min: env_u64("MOMENTUM_KOL_AUTOMUTE_MIN", 4) as u32,
             scale_out_targets,
             scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
@@ -877,6 +883,18 @@ fn record_kol_pnl(label: &str, realized_sol: f64, is_full: bool, trade_realized:
     if is_full {
         if trade_realized >= 0.0 { e.1 += 1; } else { e.2 += 1; }
     }
+}
+
+/// A curated KOL is "muted" once it's net-negative over enough closed trades — so a
+/// losing KOL (e.g. one the early tiny samples flattered) stops boosting entries.
+fn kol_is_muted(label: &str, cfg: &MomentumConfig) -> bool {
+    if !cfg.kol_automute {
+        return false;
+    }
+    KOL_PNL.get(label).map(|e| {
+        let (realized, wins, losses) = *e.value();
+        (wins + losses) >= cfg.kol_automute_min && realized < 0.0
+    }).unwrap_or(false)
 }
 
 /// Record the outcome of a closed position and evaluate the circuit breaker.
@@ -2286,6 +2304,12 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
 
     // KOL edge: a tracked KOL buying this token is the leading signal.
     let kol = if cfg.kol_enabled { kol_hot(&mint, now) } else { None };
+    // Auto-mute losing KOLs: a curated KOL that's net-negative over enough trades is
+    // dropped (treated as no-KOL) so it stops boosting — no manual list editing needed.
+    let kol = match kol {
+        Some((_, ref label)) if kol_is_muted(label, &cfg) => None,
+        other => other,
+    };
     // Pure-KOL mode: only ever enter what a KOL bought (momentum/LP/anti-fake confirm).
     if cfg.kol_require && kol.is_none() {
         return;
