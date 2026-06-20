@@ -43,3 +43,5 @@ momentum_decisions.csv
 momentum_decisions.jsonl
 momentum_decisions_outcomes.csv
 pump_scanner_observations.csv
+momentum_avoidance.csv
+momentum_avoidance.csv.tmp

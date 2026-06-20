@@ -216,6 +216,23 @@ pub struct MomentumConfig {
     /// Weight on the market-structure half of the composite (rest goes to convergence).
     pub watch_ms_weight: f64,
 
+    // ---- Learned avoidance: stop repeating mistakes (creator + pattern) ----
+    /// Skip a token whose CREATOR has lost money for the bot before (decaying memory).
+    pub creator_avoid: bool,
+    /// Minimum closed trades on a creator before its record is trusted.
+    pub creator_min_trades: u32,
+    /// Veto a creator whose decaying realized PnL/token is at or below this (SOL).
+    pub creator_avoid_pnl: f64,
+    /// Penalize entries whose feature pattern (signal type, conviction, mcap, score
+    /// band) has been losing — the bot learns which kinds of tokens burn it.
+    pub pattern_avoid: bool,
+    /// Min closed samples in a pattern band before it can penalize.
+    pub pattern_min_samples: u32,
+    /// Max entry-score penalty applied when a token matches losing patterns.
+    pub pattern_penalty_max: f64,
+    /// File persisting the learned creator + pattern memory across runs.
+    pub avoidance_file: String,
+
     // ---- Edge: insider / leader-dump exit ----
     /// Exit immediately when the creator or top early buyers start distributing.
     pub leader_dump_exit_enabled: bool,
@@ -439,6 +456,13 @@ impl MomentumConfig {
             watch_autobuy: std::env::var("MOMENTUM_WATCH_AUTOBUY").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             watch_size_sol: env_f64("MOMENTUM_WATCH_SIZE_SOL", 0.5),
             watch_ms_weight: env_f64("MOMENTUM_WATCH_MS_WEIGHT", 0.5).clamp(0.0, 1.0),
+            creator_avoid: std::env::var("MOMENTUM_CREATOR_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            creator_min_trades: env_u64("MOMENTUM_CREATOR_MIN_TRADES", 2) as u32,
+            creator_avoid_pnl: env_f64("MOMENTUM_CREATOR_AVOID_PNL", -0.02),
+            pattern_avoid: std::env::var("MOMENTUM_PATTERN_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            pattern_min_samples: env_u64("MOMENTUM_PATTERN_MIN_SAMPLES", 20) as u32,
+            pattern_penalty_max: env_f64("MOMENTUM_PATTERN_PENALTY_MAX", 25.0),
+            avoidance_file: std::env::var("MOMENTUM_AVOIDANCE_FILE").unwrap_or_else(|_| "momentum_avoidance.csv".to_string()),
 
             leader_dump_exit_enabled: std::env::var("MOMENTUM_LEADER_DUMP_EXIT")
                 .map(|v| v.to_lowercase() != "false")
@@ -558,6 +582,11 @@ impl MomentumConfig {
             "🏅 Wallet score: recency-weighted win rate (50%/30%/20% recent50/recent200/lifetime), confidence-adjusted. Proven >= {:.0} (WATCHLIST+). Tiers: 90 ELITE / 75 STRONG / 60 WATCHLIST / 40 WEAK",
             self.alpha_min_wallet_score,
         ));
+        logger.log(format!(
+            "🧠 Learned avoidance: creator-blacklist {} (<= {:+.3} SOL/tok over {}+) | pattern-penalty {} (<= -{:.0} score, {}+ samples) — the bot stops repeating mistakes",
+            if self.creator_avoid { "on" } else { "off" }, self.creator_avoid_pnl, self.creator_min_trades,
+            if self.pattern_avoid { "on" } else { "off" }, self.pattern_penalty_max, self.pattern_min_samples,
+        ));
         if self.watch_enabled {
             logger.log(format!(
                 "👁  Ones to Watch: composite >= {:.0} (structure {:.0}% + convergence {:.0}%) -> {}",
@@ -665,6 +694,15 @@ struct MomentumPosition {
     /// final). Used to classify the whole position as a win/loss at full exit.
     #[serde(default)]
     realized_so_far: f64,
+    /// Entry fingerprint for learned avoidance (attributed at exit).
+    #[serde(default)]
+    creator: String,
+    #[serde(default)]
+    signal_type: String,
+    #[serde(default)]
+    entry_conv: u32,
+    #[serde(default)]
+    entry_base_score: f64,
 }
 
 lazy_static! {
@@ -693,6 +731,11 @@ lazy_static! {
     static ref OUTCOMES: DashMap<String, OutcomeTrack> = DashMap::new();
     /// "Ones to Watch": mint -> (watch_score, market_structure, convergence, ts).
     static ref WATCHLIST: DashMap<String, (f64, f64, f64, u64)> = DashMap::new();
+    /// Learned avoidance — the bot's memory of what burns it, updated every exit:
+    /// creator -> (decaying realized PnL/token, closed trades).
+    static ref CREATOR_REP: DashMap<String, (f64, u32)> = DashMap::new();
+    /// feature-pattern band -> (decaying realized PnL/token, closed samples).
+    static ref PATTERN_EV: DashMap<String, (f64, u32)> = DashMap::new();
     static ref DECISION_LOG_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
     static ref DECISION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Serializes appends to the trade-log CSV.
@@ -1091,6 +1134,86 @@ fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, cfg: &Mom
     (total, ms, conv)
 }
 
+/// Discrete feature bands describing a token at entry — the "kind" of token it is.
+/// The bot learns the realized PnL of each band so it can avoid losing patterns.
+fn token_bands(signal_type: &str, conv: u32, mcap: f64, score: f64) -> Vec<String> {
+    let smart = if conv == 0 { "0" } else if conv < 3 { "lo" } else { "hi" };
+    let mc = if mcap < 30.0 { "lo" } else if mcap < 60.0 { "mid" } else { "hi" };
+    let sc = if score < 50.0 { "lo" } else if score < 70.0 { "mid" } else { "hi" };
+    vec![
+        format!("sig:{}", signal_type),
+        format!("smart:{}", smart),
+        format!("mcap:{}", mc),
+        format!("score:{}", sc),
+    ]
+}
+
+const AVOID_EMA_ALPHA: f64 = 0.2; // recent outcomes dominate -> the memory keeps adapting
+
+/// Record a closed position's realized PnL against its creator and feature bands,
+/// so future entries can avoid creators/patterns that keep losing.
+fn learn_avoidance(creator: &str, bands: &[String], realized: f64) {
+    if !creator.is_empty() {
+        let mut e = CREATOR_REP.entry(creator.to_string()).or_insert((0.0, 0));
+        e.0 = (1.0 - AVOID_EMA_ALPHA) * e.0 + AVOID_EMA_ALPHA * realized;
+        e.1 += 1;
+    }
+    for b in bands {
+        let mut e = PATTERN_EV.entry(b.clone()).or_insert((0.0, 0));
+        e.0 = (1.0 - AVOID_EMA_ALPHA) * e.0 + AVOID_EMA_ALPHA * realized;
+        e.1 += 1;
+    }
+}
+
+/// Should this creator be avoided? (enough trades + decaying PnL at/below the bar.)
+fn creator_is_bad(creator: &str, cfg: &MomentumConfig) -> Option<(f64, u32)> {
+    if !cfg.creator_avoid || creator.is_empty() {
+        return None;
+    }
+    CREATOR_REP.get(creator).and_then(|e| {
+        let (pnl, n) = *e.value();
+        if n >= cfg.creator_min_trades && pnl <= cfg.creator_avoid_pnl {
+            Some((pnl, n))
+        } else {
+            None
+        }
+    })
+}
+
+/// Entry-score penalty (0..pattern_penalty_max) from how badly the candidate's
+/// feature bands have performed. Only bands with enough samples count. Returns
+/// (penalty, worst_band_label) so the decision can be explained.
+fn pattern_penalty(bands: &[String], cfg: &MomentumConfig) -> (f64, String) {
+    if !cfg.pattern_avoid {
+        return (0.0, String::new());
+    }
+    let mut sum = 0.0;
+    let mut cnt = 0;
+    let mut worst = (0.0f64, String::new());
+    for b in bands {
+        if let Some(e) = PATTERN_EV.get(b) {
+            let (pnl, n) = *e.value();
+            if n >= cfg.pattern_min_samples {
+                sum += pnl;
+                cnt += 1;
+                if pnl < worst.0 {
+                    worst = (pnl, b.clone());
+                }
+            }
+        }
+    }
+    if cnt == 0 {
+        return (0.0, String::new());
+    }
+    let avg = sum / cnt as f64;
+    if avg >= 0.0 {
+        return (0.0, String::new());
+    }
+    // Map a losing average (toward -0.05 SOL/token) to a penalty up to the max.
+    let penalty = (cfg.pattern_penalty_max * (-avg / 0.05).clamp(0.0, 1.0)).min(cfg.pattern_penalty_max);
+    (penalty, worst.1)
+}
+
 /// Queue a buy for later outcome grading (smart-money learning).
 fn enqueue_attribution(wallet: String, mint: String, entry_mcap: f64, eval_at: u64) {
     if let Ok(mut q) = ATTR_QUEUE.lock() {
@@ -1147,6 +1270,41 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
         if since_save >= 60 {
             since_save = 0;
             save_wallet_rep(&cfg.wallet_rep_file);
+            save_avoidance(&cfg.avoidance_file);
+        }
+    }
+}
+
+/// Persist the learned creator + pattern avoidance memory (one file, kind-tagged).
+fn save_avoidance(path: &str) {
+    use std::io::Write;
+    if path.is_empty() { return; }
+    let tmp = format!("{}.tmp", path);
+    let mut file = match std::fs::File::create(&tmp) { Ok(f) => f, Err(_) => return };
+    let _ = writeln!(file, "kind,key,pnl,count");
+    for e in CREATOR_REP.iter() {
+        let (pnl, n) = *e.value();
+        let _ = writeln!(file, "creator,{},{:.6},{}", e.key(), pnl, n);
+    }
+    for e in PATTERN_EV.iter() {
+        let (pnl, n) = *e.value();
+        let _ = writeln!(file, "pattern,{},{:.6},{}", e.key(), pnl, n);
+    }
+    let _ = std::fs::rename(&tmp, path);
+}
+
+fn load_avoidance(path: &str) {
+    let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return };
+    for line in content.lines().skip(1) {
+        let mut it = line.split(',');
+        if let (Some(kind), Some(key), Some(p), Some(c)) = (it.next(), it.next(), it.next(), it.next()) {
+            if let (Ok(pnl), Ok(n)) = (p.parse::<f64>(), c.parse::<u32>()) {
+                match kind {
+                    "creator" => { CREATOR_REP.insert(key.to_string(), (pnl, n)); }
+                    "pattern" => { PATTERN_EV.insert(key.to_string(), (pnl, n)); }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -2141,7 +2299,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
 
     // GMGN smart-money / trenches confirmation adds score points for the gate.
     let gmgn_hot = gmgn().is_some() && on_gmgn_watchlist(&mint, now);
-    let effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts + alpha_pts;
+    let mut effective_score = signal.score + if gmgn_hot { cfg.gmgn_boost } else { 0.0 } + kol_pts + alpha_pts;
 
     // Which signal drove this evaluation (for per-signal learning/attribution).
     let signal_type = if is_convergence { "convergence" }
@@ -2149,6 +2307,24 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         else if kol.is_some() { "kol" }
         else if gmgn_hot { "gmgn" }
         else { "momentum" };
+
+    // Learned avoidance — stop repeating mistakes:
+    //  (a) hard-skip a CREATOR whose tokens have lost the bot money before;
+    //  (b) penalize the score by how badly this token's feature PATTERN has performed.
+    let creator = parsed.coin_creator.clone().unwrap_or_default();
+    if let Some((pnl, n)) = creator_is_bad(&creator, &cfg) {
+        logger.log(format!("🧠 Avoid {} — creator {} burned us before ({:+.3} SOL/tok over {})", mint, &creator[..creator.len().min(8)], pnl, n).yellow().to_string());
+        record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("creator avoided ({:+.3} over {})", pnl, n));
+        return;
+    }
+    let cand_bands = token_bands(signal_type, conv_count as u32, signal.current_mcap, signal.score);
+    let (pat_penalty, worst_band) = pattern_penalty(&cand_bands, &cfg);
+    if pat_penalty > 0.0 {
+        effective_score -= pat_penalty;
+        if pat_penalty >= 5.0 && !DECISION_LOGGED.contains_key(&mint) {
+            logger.log(format!("🧠 {} -{:.0} score: pattern '{}' has been losing", mint, pat_penalty, worst_band).yellow().to_string());
+        }
+    }
 
     // "Ones to Watch": high-conviction composite (market structure + convergence).
     // In beta (autobuy off) this only flags + alerts + tracks the token for learn.py
@@ -2376,6 +2552,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 sell_attempts: 0,
                 quarantined: false,
                 realized_so_far: 0.0,
+                creator: parsed.coin_creator.clone().unwrap_or_default(),
+                signal_type: signal_type.to_string(),
+                entry_conv: conv_count as u32,
+                entry_base_score: signal.score,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
             record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "BUY", "");
@@ -2889,10 +3069,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
             "📝 [DRY] {} {:.0}% of {} ({}) | sim proceeds {:.4} SOL | sim PnL {:+.4} SOL",
             event, decision.frac_of_original * 100.0, mint, decision.reason, sim_proceeds, sim_realized,
         ).yellow().to_string());
+        let fp = if is_full { POSITIONS.get(&mint).map(|p| (p.creator.clone(), token_bands(&p.signal_type, p.entry_conv, p.entry_mcap, p.entry_base_score))) } else { None };
         let pos_total = commit_sell(true, sim_realized);
         record_kol_pnl(&pos_kol, sim_realized, is_full, sim_realized);
         if is_full {
-            finalize_win_loss(pos_total.unwrap_or(sim_realized), &cfg, &logger);
+            let total = pos_total.unwrap_or(sim_realized);
+            if let Some((c, b)) = &fp { learn_avoidance(c, b, total); }
+            finalize_win_loss(total, &cfg, &logger);
         }
         return;
     }
@@ -2913,10 +3096,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 est_realized_pnl_sol: est_realized_pnl,
                 signature: &sig,
             });
+            let fp = if is_full { POSITIONS.get(&mint).map(|p| (p.creator.clone(), token_bands(&p.signal_type, p.entry_conv, p.entry_mcap, p.entry_base_score))) } else { None };
             let pos_total = commit_sell(true, est_realized_pnl);
             record_kol_pnl(&pos_kol, est_realized_pnl, is_full, est_realized_pnl);
             if is_full {
-                finalize_win_loss(pos_total.unwrap_or(est_realized_pnl), &cfg, &logger);
+                let total = pos_total.unwrap_or(est_realized_pnl);
+                if let Some((c, b)) = &fp { learn_avoidance(c, b, total); }
+                finalize_win_loss(total, &cfg, &logger);
             }
             spawn_reconcile(recon_app, mint.clone(), sig, cost_basis,
                 est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.frac_of_original, decision.reason.clone());
@@ -3153,6 +3339,16 @@ async fn momentum_startup(
         logger.log(format!(
             "🧠 Loaded reputation for {} wallets from {} — {} already proven (rep >= {:.2}, >= {} samples) and will be followed",
             WALLET_REP.len(), cfg.wallet_rep_file, proven, cfg.alpha_rep_min, cfg.alpha_min_samples,
+        ).cyan().to_string());
+    }
+
+    // Learned avoidance memory (creators + patterns that have lost) — compounds across runs.
+    if cfg.creator_avoid || cfg.pattern_avoid {
+        load_avoidance(&cfg.avoidance_file);
+        let bad = CREATOR_REP.iter().filter(|e| { let (p, n) = *e.value(); n >= cfg.creator_min_trades && p <= cfg.creator_avoid_pnl }).count();
+        logger.log(format!(
+            "🧠 Loaded avoidance memory: {} creators / {} patterns — {} creators currently blacklisted",
+            CREATOR_REP.len(), PATTERN_EV.len(), bad,
         ).cyan().to_string());
     }
 
