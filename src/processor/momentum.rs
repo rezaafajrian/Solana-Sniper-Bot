@@ -2042,6 +2042,7 @@ fn insider_distribution_veto(mint: &str, cfg: &MomentumConfig) -> Option<String>
 
 /// Post-detection price tracking for one evaluated token, so we can label its
 /// outcome (rug/loss/2x/...) and study which features predicted it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OutcomeTrack {
     detect_ts: u64,
     detect_mcap: f64,
@@ -2207,6 +2208,53 @@ fn outcome_label(max_ret: f64, final_ret: f64) -> &'static str {
     else { "BREAKEVEN" }
 }
 
+/// Path for the pending (not-yet-finalized) outcome map: derived from the decision
+/// log base so it travels with the rest of the learning artifacts.
+fn outcomes_pending_path(cfg: &MomentumConfig) -> String {
+    if cfg.decision_log_file.is_empty() { String::new() } else { format!("{}_pending.json", cfg.decision_log_file) }
+}
+
+/// Persist the in-memory outcome map so a restart doesn't reset every token's 2h
+/// labeling clock. Without this, frequent restarts mean outcomes are NEVER labeled
+/// and the self-learning loop starves. Atomic temp-file write, best-effort.
+fn save_outcomes(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let map: HashMap<String, OutcomeTrack> = OUTCOMES
+        .iter()
+        .filter(|e| !e.value().finalized)
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    if let Ok(json) = serde_json::to_string(&map) {
+        let tmp = format!("{}.tmp", path);
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Reload the pending outcome map saved by a previous run so the 2h labeling clock
+/// survives restarts. Returns the number of tracked tokens restored.
+fn load_outcomes(path: &str) -> usize {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let map: HashMap<String, OutcomeTrack> = match serde_json::from_str(&content) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let mut n = 0;
+    for (mint, o) in map {
+        if !o.finalized {
+            OUTCOMES.insert(mint, o);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Background task: finalize outcomes older than 2h, append a labeled row to the
 /// outcomes CSV, and drop them from memory.
 async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
@@ -2216,6 +2264,7 @@ async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
         return;
     }
     let path = format!("{}_outcomes.csv", base);
+    let pending_path = format!("{}_pending.json", base);
     let mut interval = time::interval(Duration::from_secs(30));
     while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
         interval.tick().await;
@@ -2252,7 +2301,12 @@ async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
                 .map(|e| e.key().clone()).collect();
             for m in stale { OUTCOMES.remove(&m); }
         }
+        // Persist the pending map every tick so a restart resumes the 2h clock
+        // instead of wiping it (the bug that kept labeled outcomes at zero).
+        save_outcomes(&pending_path);
     }
+    // Flush once more on shutdown so the in-flight clock survives a clean Ctrl-C.
+    save_outcomes(&pending_path);
 }
 
 /// Creator + top early buyers (by short-window volume) — the wallets whose
@@ -3529,10 +3583,14 @@ async fn momentum_startup(
             *p = cfg.decision_log_file.clone();
         }
         DECISION_LOGGED.clear();
+        // Reload the pending outcome map from the previous run so the 2h labeling
+        // clock survives restarts (without this, frequent restarts keep labeled
+        // outcomes permanently at zero and the learning loop never gets data).
         OUTCOMES.clear();
+        let restored = load_outcomes(&outcomes_pending_path(&cfg));
         logger.log(format!(
-            "📒 Decision log ON: {}.csv / .jsonl (every evaluation) + {}_outcomes.csv (2h labeled outcomes)",
-            cfg.decision_log_file, cfg.decision_log_file,
+            "📒 Decision log ON: {}.csv / .jsonl (every evaluation) + {}_outcomes.csv (2h labeled outcomes) | {} pending outcomes restored",
+            cfg.decision_log_file, cfg.decision_log_file, restored,
         ).cyan().to_string());
         let cfg = cfg.clone();
         tokio::spawn(async move { run_outcome_tracker(cfg).await });
