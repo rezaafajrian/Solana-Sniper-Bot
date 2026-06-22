@@ -297,6 +297,10 @@ pub struct MomentumConfig {
     /// below what it needs to pay for the eventual sell. Buys are skipped if the
     /// wallet balance is below entry_size + this reserve.
     pub fee_reserve_sol: f64,
+    /// SECURITY TRIPWIRE: refuse to start LIVE if the wallet holds more than this many
+    /// SOL — a guard against ever accidentally pointing the auto-signing bot at your
+    /// main wallet. A hot wallet should hold only what you'd accept losing. 0 = disabled.
+    pub max_wallet_sol: f64,
     /// Failed sell attempts before a position is quarantined (auto-sell halted, alerted)
     /// — stops the bot spinning forever on an illiquid/honeypot token. 0 = never quarantine.
     pub max_sell_retries: u32,
@@ -511,6 +515,7 @@ impl MomentumConfig {
             bankruptcy_floor_frac: env_f64("MOMENTUM_BANKRUPTCY_FLOOR_FRAC", 0.10),
             buy_cost_fraction: env_f64("MOMENTUM_BUY_COST_FRACTION", 0.015),
             fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
+            max_wallet_sol: env_f64("MOMENTUM_MAX_WALLET_SOL", 0.0),
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
@@ -3467,6 +3472,56 @@ async fn send_heartbeat_ping(
 /// Shared startup for both feeds: go-live gate, circuit-breaker/day init,
 /// reputation load, and the background tasks (exit monitor, attribution, GMGN).
 /// Returns the app_state + sniper handles, or an error if the go-live gate blocks.
+/// Startup security checks that run BEFORE any live trading. Cheap insurance against
+/// the two scariest operational mistakes: (1) auto-signing on your main wallet, and
+/// (2) a world-readable `.env` leaking the private key. Dry-run skips the balance
+/// tripwire (no real funds at risk) but still warns on file permissions.
+async fn security_preflight(cfg: &Arc<MomentumConfig>, app_state: &Arc<AppState>, logger: &Logger) -> Result<(), String> {
+    // --- .env permission check: warn if the secrets file is group/world readable. ---
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(".env") {
+            let mode = meta.permissions().mode() & 0o077;
+            if mode != 0 {
+                logger.log(format!(
+                    "🔓 SECURITY: .env is readable by group/other (mode {:o}). Run `chmod 600 .env` — it holds your private key.",
+                    meta.permissions().mode() & 0o777,
+                ).yellow().bold().to_string());
+            }
+        }
+    }
+
+    // --- Wallet-balance tripwire: never auto-sign on a wallet holding more than the
+    //     configured ceiling. The whole point of a hot wallet is a small blast radius. ---
+    if !cfg.dry_run && cfg.max_wallet_sol > 0.0 {
+        if let Ok(pubkey) = app_state.wallet.try_pubkey() {
+            match app_state.rpc_nonblocking_client.get_balance(&pubkey).await {
+                Ok(lamports) => {
+                    let bal = lamports as f64 / LAMPORTS_PER_SOL;
+                    if bal > cfg.max_wallet_sol {
+                        let msg = format!(
+                            "Refusing to start LIVE: wallet holds {:.3} SOL, above the safety ceiling of {:.3} (MOMENTUM_MAX_WALLET_SOL). \
+                             This looks like the wrong (main) wallet. Use a DEDICATED hot wallet with a small balance, or raise the ceiling if intentional.",
+                            bal, cfg.max_wallet_sol,
+                        );
+                        logger.log(format!("⛔ {}", msg).red().bold().to_string());
+                        return Err(msg);
+                    }
+                    logger.log(format!("🔐 Security preflight OK — hot wallet balance {:.3} SOL within ceiling {:.3}", bal, cfg.max_wallet_sol).green().to_string());
+                }
+                Err(e) => {
+                    // Can't verify balance — fail closed in live mode rather than trade blind.
+                    let msg = format!("Refusing to start LIVE: could not verify wallet balance for the safety tripwire ({}). Check RPC.", e);
+                    logger.log(format!("⛔ {}", msg).red().bold().to_string());
+                    return Err(msg);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn momentum_startup(
     cfg: &Arc<MomentumConfig>,
     sniper: SniperConfig,
@@ -3516,6 +3571,10 @@ async fn momentum_startup(
 
     let app_state = Arc::new(sniper.app_state.clone());
     let sniper = Arc::new(sniper);
+
+    // Security preflight: hot-wallet balance tripwire + .env permission check. Fails
+    // closed in live mode so the bot can never auto-sign on the wrong (main) wallet.
+    security_preflight(cfg, &app_state, logger).await?;
 
     if cfg.smart_money_enabled {
         load_wallet_rep(&cfg.wallet_rep_file);

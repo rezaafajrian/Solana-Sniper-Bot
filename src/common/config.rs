@@ -258,8 +258,10 @@ pub fn import_env_var(key: &str) -> String {
     match env::var(key){
         Ok(res) => res,
         Err(e) => {
-            println!("{}", format!("{}: {}", e, key).red().to_string());
-            loop{}
+            // Exit cleanly on a missing secret. The old `loop{}` busy-spun a CPU
+            // core at 100% forever, hiding the real problem instead of surfacing it.
+            eprintln!("{}", format!("missing required env var {}: {}", key, e).red().to_string());
+            std::process::exit(1);
         }
     }
 }
@@ -319,8 +321,9 @@ pub async fn create_coingecko_proxy() -> Result<f64, Error> {
 pub fn import_wallet() -> Result<Arc<Keypair>> {
     let priv_key = import_env_var("PRIVATE_KEY");
     if priv_key.len() < 85 {
-        println!("{}", format!("Please check wallet priv key: Invalid length => {}", priv_key.len()).red().to_string());
-        loop{}
+        // Length only — never echo the key material itself.
+        eprintln!("{}", format!("Invalid PRIVATE_KEY: bad length => {} (expected base58 ~88 chars)", priv_key.len()).red().to_string());
+        std::process::exit(1);
     }
     let wallet: Keypair = Keypair::from_base58_string(priv_key.as_str());
 
