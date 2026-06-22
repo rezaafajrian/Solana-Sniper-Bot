@@ -163,6 +163,38 @@ async fn authority_honeypot_reason(
     None
 }
 
+/// Opt-in pre-send simulation. Builds and simulates the (signed) transaction against the
+/// RPC before broadcasting; if the simulation REVERTS, the trade is aborted. On a buy this
+/// catches a doomed entry before spending a real tx + fees; on a sell it catches a
+/// honeypot / sell-path revert before firing a real, failing sell. Only a positive revert
+/// blocks — RPC transport errors fail open so a flaky node doesn't freeze all trading.
+/// Adds an RPC round-trip, so it's off by default (enable for cautious live runs).
+async fn simulate_before_send(
+    rpc: &Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    keypair: &anchor_client::solana_sdk::signature::Keypair,
+    instructions: &[solana_sdk::instruction::Instruction],
+    blockhash: solana_sdk::hash::Hash,
+    leg: &str,
+) -> Result<(), String> {
+    let tx = anchor_client::solana_sdk::transaction::Transaction::new_signed_with_payer(
+        instructions,
+        Some(&keypair.pubkey()),
+        &vec![keypair],
+        blockhash,
+    );
+    match rpc.simulate_transaction(&tx).await {
+        Ok(resp) => {
+            if let Some(err) = resp.value.err {
+                let tail = resp.value.logs.unwrap_or_default()
+                    .into_iter().rev().take(3).collect::<Vec<_>>().join(" | ");
+                return Err(format!("{} simulation reverted: {:?} [{}]", leg, err, tail));
+            }
+            Ok(())
+        }
+        Err(_) => Ok(()), // RPC transport error — fail open (only block on a positive revert)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -388,6 +420,10 @@ pub struct MomentumConfig {
     /// freeze authority (can freeze your account → unsellable) or mint authority (can
     /// inflate supply) is still live. On by default; fails open on RPC errors.
     pub authority_check: bool,
+    /// Opt-in pre-send simulation: simulate each buy/sell tx before broadcasting and abort
+    /// if it would revert (catches honeypots / sell-path reverts / doomed builds). Adds an
+    /// RPC round-trip per trade, so it's OFF by default — enable for cautious live runs.
+    pub presend_simulate: bool,
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
@@ -603,6 +639,7 @@ impl MomentumConfig {
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
             guard_programs: std::env::var("MOMENTUM_GUARD_PROGRAMS").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             authority_check: std::env::var("MOMENTUM_AUTHORITY_CHECK").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            presend_simulate: std::env::var("MOMENTUM_PRESEND_SIMULATE").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
             gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
@@ -2906,6 +2943,13 @@ async fn momentum_buy(
         .await
         .ok_or_else(|| "no recent blockhash".to_string())?;
 
+    // Opt-in pre-send simulation: abort a buy that would revert before spending fees.
+    if cfg.presend_simulate {
+        simulate_before_send(&app_state.rpc_nonblocking_client, &keypair, &instructions, blockhash, "buy")
+            .await
+            .map_err(|e| format!("buy blocked by pre-send simulation: {}", e))?;
+    }
+
     let sigs = match cfg.landing.as_str() {
         "jito" => crate::block_engine::tx::new_signed_and_send_jito(
             blockhash, &keypair, instructions, logger,
@@ -2991,6 +3035,14 @@ async fn momentum_sell(
     let blockhash = crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash()
         .await
         .ok_or_else(|| "no recent blockhash".to_string())?;
+
+    // Opt-in pre-send simulation: catch a honeypot / sell-path revert before firing a
+    // real, failing sell (the existing retry/quarantine logic handles repeated failures).
+    if cfg.presend_simulate {
+        simulate_before_send(&app_state.rpc_nonblocking_client, &keypair, &instructions, blockhash, "sell")
+            .await
+            .map_err(|e| format!("sell blocked by pre-send simulation: {}", e))?;
+    }
 
     let sigs = match cfg.landing.as_str() {
         "jito" => crate::block_engine::tx::new_signed_and_send_jito(
