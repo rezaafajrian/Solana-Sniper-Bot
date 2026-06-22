@@ -87,6 +87,45 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const TOKEN_DECIMALS: f64 = 1_000_000.0; // pump.fun tokens use 6 decimals
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
+/// The ONLY programs a legitimate pump.fun buy/sell transaction may invoke. Any signed
+/// instruction touching a program outside this set is treated as tampering/attack and
+/// the trade is refused BEFORE signing. This is defense-in-depth on top of the committed
+/// lockfile: even if a dependency were compromised or a data path poisoned, the bot will
+/// never sign a transaction that calls an arbitrary (wallet-draining) program. The set is
+/// derived from the actual swap path: pump.fun swap, ATA create, SPL-token close, plus the
+/// compute-budget + system (tip) instructions the landing layer appends.
+const ALLOWED_TX_PROGRAMS: &[&str] = &[
+    PUMP_FUN_PROGRAM,                               // pump.fun bonding-curve swap
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token (ATA close)
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // SPL Token-2022
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated Token Account (ATA create)
+    "11111111111111111111111111111111",             // System program (tip transfer)
+    "ComputeBudget111111111111111111111111111111",  // Compute budget (priority fee)
+];
+
+/// Anti-tamper guard: reject a transaction before signing if any instruction calls a
+/// program outside `ALLOWED_TX_PROGRAMS`, or if no pump.fun swap instruction is present.
+/// Returns the offending program on failure so it's logged. Pure in-memory (zero latency).
+fn guard_swap_instructions(instructions: &[solana_sdk::instruction::Instruction]) -> Result<(), String> {
+    if instructions.is_empty() {
+        return Err("no instructions to send".to_string());
+    }
+    let mut saw_pump = false;
+    for ix in instructions {
+        let prog = ix.program_id.to_string();
+        if !ALLOWED_TX_PROGRAMS.contains(&prog.as_str()) {
+            return Err(format!("unexpected program {} — refusing to sign (possible tampering)", prog));
+        }
+        if prog == PUMP_FUN_PROGRAM {
+            saw_pump = true;
+        }
+    }
+    if !saw_pump {
+        return Err("no pump.fun swap instruction present — refusing to sign".to_string());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -304,6 +343,10 @@ pub struct MomentumConfig {
     /// Failed sell attempts before a position is quarantined (auto-sell halted, alerted)
     /// — stops the bot spinning forever on an illiquid/honeypot token. 0 = never quarantine.
     pub max_sell_retries: u32,
+    /// Anti-tamper guard: refuse to sign any transaction that invokes a program outside
+    /// the canonical pump.fun set (defense-in-depth against a poisoned build/feed). On by
+    /// default; only disable if a future legitimate program addition trips a false positive.
+    pub guard_programs: bool,
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
@@ -517,6 +560,7 @@ impl MomentumConfig {
             fee_reserve_sol: env_f64("MOMENTUM_FEE_RESERVE_SOL", 0.02),
             max_wallet_sol: env_f64("MOMENTUM_MAX_WALLET_SOL", 0.0),
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
+            guard_programs: std::env::var("MOMENTUM_GUARD_PROGRAMS").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
             gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
@@ -2797,6 +2841,11 @@ async fn momentum_buy(
         .await
         .map_err(|e| format!("build buy failed: {}", e))?;
 
+    // Anti-tamper guard: never sign a buy that touches an unexpected program.
+    if cfg.guard_programs {
+        guard_swap_instructions(&instructions).map_err(|e| format!("buy blocked by program guard: {}", e))?;
+    }
+
     let blockhash = crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash()
         .await
         .ok_or_else(|| "no recent blockhash".to_string())?;
@@ -2877,6 +2926,11 @@ async fn momentum_sell(
         .build_swap_from_parsed_data(&sell_trade_info, sell_config)
         .await
         .map_err(|e| format!("build sell failed: {}", e))?;
+
+    // Anti-tamper guard: never sign a sell that touches an unexpected program.
+    if cfg.guard_programs {
+        guard_swap_instructions(&instructions).map_err(|e| format!("sell blocked by program guard: {}", e))?;
+    }
 
     let blockhash = crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash()
         .await
