@@ -126,6 +126,43 @@ fn guard_swap_instructions(instructions: &[solana_sdk::instruction::Instruction]
     Ok(())
 }
 
+/// Honeypot pre-check (read-only, cached). Reads the SPL mint and rejects tokens whose
+/// authorities are still live: a set FREEZE authority lets the creator freeze your token
+/// account so you can never sell (the on-curve honeypot vector); a set MINT authority lets
+/// them inflate supply and dilute/rug. Legit pump.fun tokens renounce BOTH at creation, so
+/// this passes them and only catches anomalies. Returns Some(reason) ONLY on a positive
+/// unsafe determination — RPC/parse failures return None (fail-open: don't kill the edge on
+/// a flaky read; the pump.fun bonding curve is structurally sellable anyway).
+async fn authority_honeypot_reason(
+    rpc: &Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    mint: &str,
+) -> Option<String> {
+    use solana_program_pack::Pack;
+    use std::str::FromStr;
+    if let Some(v) = MINT_AUTHORITY_CHECKED.get(mint) {
+        // Only safe verdicts are cached; nothing to reject on a cache hit.
+        let _ = v;
+        return None;
+    }
+    let pk = solana_sdk::pubkey::Pubkey::from_str(mint).ok()?;
+    let acct = match rpc.get_account(&pk).await {
+        Ok(a) => a,
+        Err(_) => return None, // fail-open on RPC error
+    };
+    let m = match spl_token::state::Mint::unpack(&acct.data) {
+        Ok(m) => m,
+        Err(_) => return None, // not a standard SPL mint we can parse → don't block
+    };
+    if m.freeze_authority.is_some() {
+        return Some("freeze authority active — token can be frozen (unsellable honeypot)".to_string());
+    }
+    if m.mint_authority.is_some() {
+        return Some("mint authority active — supply can be inflated (dilution/rug)".to_string());
+    }
+    MINT_AUTHORITY_CHECKED.insert(mint.to_string(), true);
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -347,6 +384,10 @@ pub struct MomentumConfig {
     /// the canonical pump.fun set (defense-in-depth against a poisoned build/feed). On by
     /// default; only disable if a future legitimate program addition trips a false positive.
     pub guard_programs: bool,
+    /// Honeypot pre-check: read each token's SPL mint before buying and reject it if the
+    /// freeze authority (can freeze your account → unsellable) or mint authority (can
+    /// inflate supply) is still live. On by default; fails open on RPC errors.
+    pub authority_check: bool,
     /// Minimum number of *distinct* reputable wallets required before smart-money
     /// boost applies — guards against a single farmed wallet baiting the bot.
     pub smart_money_min_distinct: usize,
@@ -561,6 +602,7 @@ impl MomentumConfig {
             max_wallet_sol: env_f64("MOMENTUM_MAX_WALLET_SOL", 0.0),
             max_sell_retries: env_u64("MOMENTUM_MAX_SELL_RETRIES", 8) as u32,
             guard_programs: std::env::var("MOMENTUM_GUARD_PROGRAMS").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            authority_check: std::env::var("MOMENTUM_AUTHORITY_CHECK").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             smart_money_min_distinct: env_usize("MOMENTUM_SMART_MONEY_MIN_DISTINCT", 2),
 
             gmgn_security_veto: std::env::var("GMGN_SECURITY_VETO").map(|v| v.to_lowercase() != "false").unwrap_or(true),
@@ -810,6 +852,9 @@ lazy_static! {
     /// and per-token post-detection outcome tracking.
     static ref DECISION_LOGGED: DashMap<String, ()> = DashMap::new();
     static ref OUTCOMES: DashMap<String, OutcomeTrack> = DashMap::new();
+    /// Honeypot authority pre-check cache: mint -> true (checked & safe). Avoids
+    /// re-reading the same mint account on every evaluation.
+    static ref MINT_AUTHORITY_CHECKED: DashMap<String, bool> = DashMap::new();
     /// "Ones to Watch": mint -> (watch_score, market_structure, convergence, ts).
     static ref WATCHLIST: DashMap<String, (f64, f64, f64, u64)> = DashMap::new();
     /// Learned avoidance — the bot's memory of what burns it, updated every exit:
@@ -2560,6 +2605,17 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Honeypot authority pre-check: reject tokens that can be frozen (unsellable) or
+    // whose supply can still be minted, BEFORE committing capital. Cached per mint;
+    // fails open on RPC error so a flaky read doesn't block every entry.
+    if cfg.authority_check {
+        if let Some(reason) = authority_honeypot_reason(&sniper.app_state.rpc_nonblocking_client, &mint).await {
+            logger.log(format!("🛑 Authority veto {} — {}", mint, reason).red().to_string());
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("authority: {}", reason));
+            return;
         }
     }
 
