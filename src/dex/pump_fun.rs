@@ -263,7 +263,7 @@ impl Pump {
         }
         
         let coin_creator = match &trade_info.coin_creator {
-            Some(creator) => Pubkey::from_str(creator).unwrap_or_else(|_| panic!("Invalid creator pubkey: {}", creator)),
+            Some(creator) => Pubkey::from_str(creator).map_err(|_| anyhow!("Invalid creator pubkey: {}", creator))?,
             None => return Err(anyhow!("Coin creator not found in trade info")),
         };
         let (creator_vault, _) = Pubkey::find_program_address(
