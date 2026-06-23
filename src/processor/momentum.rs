@@ -372,6 +372,10 @@ pub struct MomentumConfig {
     /// Fraction of the held position to sell on an insider-dump signal (1.0 = full
     /// exit, the protective default; lower keeps a runner that rides via the trail).
     pub leader_dump_fraction: f64,
+    /// SLOW-RUG exit: total SOL the tracked (creator + early) wallets may cumulatively
+    /// sell over the WHOLE hold before we exit — catches steady distribution that never
+    /// trips the acute `leader_dump_sol` threshold in any single window. 0 disables.
+    pub slow_rug_sol: f64,
 
     // ---- Edge: trailing stop (let winners run) ----
     /// Once a position's peak PnL clears `trail_activate_pct`, ride it and exit only
@@ -623,6 +627,7 @@ impl MomentumConfig {
             leader_track_top_n: env_usize("MOMENTUM_LEADER_TRACK_TOP_N", 5),
             leader_dump_sol: env_f64("MOMENTUM_LEADER_DUMP_SOL", 1.0),
             leader_dump_fraction: env_f64("MOMENTUM_LEADER_DUMP_FRACTION", 1.0).clamp(0.0, 1.0),
+            slow_rug_sol: env_f64("MOMENTUM_SLOW_RUG_SOL", 0.0),
 
             trail_enabled: std::env::var("MOMENTUM_TRAIL_ENABLED")
                 .map(|v| v.to_lowercase() != "false")
@@ -868,6 +873,14 @@ struct MomentumPosition {
     entry_conv: u32,
     #[serde(default)]
     entry_base_score: f64,
+    /// SLOW-RUG detector: cumulative SOL sold by this token's tracked (creator + early)
+    /// wallets across the WHOLE holding period — catches steady distribution that each
+    /// stays under the acute leader-dump threshold but bleeds the position over time.
+    #[serde(default)]
+    insider_sold_cum: f64,
+    /// Latest tick timestamp already counted into `insider_sold_cum` (avoids double-count).
+    #[serde(default)]
+    insider_seen_ts: u64,
 }
 
 lazy_static! {
@@ -2505,6 +2518,31 @@ fn tracked_wallet_sell_volume(mint: &str, tracked: &HashSet<String>, now: u64, c
         .unwrap_or(0.0)
 }
 
+/// SOL sold by tracked wallets with tick.ts > `since_ts` (for cumulative SLOW-RUG
+/// tracking across the whole hold). Returns (new sells since `since_ts`, latest tick ts
+/// seen) so the caller can advance its watermark and never double-count.
+fn tracked_wallet_sell_since(mint: &str, tracked: &HashSet<String>, since_ts: u64) -> (f64, u64) {
+    if tracked.is_empty() {
+        return (0.0, since_ts);
+    }
+    TOKEN_STATE
+        .get(mint)
+        .map(|s| {
+            let mut vol = 0.0;
+            let mut max_ts = since_ts;
+            for t in s.ticks.iter() {
+                if !t.is_buy && t.ts > since_ts && tracked.contains(&t.trader) {
+                    vol += t.sol;
+                }
+                if t.ts > max_ts {
+                    max_ts = t.ts;
+                }
+            }
+            (vol, max_ts)
+        })
+        .unwrap_or((0.0, since_ts))
+}
+
 async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<MomentumConfig>, sniper: Arc<SniperConfig>, logger: Logger) {
     // Discipline: if the circuit breaker has tripped, take no new entries.
     if trading_halted() {
@@ -2839,6 +2877,8 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                 signal_type: signal_type.to_string(),
                 entry_conv: conv_count as u32,
                 entry_base_score: signal.score,
+                insider_sold_cum: 0.0,
+                insider_seen_ts: now,
             });
             save_positions(); // crash-safety: a new open position is on disk immediately
             record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "BUY", "");
@@ -3248,6 +3288,17 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
         let entry_size_sol = pos.entry_size_sol;
         let cost_basis_sol = pos.cost_basis_sol;
 
+        // Slow-rug accumulation: add tracked-wallet (creator + early buyer) sells seen
+        // since we last looked, so a steady drip that never trips the acute leader-dump
+        // threshold still accumulates over the whole hold.
+        if cfg.slow_rug_sol > 0.0 {
+            let tracked = pos.tracked_wallets.clone();
+            let (new_sold, seen_ts) = tracked_wallet_sell_since(&mint, &tracked, pos.insider_seen_ts);
+            pos.insider_sold_cum += new_sold;
+            pos.insider_seen_ts = seen_ts;
+        }
+        let insider_cum = pos.insider_sold_cum;
+
         // 0a. Migration imminent -> exit before bonding-curve pricing goes invalid.
         if cfg.migration_exit_sol > 0.0 && curve_sol >= cfg.migration_exit_sol {
             pos.selling = true;
@@ -3270,6 +3321,13 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                     pnl, entry_mcap, current_mcap: signal.current_mcap, entry_size_sol, cost_basis_sol,
                 }
             }
+        }
+        // 0c. SLOW RUG: insiders bled out cumulatively over the whole hold without any
+        // single dump big enough to trip 0b. Once total tracked-wallet selling crosses
+        // the threshold, the smart money has left — exit before the grind-down finishes.
+        else if cfg.slow_rug_sol > 0.0 && insider_cum >= cfg.slow_rug_sol {
+            pos.selling = true;
+            Decision::full(pos.remaining_fraction, format!("slow-rug distribution ({:.2} SOL cumulatively sold by insiders, pnl {:.1}%)", insider_cum, pnl), pnl, entry_mcap, signal.current_mcap, entry_size_sol, cost_basis_sol)
         }
         // 1. Hard stop.
         else if pnl <= cfg.hard_stop_pct {
