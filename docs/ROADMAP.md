@@ -89,9 +89,12 @@ recovered positions stays in Phase 2 as a refinement.
 - 🟡 Feed reconnect with backoff — **built** for the ws feed; verify under long runs.
 - ❌ Process supervision (systemd / docker restart=always) so a crash auto-restarts —
       only safe *after* Phase 1 position recovery exists.
-- ❌ Remote alerting (Telegram/Discord/push) on: halted, repeated buy/sell failures,
-      feed down, drawdown threshold. You need to know *while away*, not via the
-      dashboard you have to be watching.
+- ✅ Remote alerting (Telegram) on: bot online, circuit-breaker halt, margin call, token
+      quarantine, and manual/external-sell reconcile. Set TELEGRAM_BOT_TOKEN +
+      TELEGRAM_CHAT_ID. (Feed-down + drawdown-threshold alerts are still TODO.)
+- ✅ **External-sell resilience.** If you sell a position yourself (wallet or Telegram bot),
+      the bot detects the token left the wallet on its next sell attempt, reconciles the
+      position (frees the slot), alerts, and keeps running — no crash, no quarantine churn.
 - ✅ Live dashboard (status snapshot + terminal UI).
 - ❌ Structured logs + log rotation; a daily PnL/health summary.
 - ❌ Operational runbook: how to kill it, how to flatten all positions manually, what

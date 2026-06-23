@@ -167,10 +167,18 @@ ON in live; they're what stop it quietly bleeding:
 - **Suspected key compromise:** stop the service, move funds out of the hot wallet
   immediately, rotate the key, investigate the host.
 
-## 9. Still missing for fully-unattended (known gaps)
+## 9. Remote alerting (Telegram) — set this up so you can walk away
 
-- **Remote alerting** (Telegram/Discord on halt / margin-call / quarantine / feed-down) —
-  NOT built yet. Until it is, you only learn of a problem by checking `journalctl` or the
-  dashboard. This is the top remaining gap before truly walking away (Roadmap Phase 3).
+Push alerts fire on: bot online, circuit-breaker halt, margin call, token quarantine, and
+manual/external-sell reconcile. Arm it in `.env`:
+```
+TELEGRAM_BOT_TOKEN=<from @BotFather>
+TELEGRAM_CHAT_ID=<your id from @userinfobot>
+```
+No-op if unset. You'll get a "🟢 bot online" ping at startup confirming alerts are wired.
+If you sell a position yourself (from your wallet or a Telegram trading bot), the bot
+detects the token left the wallet, reconciles it (frees the slot), keeps running, and
+pings you — it does NOT crash or get stuck.
+
 - **gRPC feed** — for lowest latency set `MOMENTUM_FEED=grpc` + a Yellowstone endpoint
   (the default; the ws feed is the no-gRPC fallback).

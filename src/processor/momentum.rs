@@ -77,6 +77,7 @@ use solana_sdk::signer::Signer;
 use crate::common::config::{AppState, SwapConfig};
 use crate::common::logger::Logger;
 use crate::library::gmgn::{GmgnClient, GmgnConfig, SecurityVerdict};
+use crate::library::telegram;
 use once_cell::sync::OnceCell;
 use crate::dex::pump_fun::{Pump, PUMP_FUN_PROGRAM, TOKEN_TOTAL_SUPPLY};
 use crate::processor::sniper_bot::{SniperConfig, BOUGHT_TOKEN_LIST};
@@ -1110,6 +1111,7 @@ fn record_full_exit(realized_sol: f64, cfg: &MomentumConfig, logger: &Logger) {
             "🛑🛑 CIRCUIT BREAKER TRIPPED — {}. New entries halted; open positions will still exit ({}).",
             reason, resume,
         ).red().bold().to_string());
+        telegram::notify(format!("🛑 CIRCUIT BREAKER TRIPPED — {}. New entries halted ({}).", reason, resume));
     }
 }
 
@@ -2793,6 +2795,7 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
                     "💀 MARGIN CALL — equity {:.3} SOL <= floor {:.3} ({:.0}% of start). Account ruined after {:+.3} SOL realized. Halting new entries; open positions still exit.",
                     eq, floor, cfg.bankruptcy_floor_frac * 100.0, realized_pnl(),
                 ).red().bold().to_string());
+                telegram::notify(format!("💀 MARGIN CALL — equity {:.3} SOL hit the floor {:.3}. New entries halted.", eq, floor));
             }
             return;
         }
@@ -3458,6 +3461,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                         "🚨 QUARANTINE {} — sell failed {} times (likely illiquid/honeypot). Auto-sell halted; check your wallet and exit manually.",
                         mint, p.sell_attempts,
                     ).red().bold().to_string());
+                    telegram::notify(format!("🚨 QUARANTINE {} — sell failed {}x (likely illiquid/honeypot). Check your wallet.", &mint[..mint.len().min(8)], p.sell_attempts));
                 }
             }
             save_positions();
@@ -3557,8 +3561,22 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
                 est_realized_pnl, signal.score, decision.entry_mcap, decision.current_mcap, decision.pnl, decision.frac_of_original, decision.reason.clone());
         }
         Err(e) => {
-            logger.log(format!("Sell error {}: {}", mint, e).red().to_string());
-            commit_sell(false, 0.0);
+            // External-sell reconciliation: a missing token account means the position is
+            // no longer in the wallet — you sold it manually (wallet or a Telegram trading
+            // bot), or it was already gone. Don't churn toward quarantine: close it cleanly
+            // in the books, free the slot, and keep running. We don't count it toward
+            // win/loss (we didn't execute this exit, so the realized PnL is unknown to us).
+            if e.contains("does not exist") {
+                logger.log(format!(
+                    "🔄 {} no longer held on-chain (manual/external sell) — reconciled: closing in books, slot freed. Bot continues.",
+                    mint,
+                ).yellow().bold().to_string());
+                telegram::notify(format!("🔄 {} left the wallet (manual/external sell) — reconciled, slot freed. Bot still running.", &mint[..mint.len().min(8)]));
+                finalize_exit(&mint);
+            } else {
+                logger.log(format!("Sell error {}: {}", mint, e).red().to_string());
+                commit_sell(false, 0.0);
+            }
         }
     }
 }
@@ -3794,6 +3812,14 @@ async fn momentum_startup(
                    or MOMENTUM_DRY_RUN=true to paper-trade. Validate in dry run + analyzer/A-B first.";
         logger.log(format!("⛔ {}", msg).red().bold().to_string());
         return Err(msg.to_string());
+    }
+
+    // Remote alerting: arm Telegram (no-op if TELEGRAM_BOT_TOKEN/CHAT_ID unset) and ping
+    // once so you know the bot is actually live and alerts are wired.
+    if telegram::init_from_env() {
+        let mode = if cfg.dry_run { "DRY RUN" } else { "LIVE" };
+        telegram::notify(format!("🟢 Momentum bot online ({}). Alerts armed: halt, margin call, quarantine, manual-sell reconcile.", mode));
+        logger.log("📲 Telegram alerts ARMED".cyan().to_string());
     }
 
     TRADING_HALTED.store(false, Ordering::SeqCst);

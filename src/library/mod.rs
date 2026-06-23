@@ -6,3 +6,4 @@ pub mod jupiter_api;
 pub mod gmgn;
 pub mod ws_feed;
 pub mod health_check;
+pub mod telegram;
