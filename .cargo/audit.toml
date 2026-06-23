@@ -1,0 +1,33 @@
+# cargo-audit configuration — ACCEPTED-RISK register.
+#
+# Every advisory ignored below is a TRANSITIVE dependency of the pinned
+# solana 2.1.x / anchor 0.31 stack — none are crates this project chose, and
+# none can be resolved without a major Solana SDK upgrade (tracked in
+# docs/ROADMAP.md as the real fix, to be done with full re-validation, not
+# rushed before the first live run). Each is accepted consciously below with
+# its rationale. Re-review this list whenever the Solana SDK is bumped.
+#
+# Run:  cargo audit        (should now exit clean)
+#       cargo audit --no-config   (to see the full unfiltered list again)
+
+[advisories]
+ignore = [
+    # --- ed25519/curve25519: pulled by ed25519-dalek-bip32 0.2 INSIDE solana-sdk ---
+    # ed25519-dalek 1.0.1 oracle attack. Needs dalek >=2 (major bump owned by solana).
+    # Practical risk: low — the attack requires a specific misuse pattern; standard
+    # Solana transaction signing is not the vulnerable code path.
+    "RUSTSEC-2022-0093",
+    # curve25519-dalek 3.2.0 timing side-channel in Scalar sub. Needs >=4.1.3 (major,
+    # owned by ed25519-dalek 1.x). Practical risk: low — a local timing side-channel on
+    # the client's own signing, not remotely exploitable.
+    "RUSTSEC-2024-0344",
+
+    # --- rustls-webpki 0.101.7: pulled by rustls 0.21 <- reqwest 0.11 <- solana-rpc-client ---
+    # The patched 0.103.x is ALREADY in the tree; only the reqwest-0.11 path is stuck.
+    # Fix needs reqwest 0.12 (major, owned by solana-rpc-client). Practical risk:
+    # moderate-low — TLS cert-validation edge cases on connections to KNOWN RPC
+    # endpoints, not arbitrary servers.
+    "RUSTSEC-2026-0099",  # name constraints / wildcard
+    "RUSTSEC-2026-0104",  # reachable panic in CRL parsing
+    "RUSTSEC-2026-0098",  # name constraints for URI names
+]

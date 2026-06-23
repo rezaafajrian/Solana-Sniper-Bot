@@ -50,6 +50,13 @@ These are the ways a *technically working* bot still loses your money.
 - 🟡 **Secret management.** Private key sits in plaintext `.env`. At minimum: confirm
       `.env` is gitignored (it is), **rotate the keys that were exposed in chat**, use
       a dedicated low-balance hot wallet (never your main), and never log key material.
+- 🟡 **Dependency CVEs (`cargo audit`).** `Cargo.lock` is committed + audited. `quinn-proto`
+      bumped to 0.11.15 (cleared the one remotely-triggerable advisory, RUSTSEC-2026-0185).
+      The remaining 5 (ed25519-dalek 1.x oracle, curve25519-dalek 3.x timing, rustls-webpki
+      0.101 ×3) are **baked into the solana 2.1 / anchor 0.31 tree** — unfixable without a
+      major SDK upgrade. Consciously accepted in `.cargo/audit.toml` with rationale (low
+      practical risk for a client-side signing bot). **Real fix = bump the Solana SDK**, a
+      tracked Phase-5 task to do WITH full re-validation, not before the first live run.
 - ✅ **Pre-buy balance + fee-reserve check.** momentum_buy verifies wallet balance >=
       size + MOMENTUM_FEE_RESERVE_SOL before sending; short balance skips the entry.
 - ✅ **Anti-dump entry filters.** Base-momentum floor (boosts can't drag in dead charts),
