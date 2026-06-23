@@ -244,6 +244,10 @@ pub struct MomentumConfig {
     /// Max share of buy volume from wallets that ALSO sold in the window
     /// (round-tripping / wash trading). Above this, the score is cut.
     pub max_wash_fraction: f64,
+    /// Max share of short-window buy VOLUME allowed from the token creator's own wallet
+    /// before the momentum score is discounted — kills "fake pump" from creator/bundler
+    /// self-buying so it can't clear the entry gate. Above this, score is cut toward 0.
+    pub max_creator_buy_frac: f64,
     // ---- Anti-dump: stream-based concentration veto (no API, works on fresh tokens) ----
     /// Reject entry if the top-N traders hold more than this share of the net
     /// trader-held float (a free proxy for holder concentration). 0 disables.
@@ -555,6 +559,7 @@ impl MomentumConfig {
             max_wallet_concentration: env_f64("MOMENTUM_MAX_WALLET_CONCENTRATION", 0.50),
             min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
             max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
+            max_creator_buy_frac: env_f64("MOMENTUM_MAX_CREATOR_BUY_FRAC", 0.15),
             max_top_holder_share: env_f64("MOMENTUM_MAX_TOP_HOLDER_SHARE", 0.0),
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
@@ -711,8 +716,8 @@ impl MomentumConfig {
             self.min_buy_volume_sol, self.target_unique_buyers, self.target_mcap_growth * 100.0, self.max_wallet_concentration * 100.0,
         ));
         logger.log(format!(
-            "Anti-fake: min buyer diversity {:.2}, max wash fraction {:.2}",
-            self.min_buyer_diversity, self.max_wash_fraction,
+            "Anti-fake: min buyer diversity {:.2}, max wash fraction {:.2}, max creator buy-share {:.2}",
+            self.min_buyer_diversity, self.max_wash_fraction, self.max_creator_buy_frac,
         ));
         let runner = (1.0 - self.scale_out_fractions.iter().sum::<f64>()).max(0.0);
         let rungs: Vec<String> = self.scale_out_targets.iter().zip(self.scale_out_fractions.iter())
@@ -1910,7 +1915,20 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
     } else {
         clamp01(1.0 - (wash_frac - cfg.max_wash_fraction) / (1.0 - cfg.max_wash_fraction).max(1e-9))
     };
-    let genuine_factor = diversity_factor * wash_factor;
+    // (c) Creator self-buying: share of short-window buy VOLUME from the token creator's
+    //     own wallet. A "pump" that's largely the creator buying their own token (the
+    //     bundler fake-momentum trap) is discounted here so manufactured volume can't
+    //     clear the entry gate — the genuine demand it's faking simply isn't there.
+    let creator_buy_vol = state.last_trade_info.coin_creator.as_deref()
+        .and_then(|c| per_wallet_buy.get(c).copied())
+        .unwrap_or(0.0);
+    let creator_frac = if buy_vol_s > 0.0 { creator_buy_vol / buy_vol_s } else { 0.0 };
+    let creator_factor = if creator_frac <= cfg.max_creator_buy_frac {
+        1.0
+    } else {
+        clamp01(1.0 - (creator_frac - cfg.max_creator_buy_frac) / (1.0 - cfg.max_creator_buy_frac).max(1e-9))
+    };
+    let genuine_factor = diversity_factor * wash_factor * creator_factor;
 
     let base_score = (weighted * 100.0) * dump_factor * genuine_factor;
 
