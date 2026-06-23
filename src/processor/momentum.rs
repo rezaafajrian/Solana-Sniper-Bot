@@ -4067,3 +4067,154 @@ pub async fn start_momentum_monitoring(sniper: SniperConfig) -> Result<(), Strin
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // ---- helpers ----------------------------------------------------------
+    fn ix(prog: &str) -> solana_sdk::instruction::Instruction {
+        solana_sdk::instruction::Instruction {
+            program_id: solana_sdk::pubkey::Pubkey::from_str(prog).unwrap(),
+            accounts: vec![],
+            data: vec![],
+        }
+    }
+    const TOKEN_PROG: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const SYS_PROG: &str = "11111111111111111111111111111111";
+    const EVIL_PROG: &str = "Evi1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+    fn tick(ts: u64, is_buy: bool, sol: f64, trader: &str, mcap: f64) -> TradeTick {
+        TradeTick { ts, is_buy, sol, trader: trader.to_string(), mcap }
+    }
+    fn trade_info(creator: Option<&str>) -> TradeInfoFromToken {
+        TradeInfoFromToken {
+            dex_type: DexType::PumpFun, slot: 0, signature: String::new(), pool_id: String::new(),
+            mint: "M".into(), timestamp: 0, is_buy: true, price: 0, is_reverse_when_pump_swap: false,
+            coin_creator: creator.map(|s| s.to_string()), sol_change: 0.0, token_change: 0.0,
+            liquidity: 0.0, virtual_sol_reserves: 0, virtual_token_reserves: 0,
+        }
+    }
+    fn test_cfg() -> MomentumConfig {
+        let mut c = MomentumConfig::from_env();
+        c.short_window_secs = 30;
+        c.medium_window_secs = 120;
+        c.min_buy_volume_sol = 1.0;
+        c.target_unique_buyers = 10.0;
+        c.target_mcap_growth = 0.5;
+        c.max_wallet_concentration = 0.5;
+        c.min_buyer_diversity = 0.5;
+        c.max_wash_fraction = 0.4;
+        c.max_creator_buy_frac = 0.15;
+        c
+    }
+    fn state(ticks: Vec<TradeTick>, creator: Option<&str>) -> TokenMomentum {
+        TokenMomentum { ticks: ticks.into_iter().collect(), last_mcap: 1100.0, last_trade_info: trade_info(creator), last_score: 0.0 }
+    }
+
+    // ---- anti-tamper program guard ---------------------------------------
+    #[test]
+    fn guard_accepts_canonical_pumpfun_tx() {
+        let ixs = vec![ix(PUMP_FUN_PROGRAM), ix(TOKEN_PROG), ix(SYS_PROG)];
+        assert!(guard_swap_instructions(&ixs).is_ok());
+    }
+    #[test]
+    fn guard_rejects_unknown_program() {
+        let ixs = vec![ix(PUMP_FUN_PROGRAM), ix(EVIL_PROG)];
+        assert!(guard_swap_instructions(&ixs).is_err());
+    }
+    #[test]
+    fn guard_rejects_missing_pumpfun_swap() {
+        let ixs = vec![ix(TOKEN_PROG), ix(SYS_PROG)];
+        assert!(guard_swap_instructions(&ixs).is_err());
+    }
+    #[test]
+    fn guard_rejects_empty() {
+        assert!(guard_swap_instructions(&[]).is_err());
+    }
+
+    // ---- outcome labelling -----------------------------------------------
+    #[test]
+    fn outcome_labels_map_correctly() {
+        assert_eq!(outcome_label(0.0, -0.95), "RUG");
+        assert_eq!(outcome_label(25.0, 5.0), "20X+");
+        assert_eq!(outcome_label(12.0, 3.0), "10X");
+        assert_eq!(outcome_label(6.0, 2.0), "5X");
+        assert_eq!(outcome_label(1.5, 0.5), "2X");
+        assert_eq!(outcome_label(0.1, -0.5), "LOSS");
+        assert_eq!(outcome_label(0.3, 0.2), "WIN");
+        assert_eq!(outcome_label(0.05, 0.0), "BREAKEVEN");
+    }
+
+    // ---- pure math --------------------------------------------------------
+    #[test]
+    fn clamp01_bounds() {
+        assert_eq!(clamp01(-1.0), 0.0);
+        assert_eq!(clamp01(0.5), 0.5);
+        assert_eq!(clamp01(2.0), 1.0);
+    }
+    #[test]
+    fn mcap_from_reserves_zero_is_none() {
+        assert!(mcap_from_reserves(0, 0).is_none());
+        assert!(mcap_from_reserves(30_000_000_000, 1_000_000_000_000_000).is_some());
+    }
+
+    // ---- core scoring: the anti-fake creator self-buy discount -----------
+    #[test]
+    fn creator_self_buy_pump_scores_zero() {
+        let cfg = test_cfg();
+        let now = 1000;
+        // A "pump" that is entirely the creator buying its own token.
+        let ticks: Vec<_> = (0..10).map(|i| tick(990, true, 1.0, "CREATOR", 1000.0 + i as f64 * 10.0)).collect();
+        let sig = score_token(&state(ticks, Some("CREATOR")), &cfg, now);
+        // genuine_factor collapses to 0 -> the fake pump cannot clear the gate.
+        assert_eq!(sig.score, 0.0, "creator-only pump must score 0");
+        assert_eq!(sig.genuine_factor, 0.0);
+    }
+    #[test]
+    fn organic_pump_outscores_creator_pump() {
+        let cfg = test_cfg();
+        let now = 1000;
+        let creator_ticks: Vec<_> = (0..10).map(|_| tick(990, true, 1.0, "CREATOR", 1100.0)).collect();
+        let organic_ticks: Vec<_> = (0..10).map(|i| tick(990, true, 1.0, &format!("w{i}"), 1100.0)).collect();
+        let creator_score = score_token(&state(creator_ticks, Some("CREATOR")), &cfg, now).score;
+        let organic_score = score_token(&state(organic_ticks, Some("CREATOR")), &cfg, now).score;
+        assert!(organic_score > creator_score, "organic {organic_score} should beat fake {creator_score}");
+        assert!(organic_score > 0.0);
+    }
+    #[test]
+    fn heavy_selling_suppresses_score() {
+        let cfg = test_cfg();
+        let now = 1000;
+        let mut ticks: Vec<_> = (0..10).map(|i| tick(990, true, 1.0, &format!("w{i}"), 1100.0)).collect();
+        let buys_only = score_token(&state(ticks.clone(), Some("C")), &cfg, now).score;
+        // Add big sells (> 1.5x buys) -> dump_factor cuts the score hard.
+        for i in 0..10 { ticks.push(tick(991, false, 3.0, &format!("s{i}"), 1100.0)); }
+        let with_sells = score_token(&state(ticks, Some("C")), &cfg, now).score;
+        assert!(with_sells < buys_only, "heavy selling must suppress: {with_sells} !< {buys_only}");
+    }
+
+    // ---- slow-rug cumulative accumulator (no double counting) ------------
+    #[test]
+    fn tracked_sell_since_watermark_no_double_count() {
+        let mint = "test_mint_slowrug_unit";
+        let mut tracked = HashSet::new();
+        tracked.insert("insider".to_string());
+        let ticks = vec![
+            tick(100, false, 0.5, "insider", 1000.0),
+            tick(110, false, 0.7, "insider", 1000.0),
+            tick(120, false, 0.3, "other", 1000.0),   // not tracked
+            tick(130, true, 2.0, "insider", 1000.0),   // a buy, not a sell
+        ];
+        TOKEN_STATE.insert(mint.to_string(), state(ticks, Some("creator")));
+        // From the start: count both insider sells (0.5 + 0.7), watermark advances to 130.
+        let (vol, seen) = tracked_wallet_sell_since(mint, &tracked, 0);
+        assert!((vol - 1.2).abs() < 1e-9, "got {vol}");
+        assert_eq!(seen, 130);
+        // Re-running from the watermark counts nothing new (no double count).
+        let (vol2, _) = tracked_wallet_sell_since(mint, &tracked, seen);
+        assert_eq!(vol2, 0.0);
+        TOKEN_STATE.remove(mint);
+    }
+}

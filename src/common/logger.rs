@@ -96,3 +96,32 @@ impl LogLevel<'_> {
         self.level.to_lowercase().eq("debug")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::redact_secrets;
+
+    #[test]
+    fn redacts_rpc_url_with_embedded_key() {
+        let s = "ws: connect failed: wss://solana-mainnet.core.chainstack.com/bb31ea6386a3a3b5 (retry in 5s)";
+        let out = redact_secrets(s);
+        assert!(!out.contains("bb31ea6386a3a3b5"), "API key leaked: {out}");
+        assert!(!out.contains("chainstack.com"), "host leaked: {out}");
+        assert!(out.contains("wss://[redacted]"));
+        assert!(out.contains("retry in 5s"), "non-secret context should survive: {out}");
+    }
+
+    #[test]
+    fn redacts_multiple_urls() {
+        let s = "primary https://a.com/key1 backup https://b.com/key2 end";
+        let out = redact_secrets(s);
+        assert!(!out.contains("key1") && !out.contains("key2"), "{out}");
+        assert!(out.contains("primary") && out.contains("backup") && out.contains("end"));
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        let s = "🔴 SELL 50% of MINT at price 1234 | pnl +42%";
+        assert_eq!(redact_secrets(s), s);
+    }
+}
