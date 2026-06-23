@@ -1,0 +1,48 @@
+[Unit]
+# Solana momentum trading bot — always-on systemd service.
+# Install: see docs/VPS_DEPLOYMENT.md. Edit the paths/user below to match your box.
+Description=Solana momentum trading bot
+After=network-online.target
+Wants=network-online.target
+# Crash-loop guard: if it dies >10 times in 5 min, stop trying (something is wrong —
+# better to halt and alert than to thrash. Crash recovery re-adopts open positions).
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+# The repo lives here; .env (chmod 600) and all runtime artifacts (positions, logs,
+# decision/outcome CSVs) are written in this dir, which dotenv() also reads from.
+WorkingDirectory=/opt/solbot/Solana-Sniper-Bot
+ExecStart=/opt/solbot/Solana-Sniper-Bot/target/release/solana-vntr-sniper
+# Restart on crash with backoff; combined with crash-recovery (positions persist to
+# disk and are re-adopted on startup) so a restart resumes managing open positions.
+Restart=always
+RestartSec=5
+# Logs go to journald: journalctl -u momentum-bot -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=momentum-bot
+
+# ---- hardening (defense-in-depth: limit what a compromised process can touch) ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The ONLY writable path: the repo dir (for .env + runtime artifacts).
+ReadWritePaths=/opt/solbot/Solana-Sniper-Bot
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+# Resource ceilings so a bug/leak can't take down the box.
+MemoryMax=2G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

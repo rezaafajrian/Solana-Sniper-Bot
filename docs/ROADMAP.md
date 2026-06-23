@@ -113,6 +113,10 @@ recovered positions stays in Phase 2 as a refinement.
 
 ## Planned deployment — gRPC + VPS, runs 24/7 ("the monster can't be stopped")
 Decided direction for production hosting:
+> **Runbook: see [`docs/VPS_DEPLOYMENT.md`](VPS_DEPLOYMENT.md)** — step-by-step host
+> hardening, the `deploy/momentum-bot.service` systemd unit, dashboard-over-SSH-tunnel,
+> the operational runbook (start/stop/update/flatten/halt reasons), and the safety model.
+
 - **gRPC feed**: switch from the websocket feed to Yellowstone gRPC for lower latency.
   Already supported — set `MOMENTUM_FEED=grpc` + `YELLOWSTONE_GRPC_HTTP`/`_TOKEN`.
   (ws was the no-gRPC fallback; gRPC is the faster path once an endpoint is available.)
