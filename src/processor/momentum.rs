@@ -280,7 +280,15 @@ pub struct MomentumConfig {
     /// Aligned 1:1 with `scale_out_targets`. The runner (held until collapse/
     /// migration) is whatever's left: 1.0 - sum(fractions).
     pub scale_out_fractions: Vec<f64>,
+    /// Base slippage tolerance (bps); fallback default for the per-leg values below.
     pub slippage_bps: u64,
+    /// Buy-leg slippage (bps). Kept tight-ish: a buy that would fill worse than this is
+    /// simply skipped — no harm in missing a bad entry.
+    pub buy_slippage_bps: u64,
+    /// Sell-leg slippage (bps). Kept LOOSE on purpose: an emergency/dump exit must not be
+    /// REJECTED for exceeding slippage — being stuck in a collapsing token is worse than a
+    /// bad fill. Defaults higher than the buy leg.
+    pub sell_slippage_bps: u64,
     /// Allow buying a token again (after the exit cooldown) if it re-pumps.
     pub allow_reentry: bool,
     /// Seconds to wait after an exit before the same token may be re-entered.
@@ -580,6 +588,8 @@ impl MomentumConfig {
             scale_out_targets,
             scale_out_fractions,
             slippage_bps: env_u64("MOMENTUM_SLIPPAGE_BPS", 1000),
+            buy_slippage_bps: env_u64("MOMENTUM_BUY_SLIPPAGE_BPS", env_u64("MOMENTUM_SLIPPAGE_BPS", 1000)),
+            sell_slippage_bps: env_u64("MOMENTUM_SELL_SLIPPAGE_BPS", env_u64("MOMENTUM_SLIPPAGE_BPS", 1000).max(2500)),
             allow_reentry: std::env::var("MOMENTUM_ALLOW_REENTRY")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
@@ -785,6 +795,10 @@ impl MomentumConfig {
                 self.max_deployed_sol, self.buy_cost_fraction * 100.0, self.landing,
             ));
         }
+        logger.log(format!(
+            "Slippage: buy {} bps / sell {} bps (sell looser so a dump exit is never blocked)",
+            self.buy_slippage_bps, self.sell_slippage_bps,
+        ));
         logger.log(format!(
             "Discipline: breaker at -{:.3} SOL daily loss or {} consecutive losses | {}{}",
             self.daily_loss_limit_sol, self.max_consecutive_losses,
@@ -2981,7 +2995,7 @@ async fn momentum_buy(
         swap_direction: SwapDirection::Buy,
         in_type: SwapInType::Qty,
         amount_in: amount_sol,
-        slippage: cfg.slippage_bps,
+        slippage: cfg.buy_slippage_bps,
     };
     let mut trade_info = parsed.clone();
     trade_info.dex_type = DexType::PumpFun;
@@ -3072,7 +3086,7 @@ async fn momentum_sell(
         swap_direction: SwapDirection::Sell,
         in_type: SwapInType::Pct,
         amount_in: fraction,
-        slippage: cfg.slippage_bps,
+        slippage: cfg.sell_slippage_bps,
     };
 
     let mut sell_trade_info = trade_info;
