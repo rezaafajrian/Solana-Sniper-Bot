@@ -232,6 +232,10 @@ pub struct MomentumConfig {
     /// Fast reaper: force-close a position whose token hasn't traded in this many
     /// seconds (a dead token) — clears zombies in minutes, not hours. 0 = off.
     pub stale_exit_secs: u64,
+    /// How often the exit monitor re-evaluates every open position (milliseconds). This
+    /// is the worst-case lag between a dump starting and the bot reacting, so it's the
+    /// dominant local exit latency — lower = faster dump escape. Floored at 200ms.
+    pub exit_poll_ms: u64,
     pub short_window_secs: u64,
     pub medium_window_secs: u64,
     pub min_buy_volume_sol: f64,
@@ -555,6 +559,7 @@ impl MomentumConfig {
             stagnation_min_pnl: env_f64("MOMENTUM_STAGNATION_MIN_PNL", 20.0),
             max_hold_secs: env_u64("MOMENTUM_MAX_HOLD_SECS", 10800),
             stale_exit_secs: env_u64("MOMENTUM_STALE_EXIT_SECS", 180),
+            exit_poll_ms: env_u64("MOMENTUM_EXIT_POLL_MS", 1000).max(200),
             short_window_secs: env_u64("MOMENTUM_SHORT_WINDOW_SECS", 30),
             medium_window_secs: env_u64("MOMENTUM_MEDIUM_WINDOW_SECS", 120),
             min_buy_volume_sol: env_f64("MOMENTUM_MIN_BUY_VOLUME_SOL", 2.0),
@@ -3649,7 +3654,9 @@ enum ExitAction {
 
 /// Background loop that evaluates every open position on a fixed cadence.
 async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, logger: Logger) {
-    let mut interval = time::interval(Duration::from_secs(3));
+    let mut interval = time::interval(Duration::from_millis(cfg.exit_poll_ms));
+    // Keep the PnL log / cleanup cadence at roughly 60s regardless of poll speed.
+    let log_every = (60_000 / cfg.exit_poll_ms.max(1)).max(1);
     let mut ticks: u64 = 0;
     while MOMENTUM_RUNNING.load(Ordering::SeqCst) {
         interval.tick().await;
@@ -3661,12 +3668,12 @@ async fn run_exit_monitor(app_state: Arc<AppState>, cfg: Arc<MomentumConfig>, lo
             evaluate_position(mint, app_state.clone(), cfg.clone(), logger.clone()).await;
         }
 
-        // Refresh the live dashboard snapshot every tick (~3s).
+        // Refresh the live dashboard snapshot every poll tick.
         write_status_snapshot(&cfg);
 
         // Live PnL summary + stale-state cleanup roughly every 60s.
         ticks += 1;
-        if ticks % 20 == 0 {
+        if ticks % log_every == 0 {
             let (realized, buys, sells) = PNL_TALLY.lock().map(|g| *g).unwrap_or((0.0, 0, 0));
             let status = if trading_halted() { " | 🛑 HALTED" } else { "" };
             logger.log(format!(
