@@ -76,7 +76,10 @@ impl GmgnConfig {
             security_cache_secs: std::env::var("GMGN_SECURITY_CACHE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
             max_rug_ratio: std::env::var("GMGN_MAX_RUG_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3),
             max_top10_holder_rate: std::env::var("GMGN_MAX_TOP10_HOLDER_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
-            max_bundle_rate: std::env::var("GMGN_MAX_BUNDLE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            // On by default: reject tokens with >20% bundled/sniped supply (the funded
+            // bundler-cluster fake-pump trap). Only active when GMGN is enabled with a key,
+            // and fails open on unknown tokens, so it never stalls fresh entries.
+            max_bundle_rate: std::env::var("GMGN_MAX_BUNDLE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.20),
             veto_on_unknown: std::env::var("GMGN_VETO_ON_UNKNOWN").map(|v| v.to_lowercase() == "true").unwrap_or(false),
         }
     }

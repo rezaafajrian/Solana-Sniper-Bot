@@ -112,6 +112,8 @@ echo
 echo "   Then analyze:"
 echo "     python3 scripts/analyze_momentum.py momentum_trades.csv"
 echo
-echo "   NOTE: GMGN holder/bundle veto stays OFF (needs an API key). The free"
-echo "   stream concentration veto covers anti-dump. All filters reduce trade"
-echo "   count — if too few entries, lower MOMENTUM_MIN_BASE_SCORE / loosen vetoes."
+echo "   NOTE: the GMGN bundle veto is now ON BY DEFAULT (rejects >20% bundled"
+echo "   supply) — but it only arms once you set GMGN_ENABLED=true + GMGN_API_KEY"
+echo "   (rotate the leaked key first). Without a key it's inert. The free stream"
+echo "   concentration + creator-self-buy discount cover anti-fake meanwhile."
+echo "   All filters reduce trade count — if too few entries, loosen vetoes."
