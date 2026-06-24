@@ -8,4 +8,7 @@
 #   0 9 * * * cd /opt/solbot/Solana-Sniper-Bot && ./scripts/daily_report.sh >> reports/cron.log 2>&1
 set -e
 cd "$(dirname "$0")/.."
+# 1. Daily self-learning report (entries, exits, edge, OOS-validated recs) + Telegram.
 python3 scripts/learn.py momentum_decisions --report-dir reports --telegram "$@"
+# 2. Runner DNA research layer (studies the 10x+ winners, refines the knowledge base).
+python3 scripts/runner_research.py momentum_decisions --report-dir reports || true
