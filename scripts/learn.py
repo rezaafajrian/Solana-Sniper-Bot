@@ -17,8 +17,51 @@ Usage:
   python3 scripts/learn.py --period weekly       # daily (default) or weekly buckets
 """
 
-import csv, os, sys, math, argparse, datetime as dt
+import csv, os, sys, math, argparse, datetime as dt, json, urllib.request
 from collections import defaultdict
+
+
+class Tee:
+    """Write everything printed to both the console and a report file."""
+    def __init__(self, path):
+        self.f = open(path, "w")
+        self.stdout = sys.stdout
+    def write(self, s):
+        self.stdout.write(s)
+        self.f.write(s)
+    def flush(self):
+        self.stdout.flush()
+        self.f.flush()
+
+
+def _env(key):
+    """Read a key from process env, falling back to a local .env file."""
+    v = os.environ.get(key)
+    if v:
+        return v
+    try:
+        for line in open(".env"):
+            line = line.strip()
+            if line.startswith(f"{key}=") and not line.startswith("#"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def telegram_send(text):
+    """Best-effort push of the synthesis to Telegram (no-op if creds absent)."""
+    token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return False
+    try:
+        data = json.dumps({"chat_id": chat, "text": text[:3900], "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
+                                     data=data, headers={"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
 
 NUM_FEATURES = [
     "creator_buy", "creator_score", "wallet_score", "insider_score",
@@ -182,8 +225,19 @@ def main():
                     help="fraction of most-recent data held out for out-of-sample validation")
     ap.add_argument("--emit-config", action="store_true",
                     help="print validated recommendations as MOMENTUM_* env overrides")
+    ap.add_argument("--report-dir", default=None,
+                    help="also save the full report to <dir>/learn_<date>.txt")
+    ap.add_argument("--telegram", action="store_true",
+                    help="push the executive synthesis to Telegram (uses .env creds)")
     args = ap.parse_args()
     config_lines = []  # populated by validated recommendations for --emit-config
+    synth = {"strengths": [], "weaknesses": [], "risks": [], "hidden": [],
+             "missed": [], "hypotheses": []}  # the daily improvement report
+
+    if args.report_dir:
+        os.makedirs(args.report_dir, exist_ok=True)
+        rpath = os.path.join(args.report_dir, f"learn_{dt.date.today().isoformat()}.txt")
+        sys.stdout = Tee(rpath)
 
     decisions, outcomes, dec_path, out_path = load(args.base)
     if not decisions:
@@ -214,6 +268,13 @@ def main():
     losers = [r for r in rows if is_loser(r)]
     bought = [r for r in rows if r.get("decision") == "BUY"]
     rejected = [r for r in rows if r.get("decision") == "REJECT"]
+
+    # Aggregates the executive synthesis reads (always defined; sections fill them).
+    cat_pnl, caps = {}, []
+    realized_total = payoff = runner_capture = float("nan")
+    exit_winrate = float("nan")
+    max_dd = 0.0
+    clusters, rug_creators, dumper_clusters = {}, [], 0
 
     # ---- 5. Headline ----
     section("1. HEADLINE")
@@ -434,13 +495,22 @@ def main():
         for c, d in sorted(cat_pnl.items(), key=lambda x: -x[1]["sol"]):
             avg = d["sol"] / d["n"] if d["n"] else 0.0
             print(f"  {c:30} {d['n']:>6} {d['sol']:>+13.4f} {avg:>+9.4f}")
+        realized_total = total
+        # max drawdown of the realized equity curve (risk factor).
+        cum = peak = 0.0
+        for _m, pnl, _r in realized_rows(trade_rows):
+            cum += pnl
+            peak = max(peak, cum)
+            max_dd = min(max_dd, cum - peak)
         # win/loss asymmetry from whole-token realized PnL
         wins = [p for p in per_token.values() if p > 0]
         losses = [p for p in per_token.values() if p < 0]
         if per_token:
-            print(f"  win rate {pct(len(wins), len(per_token)):.1f}% | avg win {mean(wins) if wins else 0:+.4f} "
-                  f"| avg loss {mean(losses) if losses else 0:+.4f} | "
-                  f"payoff {abs(mean(wins)/mean(losses)) if (wins and losses and mean(losses)) else float('nan'):.2f}x")
+            exit_winrate = pct(len(wins), len(per_token))
+            payoff = abs(mean(wins) / mean(losses)) if (wins and losses and mean(losses)) else float("nan")
+            print(f"  win rate {exit_winrate:.1f}% | avg win {mean(wins) if wins else 0:+.4f} "
+                  f"| avg loss {mean(losses) if losses else 0:+.4f} | payoff {payoff:.2f}x | "
+                  f"max drawdown {max_dd:+.4f} SOL")
         # "Left on the table": of real runners, how much of the peak did we capture?
         caps = []
         for mint, ex_pp in best_exit_pct.items():
@@ -451,7 +521,8 @@ def main():
             if not math.isnan(avail) and avail >= 0.5:  # a real runner (>=1.5x peak)
                 caps.append(max(0.0, min(1.5, (ex_pp / 100.0) / avail)))
         if caps:
-            print(f"  runner capture: you exited at avg {mean(caps)*100:.0f}% of the peak move "
+            runner_capture = mean(caps) * 100
+            print(f"  runner capture: you exited at avg {runner_capture:.0f}% of the peak move "
                   f"(over {len(caps)} runners). Low % = selling winners too early.")
         # exit-tuning hint
         bleed = [(c, d["sol"]) for c, d in cat_pnl.items() if d["sol"] < 0]
@@ -485,6 +556,8 @@ def main():
                 avg_roi = roi / samp if samp else 0.0
                 made = sum(wi(m, "rugs_created") for m in members)
                 verdict = "DUMPER" if (made > 0 or avg_roi <= -0.2) else ("ok" if avg_roi > 0.1 else "watch")
+                if verdict == "DUMPER":
+                    dumper_clusters += 1
                 crows.append((n, cid, avg_roi, made, verdict))
             for n, cid, avg_roi, made, verdict in sorted(crows, reverse=True)[:10]:
                 print(f"  #{cid:<7} {n:>8} {avg_roi*100:>7.0f}% {made:>9}  {verdict}")
@@ -595,12 +668,114 @@ def main():
         else:
             print("  # nothing validated out-of-sample yet — no config changes recommended.")
 
+    # ===================================================================
+    #  EXECUTIVE SYNTHESIS — the daily improvement report
+    # ===================================================================
+    # STRENGTHS — what's working.
+    if sig_ev:
+        bev, bsig, bn = sig_ev[0]
+        if bev > 0:
+            synth["strengths"].append(f"Best edge: '{bsig}' signal, EV {bev:+.3f}/token over {bn}.")
+    best_exit = max(cat_pnl.items(), key=lambda x: x[1]["sol"], default=None)
+    if best_exit and best_exit[1]["sol"] > 0:
+        synth["strengths"].append(f"Top exit: {best_exit[0]} earned {best_exit[1]['sol']:+.3f} SOL.")
+    if not math.isnan(payoff) and payoff >= 2.0:
+        synth["strengths"].append(f"Healthy asymmetry: payoff ratio {payoff:.1f}x (wins pay >> losses cost).")
+    for lift, k, cut, ev in ev_recs[:2]:
+        synth["strengths"].append(f"OOS-validated gate: {k} >= {cut:.2f} (+{lift:.3f}/token, held out-of-sample).")
+
+    # WEAKNESSES — what's failing.
+    if sig_ev:
+        wev, wsig, wn = sig_ev[-1]
+        if wev < 0:
+            synth["weaknesses"].append(f"Losing edge: '{wsig}' is EV-negative ({wev:+.3f} over {wn}).")
+    for c, d in cat_pnl.items():
+        if d["sol"] < -0.01:
+            synth["weaknesses"].append(f"Bleeding exit: {c} net {d['sol']:+.3f} SOL.")
+    if not math.isnan(runner_capture) and runner_capture < 40:
+        synth["weaknesses"].append(f"Selling winners early: capturing only {runner_capture:.0f}% of runner peaks "
+                                   "— loosen the trailing stop / push scale-out targets higher.")
+    if not math.isnan(ws) and not math.isnan(ls) and abs(ws - ls) < 3:
+        synth["weaknesses"].append(f"Entry score near-noise (winners {ws:.0f} vs losers {ls:.0f}) — edge is in exits/structure.")
+
+    # RISK FACTORS.
+    if max_dd < -0.001:
+        synth["risks"].append(f"Max realized drawdown {max_dd:+.3f} SOL — size so this is survivable.")
+    rug_rate = pct(len(rugs), len(rows))
+    if rug_rate > 0:
+        synth["risks"].append(f"Rug rate {rug_rate:.0f}% of labeled tokens — anti-rug stack is load-bearing.")
+    if dumper_clusters > 0:
+        synth["risks"].append(f"{dumper_clusters} dumper/bundler cluster(s) active — the cluster veto is earning its keep.")
+    if rug_creators:
+        synth["risks"].append(f"{len(rug_creators)} known rug-creator wallet(s) seen — keep the creator blacklist on.")
+
+    # HIDDEN PATTERNS — what precedes the big winners / discriminates.
+    if len(moon) >= 3 and feats_ranked:
+        top = [k for _, k, _, _, _ in feats_ranked[:3]]
+        synth["hidden"].append(f"Moonshots ({len(moon)}) skew on: {', '.join(top)} — candidate predictive features.")
+    if feats_ranked and feats_ranked[0][0] > 0.25:
+        _, k, wm, lm, _ = feats_ranked[0]
+        synth["hidden"].append(f"'{k}' separates winners ({wm:.2f}) from losers ({lm:.2f}) — weight it more.")
+
+    # MISSED OPPORTUNITIES.
+    for reason, d in sorted(by_reason.items(), key=lambda x: -x[1]["big"]):
+        if d["n"] >= 8 and pct(d["big"], d["n"]) >= 25:
+            synth["missed"].append(f"Filter '{reason}' tossed {d['n']} tokens, {pct(d['big'],d['n']):.0f}% hit 2x+ — it leaks winners.")
+            break
+    if not math.isnan(runner_capture) and runner_capture < 60:
+        synth["missed"].append(f"~{100-runner_capture:.0f}% of runner upside left on the table — exit timing is the biggest lever.")
+
+    # HYPOTHESES TO TEST — the continuous research engine.
+    decay_up = []  # signals trending up are worth requiring/boosting
+    for sig in sorted({(r.get("signal") or "?") for r in rows}):
+        es = [f(r, "o_final_return") for r in early if (r.get('signal') or '?') == sig and not math.isnan(f(r, "o_final_return"))]
+        rs = [f(r, "o_final_return") for r in recent if (r.get('signal') or '?') == sig and not math.isnan(f(r, "o_final_return"))]
+        if len(es) >= 4 and len(rs) >= 4 and mean(rs) > mean(es) + 0.1 and mean(rs) > 0:
+            decay_up.append(sig)
+    for sig in decay_up:
+        synth["hypotheses"].append(f"'{sig}' EV is rising — hypothesis: requiring/boosting it lifts win rate. A/B it.")
+    for lift, k, cut, ev in ev_recs[:2]:
+        synth["hypotheses"].append(f"Gate {k} >= {cut:.2f} (OOS-validated) — apply and measure win-rate delta.")
+    if not math.isnan(runner_capture) and runner_capture < 50:
+        synth["hypotheses"].append("Widen trailing-stop giveback (e.g. 0.35→0.45) — hypothesis: captures more of each runner.")
+    # near-miss features worth turning into new filters
+    for _, k, wm, lm, gap in feats_ranked[:5]:
+        if 0.15 <= abs(gap) <= 0.25:
+            synth["hypotheses"].append(f"'{k}' weakly discriminates (gap {gap:+.0%}) — test it as a soft score input / combo filter.")
+    if dumper_clusters > 0:
+        synth["hypotheses"].append("Test the inverse of the cluster veto: BOOST size when a CLEAN proven cluster is accumulating.")
+    if not synth["hypotheses"]:
+        synth["hypotheses"].append("Not enough signal yet — keep accumulating labeled outcomes, then re-run.")
+
+    section("★ EXECUTIVE SYNTHESIS — what to improve next")
+    titles = [("strengths", "✅ STRENGTHS (working)"), ("weaknesses", "❌ WEAKNESSES (failing)"),
+              ("risks", "⚠️  RISK FACTORS"), ("hidden", "🔍 HIDDEN PATTERNS"),
+              ("missed", "💸 MISSED OPPORTUNITIES"), ("hypotheses", "🧪 HYPOTHESES TO TEST NEXT")]
+    synth_lines = [f"📊 Daily report {dt.date.today().isoformat()} — {len(rows)} labeled tokens, "
+                   f"{pct(len(winners), len(winners)+len(losers)):.0f}% win rate"]
+    for key, title in titles:
+        items = synth[key] or ["(nothing flagged this period)"]
+        print(f"\n  {title}")
+        for it in items:
+            print(f"    • {it}")
+        # compact lines for the Telegram push (skip empty buckets)
+        if synth[key]:
+            synth_lines.append(f"\n{title}")
+            synth_lines.extend(f"• {it}" for it in synth[key][:4])
+
     print()
     hr()
     print("  Method: thresholds are fit on older data and validated on a held-out recent")
     print("  window (section 7) — only edges that survive OOS are recommended. Exit edge")
     print("  (section 10) is from REAL realized PnL. Still: A/B one change at a time.")
     hr()
+
+    if args.report_dir and isinstance(sys.stdout, Tee):
+        sys.stdout.flush()
+        print(f"\n  report saved → {os.path.join(args.report_dir, f'learn_{dt.date.today().isoformat()}.txt')}")
+    if args.telegram:
+        ok = telegram_send("\n".join(synth_lines))
+        print(f"  telegram: {'sent ✅' if ok else 'not configured / failed'}")
 
 
 if __name__ == "__main__":

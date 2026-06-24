@@ -46,3 +46,6 @@ momentum_decisions_pending.json.tmp
 pump_scanner_observations.csv
 momentum_avoidance.csv
 momentum_avoidance.csv.tmp
+
+# Generated daily learning reports
+reports/

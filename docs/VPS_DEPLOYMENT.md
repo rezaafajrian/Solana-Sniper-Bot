@@ -182,3 +182,17 @@ pings you — it does NOT crash or get stuck.
 
 - **gRPC feed** — for lowest latency set `MOMENTUM_FEED=grpc` + a Yellowstone endpoint
   (the default; the ws feed is the no-gRPC fallback).
+
+## 10. Daily self-learning report (every 24h)
+
+`scripts/daily_report.sh` runs `learn.py` over all accumulated data, saves a timestamped
+report to `reports/learn_<date>.txt`, and pushes the **executive synthesis** (strengths,
+weaknesses, risk factors, hidden patterns, missed opportunities, and hypotheses to test)
+to Telegram. Schedule it every 24h with cron (as the `solbot` user — `crontab -e`):
+```
+0 9 * * * cd /opt/solbot/Solana-Sniper-Bot && ./scripts/daily_report.sh >> reports/cron.log 2>&1
+```
+Run it any time by hand: `./scripts/daily_report.sh`. (Telegram push needs
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` in `.env`; without them it just saves the file.)
+The report is most useful once outcomes have matured — give the bot a couple of days of
+continuous running so there's enough labeled data for the out-of-sample validation.
