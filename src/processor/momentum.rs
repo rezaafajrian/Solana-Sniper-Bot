@@ -253,6 +253,21 @@ pub struct MomentumConfig {
     /// before the momentum score is discounted — kills "fake pump" from creator/bundler
     /// self-buying so it can't clear the entry gate. Above this, score is cut toward 0.
     pub max_creator_buy_frac: f64,
+    // ---- Structure gate: every entry must have REAL structure, not just a momentum
+    //      number. The existing vetoes remove BAD structure (concentrated/insider/bundled/
+    //      honeypot); this requires GOOD structure (genuine, broad, organic demand) so the
+    //      bot stops buying manufactured coin-flips even when their momentum score is high. ----
+    /// Master switch for the structure gate.
+    pub require_structure: bool,
+    /// Minimum genuine-demand factor (0..1: buyer diversity × anti-wash × anti-creator-buy)
+    /// an entry must clear. Filters manufactured / washed / creator-faked pumps.
+    pub struct_min_genuine: f64,
+    /// Minimum DISTINCT real buyers in the short window — a real move has a crowd, a fake
+    /// one has 1–2 wallets cycling. Raise for stricter (fewer, higher-quality) entries.
+    pub struct_min_buyers: usize,
+    /// Minimum bonding-curve liquidity (SOL) for an entry to be considered exitable.
+    /// 0 disables (liquidity-aware sizing caps already bound exposure).
+    pub struct_min_liq_sol: f64,
     // ---- Anti-dump: stream-based concentration veto (no API, works on fresh tokens) ----
     /// Reject entry if the top-N traders hold more than this share of the net
     /// trader-held float (a free proxy for holder concentration). 0 disables.
@@ -578,6 +593,10 @@ impl MomentumConfig {
             min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
             max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
             max_creator_buy_frac: env_f64("MOMENTUM_MAX_CREATOR_BUY_FRAC", 0.15),
+            require_structure: std::env::var("MOMENTUM_REQUIRE_STRUCTURE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            struct_min_genuine: env_f64("MOMENTUM_STRUCT_MIN_GENUINE", 0.55),
+            struct_min_buyers: env_usize("MOMENTUM_STRUCT_MIN_BUYERS", 4),
+            struct_min_liq_sol: env_f64("MOMENTUM_STRUCT_MIN_LIQ_SOL", 0.0),
             max_top_holder_share: env_f64("MOMENTUM_MAX_TOP_HOLDER_SHARE", 0.0),
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
@@ -740,6 +759,15 @@ impl MomentumConfig {
             "Anti-fake: min buyer diversity {:.2}, max wash fraction {:.2}, max creator buy-share {:.2}",
             self.min_buyer_diversity, self.max_wash_fraction, self.max_creator_buy_frac,
         ));
+        if self.require_structure {
+            logger.log(format!(
+                "🧱 Structure gate ON: every entry needs genuine ≥ {:.2}, ≥ {} distinct buyers{} (no coin-flips)",
+                self.struct_min_genuine, self.struct_min_buyers,
+                if self.struct_min_liq_sol > 0.0 { format!(", ≥ {:.2} SOL liq", self.struct_min_liq_sol) } else { String::new() },
+            ));
+        } else {
+            logger.log("Structure gate OFF (MOMENTUM_REQUIRE_STRUCTURE=false)".to_string());
+        }
         let runner = (1.0 - self.scale_out_fractions.iter().sum::<f64>()).max(0.0);
         let rungs: Vec<String> = self.scale_out_targets.iter().zip(self.scale_out_fractions.iter())
             .map(|(t, f)| format!("+{:.0}%→sell {:.0}%", t, f * 100.0)).collect();
@@ -2564,6 +2592,28 @@ fn tracked_wallet_sell_since(mint: &str, tracked: &HashSet<String>, since_ts: u6
         .unwrap_or((0.0, since_ts))
 }
 
+/// Structure gate: require POSITIVE demand structure, not just a momentum number. The
+/// other vetoes reject *bad* structure (concentration/insider/bundle/honeypot); this
+/// requires *good* structure — genuine (unmanufactured) demand from a real crowd of
+/// distinct buyers, in a token deep enough to exit. Returns Some(reason) to reject.
+/// This is what stops the bot buying coin-flips: a high momentum score with thin/fake
+/// structure (the score-100 rug) no longer qualifies.
+fn structure_gate(signal: &MomentumSignal, mint: &str, cfg: &MomentumConfig) -> Option<String> {
+    if signal.genuine_factor < cfg.struct_min_genuine {
+        return Some(format!("manufactured demand (genuine {:.2} < {:.2})", signal.genuine_factor, cfg.struct_min_genuine));
+    }
+    if signal.unique_buyers_short < cfg.struct_min_buyers {
+        return Some(format!("too few real buyers ({} < {})", signal.unique_buyers_short, cfg.struct_min_buyers));
+    }
+    if cfg.struct_min_liq_sol > 0.0 {
+        let liq = TOKEN_STATE.get(mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+        if liq < cfg.struct_min_liq_sol {
+            return Some(format!("thin liquidity ({:.2} < {:.2} SOL — hard to exit)", liq, cfg.struct_min_liq_sol));
+        }
+    }
+    None
+}
+
 async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<MomentumConfig>, sniper: Arc<SniperConfig>, logger: Logger) {
     // Discipline: if the circuit breaker has tripped, take no new entries.
     if trading_halted() {
@@ -2701,6 +2751,17 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         logger.log(format!("🛑 Insider-distribution veto {} — {}", mint, reason).yellow().to_string());
         record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("insider-distribution: {}", reason));
         return;
+    }
+
+    // Structure gate: require GENUINE, broad demand — not just a high momentum number.
+    // This is the "every coin must have structure, not a coin flip" rule: a manufactured
+    // or thinly-traded pump is rejected here even if its score cleared the bar.
+    if cfg.require_structure && !watch_buy {
+        if let Some(reason) = structure_gate(&signal, &mint, &cfg) {
+            logger.log(format!("🧱 Structure gate {} — {}", mint, reason).yellow().to_string());
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("structure: {}", reason));
+            return;
+        }
     }
 
     // GMGN security veto: skip honeypots / high rug_ratio before committing capital.
@@ -4240,6 +4301,36 @@ mod tests {
         for i in 0..10 { ticks.push(tick(991, false, 3.0, &format!("s{i}"), 1100.0)); }
         let with_sells = score_token(&state(ticks, Some("C")), &cfg, now).score;
         assert!(with_sells < buys_only, "heavy selling must suppress: {with_sells} !< {buys_only}");
+    }
+
+    // ---- structure gate: every entry needs real structure, not a coin flip ----
+    #[test]
+    fn structure_gate_rejects_manufactured_demand() {
+        let cfg = test_cfg(); // struct_min_genuine 0.55, struct_min_buyers default
+        let mut sig = MomentumSignal::default();
+        sig.genuine_factor = 0.2; // washed / creator-faked pump
+        sig.unique_buyers_short = 20;
+        assert!(structure_gate(&sig, "M", &cfg).is_some(), "fake-demand pump must be rejected");
+    }
+    #[test]
+    fn structure_gate_rejects_thin_crowd() {
+        let mut cfg = test_cfg();
+        cfg.struct_min_buyers = 4;
+        let mut sig = MomentumSignal::default();
+        sig.genuine_factor = 1.0;
+        sig.unique_buyers_short = 2; // only 2 wallets — a coin flip, not a crowd
+        assert!(structure_gate(&sig, "M", &cfg).is_some(), "2-wallet pump must be rejected");
+    }
+    #[test]
+    fn structure_gate_passes_genuine_broad_demand() {
+        let mut cfg = test_cfg();
+        cfg.struct_min_buyers = 4;
+        cfg.struct_min_genuine = 0.55;
+        cfg.struct_min_liq_sol = 0.0;
+        let mut sig = MomentumSignal::default();
+        sig.genuine_factor = 0.9;
+        sig.unique_buyers_short = 12; // real crowd, organic demand
+        assert!(structure_gate(&sig, "M", &cfg).is_none(), "genuine broad demand must pass");
     }
 
     // ---- slow-rug cumulative accumulator (no double counting) ------------
