@@ -99,11 +99,91 @@ def section(t):
     print("-" * len(t))
 
 
+# ---------------------------------------------------------------------------
+# Exit analysis (realized trades) — the half where the edge actually lives.
+# ---------------------------------------------------------------------------
+def categorize(reason):
+    r = (reason or "").lower()
+    if "insider" in r or "leader" in r: return "insider/leader-dump exit"
+    if "slow-rug" in r: return "slow-rug exit"
+    if "hard stop" in r: return "hard stop"
+    if "trailing" in r: return "trailing stop (let it run)"
+    if "stagnation" in r: return "stagnation stop (dead token)"
+    if "max hold" in r or "zombie" in r: return "max-hold reap"
+    if "collapse" in r: return "momentum collapse"
+    if "scale-out" in r: return "scale-out (profit)"
+    if "migration" in r: return "migration exit"
+    return "other"
+
+
+def load_trades(path):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def realized_rows(rows):
+    """Yield (mint, realized_sol, row) once per sell, preferring on-chain actuals."""
+    actual_sigs = {r.get("signature") for r in rows if r.get("event") == "SELL_ACTUAL"}
+    for r in rows:
+        ev = r.get("event")
+        if ev == "SELL_ACTUAL":
+            yield r.get("mint"), f(r, "est_realized_pnl_sol"), r
+        elif ev in ("SELL_PARTIAL", "SELL_FULL"):
+            sig = r.get("signature")
+            if sig in actual_sigs and sig not in ("", "DRY_RUN"):
+                continue
+            yield r.get("mint"), f(r, "est_realized_pnl_sol"), r
+
+
+# ---------------------------------------------------------------------------
+# Statistics: significance + out-of-sample splitting (anti-overfitting).
+# ---------------------------------------------------------------------------
+def z_prop(w1, n1, w2, n2):
+    """Two-proportion z-score (absolute) for a win-rate difference. >1.96 ~ p<0.05."""
+    if n1 < 1 or n2 < 1:
+        return 0.0
+    p1, p2 = w1 / n1, w2 / n2
+    p = (w1 + w2) / (n1 + n2)
+    se = math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
+    return abs(p1 - p2) / se if se > 0 else 0.0
+
+
+def sig_stars(z):
+    return "***" if z >= 2.58 else "**" if z >= 1.96 else "*" if z >= 1.64 else ""
+
+
+def row_time(r):
+    """Sortable timestamp for a joined row (decision ISO, else detect_ts)."""
+    ts = r.get("timestamp") or ""
+    if ts:
+        return ts
+    d = f(r, "o_detect_ts")
+    return "" if math.isnan(d) else f"{int(d):012d}"
+
+
+def time_split(rows, test_frac):
+    """Oldest (1-test_frac) = train, most-recent test_frac = test (out-of-sample)."""
+    ordered = sorted(rows, key=row_time)
+    cut = int(len(ordered) * (1 - test_frac))
+    return ordered[:cut], ordered[cut:]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("base", nargs="?", default="momentum_decisions")
     ap.add_argument("--period", choices=["daily", "weekly"], default="daily")
+    ap.add_argument("--trades", default="momentum_trades.csv",
+                    help="realized-trades log, for exit analysis (the edge lives here)")
+    ap.add_argument("--rep", default="momentum_wallet_rep.csv",
+                    help="wallet reputation file, for counterparty intelligence")
+    ap.add_argument("--test-frac", type=float, default=0.30,
+                    help="fraction of most-recent data held out for out-of-sample validation")
+    ap.add_argument("--emit-config", action="store_true",
+                    help="print validated recommendations as MOMENTUM_* env overrides")
     args = ap.parse_args()
+    config_lines = []  # populated by validated recommendations for --emit-config
 
     decisions, outcomes, dec_path, out_path = load(args.base)
     if not decisions:
@@ -260,33 +340,52 @@ def main():
         print("  evaluations recorded). It populates on the next run.")
 
     # ---- EV-optimal thresholds: the settings that MAXIMIZE expected value ----
-    section("7. EV-OPTIMAL THRESHOLDS (the cutoff that maximizes avg return)")
+    section("7. EV-OPTIMAL THRESHOLDS — OUT-OF-SAMPLE VALIDATED (no overfitting)")
     fr = lambda r: f(r, "o_final_return")
     ev_all = mean([fr(r) for r in rows if not math.isnan(fr(r))])
-    print(f"  baseline EV (avg final return, all entries): {ev_all:+.3f}  over {len(rows)} tokens")
-    print(f"  {'feature':22} {'best cutoff':>11} {'EV>=cut':>9} {'kept':>6} {'lift':>8}")
-    ev_recs = []
-    for k in NUM_FEATURES:
-        vals = sorted(f(r, k) for r in rows if not math.isnan(f(r, k)))
-        if len(vals) < 15:
-            continue
-        best = None  # (ev, cutoff, kept_n)
-        # sweep candidate cutoffs across the feature's range (deciles)
-        for q in range(1, 10):
-            cut = vals[int(len(vals) * q / 10)]
-            kept = [r for r in rows if not math.isnan(f(r, k)) and f(r, k) >= cut]
-            if len(kept) < max(8, len(rows) // 10):
+    train, test = time_split(rows, args.test_frac)
+    ev_train = mean([fr(r) for r in train if not math.isnan(fr(r))])
+    ev_test = mean([fr(r) for r in test if not math.isnan(fr(r))])
+    print(f"  baseline EV (all): {ev_all:+.3f} over {len(rows)} | train {len(train)} ({ev_train:+.3f}) "
+          f"/ test {len(test)} ({ev_test:+.3f})")
+    ev_recs = []  # only OOS-validated recommendations land here
+    if len(train) < 20 or len(test) < 10:
+        print("  not enough data to split train/test yet — gather more labeled outcomes.")
+        print("  (until then, threshold mining would just overfit; nothing reported.)")
+    else:
+        print(f"  {'feature':20} {'cutoff':>8} {'EV train':>9} {'EV test':>9} {'test lift':>9}  OOS")
+        for k in NUM_FEATURES:
+            tv = sorted(f(r, k) for r in train if not math.isnan(f(r, k)))
+            if len(tv) < 15:
                 continue
-            ev = mean([fr(r) for r in kept if not math.isnan(fr(r))])
-            if best is None or ev > best[0]:
-                best = (ev, cut, len(kept))
-        if best and best[0] - ev_all > 0.05:  # only show meaningful EV lift
-            lift = best[0] - ev_all
-            print(f"  {k:22} {best[1]:>11.3f} {best[0]:>+8.3f} {best[2]:>6} {lift:>+7.3f}")
-            ev_recs.append((lift, k, best[1], best[0]))
+            # Fit the best cutoff ON TRAIN ONLY.
+            best = None  # (ev_train, cutoff, kept_train)
+            for q in range(1, 10):
+                cut = tv[int(len(tv) * q / 10)]
+                kept = [r for r in train if not math.isnan(f(r, k)) and f(r, k) >= cut]
+                if len(kept) < max(8, len(train) // 10):
+                    continue
+                ev = mean([fr(r) for r in kept if not math.isnan(fr(r))])
+                if best is None or ev > best[0]:
+                    best = (ev, cut, len(kept))
+            if not best:
+                continue
+            # Validate that SAME cutoff on the held-out TEST window.
+            kept_test = [r for r in test if not math.isnan(f(r, k)) and f(r, k) >= best[1]]
+            if len(kept_test) < 5:
+                continue
+            ev_test_cut = mean([fr(r) for r in kept_test if not math.isnan(fr(r))])
+            train_lift = best[0] - ev_train
+            test_lift = ev_test_cut - ev_test
+            holds = train_lift > 0.05 and test_lift > 0.0  # must work out-of-sample
+            if train_lift > 0.05:
+                flag = "✓ holds" if holds else "✗ overfit"
+                print(f"  {k:20} {best[1]:>8.2f} {best[0]:>+8.3f} {ev_test_cut:>+8.3f} {test_lift:>+8.3f}  {flag}")
+                if holds:
+                    ev_recs.append((test_lift, k, best[1], ev_test_cut))
     if not ev_recs:
-        print("  no single-feature cutoff beats the baseline by >0.05 yet (need more data,")
-        print("  or the edge is multi-feature / in the exits, not the entry filter).")
+        print("  → no threshold survives out-of-sample yet. The honest read: the entry edge")
+        print("    is weak/in-the-exits (see section 10), not in a single feature cutoff.")
 
     # ---- Moonshot attribution: which signals catch the 5x+? ----
     section("8. MOONSHOT ATTRIBUTION (what precedes the 5x+ winners)")
@@ -311,6 +410,111 @@ def main():
     else:
         print("  not enough 5x+ tokens yet to fingerprint them — keep accumulating.")
 
+    # ---- 10. EXIT ANALYSIS (realized trades — where the edge actually lives) ----
+    trade_rows = load_trades(args.trades)
+    exit_recs = []
+    if trade_rows:
+        section("10. EXIT ANALYSIS (realized PnL by exit — the half that makes money)")
+        cat_pnl = defaultdict(lambda: {"n": 0, "sol": 0.0})
+        per_token = defaultdict(float)
+        best_exit_pct = {}  # mint -> best pnl_pct seen on a sell (capture analysis)
+        total = 0.0
+        for mint, pnl, row in realized_rows(trade_rows):
+            c = categorize(row.get("reason"))
+            cat_pnl[c]["n"] += 1
+            cat_pnl[c]["sol"] += pnl
+            per_token[mint] += pnl
+            total += pnl
+            pp = f(row, "pnl_pct")
+            if not math.isnan(pp):
+                best_exit_pct[mint] = max(best_exit_pct.get(mint, -1e9), pp)
+        print(f"  total realized: {total:+.4f} SOL over {len(per_token)} tokens "
+              f"({sum(c['n'] for c in cat_pnl.values())} sells)")
+        print(f"  {'exit reason':30} {'sells':>6} {'realized SOL':>13} {'avg/sell':>9}")
+        for c, d in sorted(cat_pnl.items(), key=lambda x: -x[1]["sol"]):
+            avg = d["sol"] / d["n"] if d["n"] else 0.0
+            print(f"  {c:30} {d['n']:>6} {d['sol']:>+13.4f} {avg:>+9.4f}")
+        # win/loss asymmetry from whole-token realized PnL
+        wins = [p for p in per_token.values() if p > 0]
+        losses = [p for p in per_token.values() if p < 0]
+        if per_token:
+            print(f"  win rate {pct(len(wins), len(per_token)):.1f}% | avg win {mean(wins) if wins else 0:+.4f} "
+                  f"| avg loss {mean(losses) if losses else 0:+.4f} | "
+                  f"payoff {abs(mean(wins)/mean(losses)) if (wins and losses and mean(losses)) else float('nan'):.2f}x")
+        # "Left on the table": of real runners, how much of the peak did we capture?
+        caps = []
+        for mint, ex_pp in best_exit_pct.items():
+            o = outcomes.get(mint)
+            if not o:
+                continue
+            avail = f({f"o_{k}": v for k, v in o.items()}, "o_max_return")  # peak multiple-1
+            if not math.isnan(avail) and avail >= 0.5:  # a real runner (>=1.5x peak)
+                caps.append(max(0.0, min(1.5, (ex_pp / 100.0) / avail)))
+        if caps:
+            print(f"  runner capture: you exited at avg {mean(caps)*100:.0f}% of the peak move "
+                  f"(over {len(caps)} runners). Low % = selling winners too early.")
+        # exit-tuning hint
+        bleed = [(c, d["sol"]) for c, d in cat_pnl.items() if d["sol"] < 0]
+        for c, sol in sorted(bleed, key=lambda x: x[1])[:2]:
+            exit_recs.append(f"Exit '{c}' is net-negative ({sol:+.3f} SOL) — review its trigger/threshold.")
+
+    # ---- 11. COUNTERPARTY INTELLIGENCE (from the wallet reputation file) ----
+    if os.path.exists(args.rep):
+        section("11. COUNTERPARTY INTELLIGENCE (wallets & coordinated clusters)")
+        wr = list(csv.DictReader(open(args.rep, newline="")))
+        def wi(r, k):
+            try: return int(float(r.get(k, "0") or "0"))
+            except ValueError: return 0
+        scored = [r for r in wr if wi(r, "samples") >= 5]
+        clusters = defaultdict(list)
+        for r in wr:
+            cid = wi(r, "cluster_id")
+            if cid > 0:
+                clusters[cid].append(r)
+        rug_creators = sorted([r for r in wr if wi(r, "rugs_created") > 0],
+                              key=lambda r: -wi(r, "rugs_created"))
+        print(f"  wallets tracked: {len(wr)} ({len(scored)} with >=5 trades) | "
+              f"coordinated clusters: {len(clusters)} | rug-creators: {len(rug_creators)}")
+        if clusters:
+            print(f"  {'cluster':>8} {'wallets':>8} {'avgROI':>8} {'rugsMade':>9}  verdict")
+            crows = []
+            for cid, members in clusters.items():
+                n = len(members)
+                samp = sum(wi(m, "samples") for m in members)
+                roi = sum(f(m, "roi_sum") for m in members if not math.isnan(f(m, "roi_sum")))
+                avg_roi = roi / samp if samp else 0.0
+                made = sum(wi(m, "rugs_created") for m in members)
+                verdict = "DUMPER" if (made > 0 or avg_roi <= -0.2) else ("ok" if avg_roi > 0.1 else "watch")
+                crows.append((n, cid, avg_roi, made, verdict))
+            for n, cid, avg_roi, made, verdict in sorted(crows, reverse=True)[:10]:
+                print(f"  #{cid:<7} {n:>8} {avg_roi*100:>7.0f}% {made:>9}  {verdict}")
+        if rug_creators:
+            print("  top rug-creators (blacklist their launches):")
+            for r in rug_creators[:5]:
+                print(f"    {r.get('wallet','')[:16]:16} created {wi(r,'rugs_created')} rug(s), "
+                      f"{wi(r,'samples')} trades")
+
+    # ---- 12. EDGE DECAY (is each signal's edge fading as others copy it?) ----
+    section("12. EDGE DECAY (per-signal EV: earlier half vs recent half)")
+    half = max(1, len(sorted(rows, key=row_time)) // 2)
+    ordr = sorted(rows, key=row_time)
+    early, recent = ordr[:half], ordr[half:]
+    sig_set = {(r.get("signal") or "?") for r in rows}
+    if len(recent) >= 10:
+        print(f"  {'signal':14} {'early EV':>9} {'recent EV':>10} {'trend':>8}")
+        for sig in sorted(sig_set):
+            es = [fr(r) for r in early if (r.get('signal') or '?') == sig and not math.isnan(fr(r))]
+            rs = [fr(r) for r in recent if (r.get('signal') or '?') == sig and not math.isnan(fr(r))]
+            if len(es) < 4 or len(rs) < 4:
+                continue
+            ee, re = mean(es), mean(rs)
+            trend = "↓ decay" if re < ee - 0.05 else ("↑ rising" if re > ee + 0.05 else "→ stable")
+            print(f"  {sig:14} {ee:>+8.3f} {re:>+9.3f} {trend:>8}")
+            if re < ee - 0.10 and re < 0:
+                exit_recs.append(f"Signal '{sig}' edge is decaying (EV {ee:+.3f}→{re:+.3f}) and now negative — it's being copied out; down-weight it.")
+    else:
+        print("  not enough recent data to measure decay yet.")
+
     # ---- 5. Recommendations ----
     section("9. RECOMMENDATIONS (data-driven, verify before trusting)")
     recs = []
@@ -331,11 +535,13 @@ def main():
         if wev < 0 and wsig != bsig:
             recs.append(f"Worst signal: '{wsig}' is EV-negative ({wev:+.3f} over {wn}). "
                         "Down-weight or stop entering on it alone.")
-    # EV-optimal threshold recommendations (the maximize lever)
+    # OOS-validated threshold recommendations (survived the held-out window).
     ev_recs.sort(reverse=True)
     for lift, k, cut, ev in ev_recs[:3]:
-        recs.append(f"Gating on {k} >= {cut:.2f} lifts avg return from {ev_all:+.3f} to {ev:+.3f} "
-                    f"(+{lift:.3f}/token). Strong EV-maximizing filter — A/B it.")
+        recs.append(f"Gating on {k} >= {cut:.2f} held up OUT-OF-SAMPLE (+{lift:.3f}/token on the "
+                    f"held-out window). This one isn't overfit — A/B it.")
+    # Exit + decay findings surfaced from sections 10/12.
+    recs.extend(exit_recs)
     # rug predictors
     rugs = [r for r in rows if label_of(r) == "RUG"]
     nonrugs = [r for r in rows if label_of(r) != "RUG"]
@@ -371,10 +577,29 @@ def main():
     for i, r in enumerate(recs, 1):
         print(f"  {i}. {r}")
 
+    # ---- machine-readable config from OOS-validated findings ----
+    for lift, k, cut, ev in ev_recs[:3]:
+        env = {
+            "overall_score": "MOMENTUM_ENTRY_SCORE",
+            "smart_wallet_count": "MOMENTUM_CONVERGENCE_MIN",
+            "liquidity": "MOMENTUM_STRUCT_MIN_LIQ_SOL",
+        }.get(k)
+        if env:
+            config_lines.append(f"{env}={cut:.2f}   # OOS-validated EV lift +{lift:.3f}/token on {k}")
+    if args.emit_config:
+        section("CONFIG OVERRIDES (only out-of-sample-validated knobs)")
+        if config_lines:
+            print("  # paste into .env, then A/B one at a time:")
+            for line in config_lines:
+                print(f"  {line}")
+        else:
+            print("  # nothing validated out-of-sample yet — no config changes recommended.")
+
     print()
     hr()
-    print("  Caveat: these are correlations on simulated outcomes. Treat every")
-    print("  recommendation as a hypothesis to A/B one at a time, not a fact.")
+    print("  Method: thresholds are fit on older data and validated on a held-out recent")
+    print("  window (section 7) — only edges that survive OOS are recommended. Exit edge")
+    print("  (section 10) is from REAL realized PnL. Still: A/B one change at a time.")
     hr()
 
 
