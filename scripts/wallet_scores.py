@@ -41,6 +41,23 @@ def score_wallet(row):
         return None
     recent = "".join(c for c in (row.get("recent", "") or "") if c in "01")
     lifetime_wr = wins / samples if samples else 0.0
+    # richer profile fields (default 0 for older rep files)
+    def _f(k):
+        try: return float(row.get(k, "0") or "0")
+        except ValueError: return 0.0
+    def _i(k):
+        try: return int(float(row.get(k, "0") or "0"))
+        except ValueError: return 0
+    roi_sum = _f("roi_sum")
+    avg_roi = roi_sum / samples if samples else 0.0
+    rugs_bought = _i("rugs_bought")
+    rugs_created = _i("rugs_created")
+    tokens_followed = _i("tokens_followed")
+    hold_secs_sum = _f("hold_secs_sum")
+    hold_samples = _i("hold_samples")
+    avg_hold = (hold_secs_sum / hold_samples) if hold_samples else 0.0
+    first_seen = _i("first_seen")
+    cluster_id = _i("cluster_id")
     r50 = winrate(recent, 50)
     r200 = winrate(recent, 200)
     # fall back to lifetime where the rolling window is empty (old data)
@@ -64,6 +81,14 @@ def score_wallet(row):
         "recent_200_winrate": round(r200, 4),
         "confidence_score": round(conf, 4),
         "final_wallet_score": round(final, 2),
+        "smart_money_score": round(final, 2),
+        "avg_roi": round(avg_roi, 3),
+        "avg_hold_secs": int(avg_hold),
+        "rugs_bought": rugs_bought,
+        "rugs_created": rugs_created,
+        "tokens_followed": tokens_followed,
+        "first_seen": first_seen,
+        "cluster_id": cluster_id,
         "tier": tier,
         "flag": "LOW_CONFIDENCE" if samples < 20 else "",
     }
@@ -87,7 +112,9 @@ def main():
     keep = [s for s in scored if TIER_ORDER[s["tier"]] >= TIER_ORDER[args.min_tier]]
 
     cols = ["wallet_address", "lifetime_trades", "lifetime_winrate", "recent_50_winrate",
-            "recent_200_winrate", "confidence_score", "final_wallet_score", "tier", "flag"]
+            "recent_200_winrate", "confidence_score", "final_wallet_score", "smart_money_score",
+            "avg_roi", "avg_hold_secs", "rugs_bought", "rugs_created", "tokens_followed",
+            "first_seen", "cluster_id", "tier", "flag"]
     if args.csv:
         w = csv.DictWriter(sys.stdout, fieldnames=cols)
         w.writeheader()
@@ -103,14 +130,16 @@ def main():
     for s in scored:
         by_tier[s["tier"]] = by_tier.get(s["tier"], 0) + 1
     print("  tiers: " + " · ".join(f"{t}={by_tier.get(t,0)}" for t in ["ELITE","STRONG","WATCHLIST","WEAK","AVOID"]))
-    print(f"\n  {'wallet':14} {'tier':10} {'final':>6} {'win50':>6} {'win200':>7} {'life':>6} {'conf':>5} {'n':>5}  flag")
+    print(f"\n  {'wallet':14} {'tier':10} {'score':>6} {'win50':>6} {'avgROI':>7} {'n':>5} {'follow':>6} {'rugB':>5} {'rugC':>5}  flag")
     for s in keep[:60]:
         w = s["wallet_address"]
         print(f"  {w[:12]+'…':14} {s['tier']:10} {s['final_wallet_score']:>6.1f} "
-              f"{s['recent_50_winrate']*100:>5.0f}% {s['recent_200_winrate']*100:>6.0f}% "
-              f"{s['lifetime_winrate']*100:>5.0f}% {s['confidence_score']:>5.2f} {s['lifetime_trades']:>5}  {s['flag']}")
-    print("\n  Recent performance dominates (50% weight). Small samples are shrunk toward 50.")
+              f"{s['recent_50_winrate']*100:>5.0f}% {s['avg_roi']*100:>6.0f}% "
+              f"{s['lifetime_trades']:>5} {s['tokens_followed']:>6} {s['rugs_bought']:>5} {s['rugs_created']:>5}  {s['flag']}")
+    print("\n  win50 = recent-50 win rate · avgROI = mean forward return · follow = distinct tokens")
+    print("  rugB = rugs bought · rugC = rugs CREATED (a creator of rugs — hard avoid).")
     print("  Follow ELITE/STRONG; WATCHLIST = promising; WEAK/AVOID = don't follow.")
+    print("  (avg_hold_secs + cluster_id are in --csv output; cluster_id needs indexer data.)")
 
 
 if __name__ == "__main__":

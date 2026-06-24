@@ -1211,6 +1211,24 @@ struct WalletRep {
     last_update: u64,
     /// Last token graded, to dampen reputation farmed by buying one token repeatedly.
     last_mint: String,
+    // ---- richer counterparty profile ----
+    /// First time we ever observed this wallet (unix secs).
+    first_seen: u64,
+    /// Sum of graded forward-returns (avg_roi = roi_sum / samples).
+    roi_sum: f64,
+    /// Graded buys whose token rugged (forward return <= -90%).
+    rugs_bought: u32,
+    /// Tokens this wallet CREATED that later rugged (set from the outcome tracker).
+    rugs_created: u32,
+    /// Distinct tokens we've seen this wallet trade (approx: counts mint changes).
+    tokens_followed: u32,
+    /// Sum of observed hold durations (secs) and their count, for avg_hold_time.
+    /// Populated only once wallet sell-matching is wired (see note); 0 until then.
+    hold_secs_sum: f64,
+    hold_samples: u32,
+    /// Funding/sybil cluster id. 0 = unknown (needs funding-graph data from an indexer;
+    /// the trade feed alone can't determine which wallets share a funder).
+    cluster_id: i64,
 }
 
 const WALLET_RECENT_CAP: usize = 200;
@@ -1224,6 +1242,16 @@ impl WalletRep {
         if self.recent.len() >= WALLET_RECENT_CAP { self.recent.pop_front(); }
         self.recent.push_back(win);
     }
+    /// Average forward-return ROI across graded buys.
+    fn avg_roi(&self) -> f64 {
+        if self.samples == 0 { 0.0 } else { self.roi_sum / self.samples as f64 }
+    }
+    /// Average observed hold time (secs); 0 if not yet measured.
+    fn avg_hold_time(&self) -> f64 {
+        if self.hold_samples == 0 { 0.0 } else { self.hold_secs_sum / self.hold_samples as f64 }
+    }
+    /// Smart-money score = the recency/confidence-weighted final score (0..100).
+    fn smart_money_score(&self) -> f64 { self.final_score() }
     /// Lifetime win rate (0..1).
     fn lifetime_winrate(&self) -> f64 {
         if self.samples == 0 { 0.0 } else { self.wins as f64 / self.samples as f64 }
@@ -1493,6 +1521,7 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
                 -1.0 // token went cold / untracked: treat as a loss
             };
             let mut r = WALLET_REP.entry(a.wallet).or_default();
+            if r.first_seen == 0 { r.first_seen = now; }
             // Time-decay old reputation toward 0 so stale wallets fade.
             if r.last_update > 0 {
                 let elapsed = now.saturating_sub(r.last_update) as f64;
@@ -1502,6 +1531,9 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             // Dampen reputation farmed by repeatedly buying the same token.
             let alpha = if r.last_mint == a.mint { 0.02 } else { 0.1 };
             r.score = (1.0 - alpha) * r.score + alpha * ret;
+            r.roi_sum += ret;                       // for avg_roi
+            if ret <= -0.9 { r.rugs_bought += 1; }  // token rugged after they bought
+            if r.last_mint != a.mint { r.tokens_followed += 1; } // distinct-ish token count
             r.push_outcome(ret > 0.0); // updates samples, wins, and the recent window
             r.last_update = now;
             r.last_mint = a.mint.clone();
@@ -1566,7 +1598,20 @@ fn load_wallet_rep(path: &str) {
                 let wins = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                 let recent: VecDeque<bool> = it.next().unwrap_or("").chars()
                     .filter(|c| *c == '0' || *c == '1').map(|c| c == '1').collect();
-                WALLET_REP.insert(w.to_string(), WalletRep { score, samples, wins, recent, last_update, last_mint });
+                // Richer profile fields (appended; default 0 for older rep files).
+                let first_seen = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let roi_sum = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let rugs_bought = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let rugs_created = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let tokens_followed = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let hold_secs_sum = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let hold_samples = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let cluster_id = it.next().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                WALLET_REP.insert(w.to_string(), WalletRep {
+                    score, samples, wins, recent, last_update, last_mint,
+                    first_seen, roi_sum, rugs_bought, rugs_created, tokens_followed,
+                    hold_secs_sum, hold_samples, cluster_id,
+                });
             }
         }
     }
@@ -1580,11 +1625,14 @@ fn save_wallet_rep(path: &str) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint,wins,recent");
+    let _ = writeln!(file, "wallet,score,samples,last_update,last_mint,wins,recent,first_seen,roi_sum,rugs_bought,rugs_created,tokens_followed,hold_secs_sum,hold_samples,cluster_id");
     for e in WALLET_REP.iter() {
         let r = e.value();
         let recent: String = r.recent.iter().map(|&b| if b { '1' } else { '0' }).collect();
-        let _ = writeln!(file, "{},{:.6},{},{},{},{},{}", e.key(), r.score, r.samples, r.last_update, r.last_mint, r.wins, recent);
+        let _ = writeln!(file, "{},{:.6},{},{},{},{},{},{},{:.6},{},{},{},{:.1},{},{}",
+            e.key(), r.score, r.samples, r.last_update, r.last_mint, r.wins, recent,
+            r.first_seen, r.roi_sum, r.rugs_bought, r.rugs_created, r.tokens_followed,
+            r.hold_secs_sum, r.hold_samples, r.cluster_id);
     }
     let _ = std::fs::rename(&tmp, path);
 }
@@ -2268,6 +2316,9 @@ struct OutcomeTrack {
     m60: Option<f64>,
     m120: Option<f64>,
     finalized: bool,
+    /// Token creator, so a RUG label can be credited to its creator's rugs_created.
+    #[serde(default)]
+    creator: String,
 }
 
 /// Concentration (top-N net float share) and insider sold-ratio as plain numbers
@@ -2352,6 +2403,7 @@ fn record_decision(parsed: &TradeInfoFromToken, signal: &MomentumSignal, cfg: &M
             detect_ts: now, detect_mcap: mcap, peak_mcap: mcap, trough_mcap: mcap, last_mcap: mcap,
             decision: decision.to_string(), overall_score: effective_score,
             m15: None, m30: None, m60: None, m120: None, finalized: false,
+            creator: creator.clone(),
         });
 
     use std::io::Write;
@@ -2492,6 +2544,11 @@ async fn run_outcome_tracker(cfg: Arc<MomentumConfig>) {
                 let dd = o.trough_mcap / dm - 1.0;
                 let final_ret = o.last_mcap / dm - 1.0;
                 let label = outcome_label(max_ret, final_ret);
+                // Credit a rug to its creator's profile (rugs_created) — the strongest
+                // "avoid this wallet's launches" signal.
+                if label == "RUG" && !o.creator.is_empty() {
+                    WALLET_REP.entry(o.creator.clone()).or_default().rugs_created += 1;
+                }
                 let need_header = !std::path::Path::new(&path).exists();
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                     if need_header {
