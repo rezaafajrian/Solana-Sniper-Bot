@@ -262,6 +262,14 @@ pub struct MomentumConfig {
     pub cluster_enabled: bool,
     /// Distinct shared tokens a wallet pair must co-buy before they're linked.
     pub cluster_min_shared: u32,
+    /// Min combined graded samples before a cluster's reputation is judged (fail-safe).
+    pub cluster_min_samples: u32,
+    /// A cluster is a "dumper" if its combined avg ROI is <= this (e.g. -0.20 = -20%).
+    pub cluster_bad_roi: f64,
+    /// ...or if this share of its buys ended in rugs (0..1).
+    pub cluster_bad_rug_rate: f64,
+    /// Veto entry when a single dumper cluster drives at least this share of recent buys.
+    pub cluster_veto_share: f64,
     /// Master switch for the structure gate.
     pub require_structure: bool,
     /// Minimum genuine-demand factor (0..1: buyer diversity × anti-wash × anti-creator-buy)
@@ -600,6 +608,10 @@ impl MomentumConfig {
             max_creator_buy_frac: env_f64("MOMENTUM_MAX_CREATOR_BUY_FRAC", 0.15),
             cluster_enabled: std::env::var("MOMENTUM_CLUSTER_ENABLED").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             cluster_min_shared: env_u64("MOMENTUM_CLUSTER_MIN_SHARED", 3) as u32,
+            cluster_min_samples: env_u64("MOMENTUM_CLUSTER_MIN_SAMPLES", 8) as u32,
+            cluster_bad_roi: env_f64("MOMENTUM_CLUSTER_BAD_ROI", -0.20),
+            cluster_bad_rug_rate: env_f64("MOMENTUM_CLUSTER_BAD_RUG_RATE", 0.40),
+            cluster_veto_share: env_f64("MOMENTUM_CLUSTER_VETO_SHARE", 0.30),
             require_structure: std::env::var("MOMENTUM_REQUIRE_STRUCTURE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             struct_min_genuine: env_f64("MOMENTUM_STRUCT_MIN_GENUINE", 0.55),
             struct_min_buyers: env_usize("MOMENTUM_STRUCT_MIN_BUYERS", 4),
@@ -1512,6 +1524,8 @@ lazy_static! {
     static ref UF_PARENT: DashMap<String, String> = DashMap::new();
     /// Root -> member count, so we only label clusters with >= 2 wallets.
     static ref CLUSTER_SIZE: DashMap<String, u32> = DashMap::new();
+    /// Root -> the set of member wallets (for judging a cluster's combined reputation).
+    static ref CLUSTER_MEMBERS: DashMap<String, std::collections::HashSet<String>> = DashMap::new();
     /// Root -> small stable cluster id.
     static ref CLUSTER_LABEL: DashMap<String, i64> = DashMap::new();
 }
@@ -1538,8 +1552,84 @@ fn uf_union(a: &str, b: &str) {
     // Attach the smaller tree under the larger root.
     let (root, child, merged) = if sa >= sb { (ra, rb, sa + sb) } else { (rb, ra, sa + sb) };
     UF_PARENT.insert(child.clone(), root.clone());
-    CLUSTER_SIZE.insert(root, merged);
+    CLUSTER_SIZE.insert(root.clone(), merged);
     CLUSTER_SIZE.remove(&child);
+    // Merge member sets so the cluster's combined reputation can be judged later.
+    let child_members = CLUSTER_MEMBERS.remove(&child).map(|(_, s)| s).unwrap_or_default();
+    let mut set = CLUSTER_MEMBERS.entry(root.clone()).or_default();
+    set.extend(child_members);
+    set.insert(a.to_string());
+    set.insert(b.to_string());
+    set.insert(root.clone());
+    set.insert(child);
+}
+
+/// Combined reputation of a cluster: returns Some(reason) if the group is a dumper/
+/// bundler — it has CREATED rugs, has net-negative ROI, or buys rugs at a high rate.
+/// None until the cluster has enough graded samples to judge (fails safe on fresh runs).
+fn cluster_dumper_reason(root: &str, cfg: &MomentumConfig) -> Option<String> {
+    let members = CLUSTER_MEMBERS.get(root)?;
+    let (mut samples, mut rug_buys, mut rugs_created, mut roi_sum) = (0u32, 0u32, 0u32, 0.0f64);
+    for w in members.iter() {
+        if let Some(r) = WALLET_REP.get(w) {
+            samples += r.samples;
+            rug_buys += r.rugs_bought;
+            rugs_created += r.rugs_created;
+            roi_sum += r.roi_sum;
+        }
+    }
+    if samples < cfg.cluster_min_samples {
+        return None;
+    }
+    if rugs_created >= 1 {
+        return Some(format!("cluster created {} rug(s)", rugs_created));
+    }
+    let avg_roi = roi_sum / samples as f64;
+    if avg_roi <= cfg.cluster_bad_roi {
+        return Some(format!("cluster avg ROI {:.0}%", avg_roi * 100.0));
+    }
+    let rug_rate = rug_buys as f64 / samples as f64;
+    if rug_rate >= cfg.cluster_bad_rug_rate {
+        return Some(format!("cluster {:.0}% of buys rugged", rug_rate * 100.0));
+    }
+    None
+}
+
+/// Entry veto: if a single coordinated cluster with a DUMPER reputation is driving a big
+/// share of this token's recent buying, the "pump" is a bundler group manufacturing
+/// momentum to sell into. Skip it. Fails safe (returns None) until clusters have history.
+fn bundler_cluster_veto(mint: &str, cfg: &MomentumConfig) -> Option<String> {
+    if !cfg.cluster_enabled {
+        return None;
+    }
+    let now = now_secs();
+    let cut = now.saturating_sub(cfg.short_window_secs);
+    let state = TOKEN_STATE.get(mint)?;
+    let mut vol_by_root: HashMap<String, f64> = HashMap::new();
+    let mut total = 0.0;
+    for t in state.ticks.iter() {
+        if t.is_buy && t.ts >= cut && !t.trader.is_empty() {
+            total += t.sol;
+            *vol_by_root.entry(uf_find(&t.trader)).or_insert(0.0) += t.sol;
+        }
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    for (root, vol) in vol_by_root {
+        let share = vol / total;
+        if share < cfg.cluster_veto_share {
+            continue;
+        }
+        let size = CLUSTER_SIZE.get(&root).map(|s| *s).unwrap_or(1);
+        if size < 2 {
+            continue;
+        }
+        if let Some(reason) = cluster_dumper_reason(&root, cfg) {
+            return Some(format!("{} driving {:.0}% of buys", reason, share * 100.0));
+        }
+    }
+    None
 }
 
 /// Cluster id for a wallet: 0 = not in a coordinated group; > 0 = stable group id.
@@ -2917,6 +3007,17 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
         logger.log(format!("🛑 Insider-distribution veto {} — {}", mint, reason).yellow().to_string());
         record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("insider-distribution: {}", reason));
         return;
+    }
+
+    // Bundler-cluster veto: if a coordinated wallet group with a dumper track record is
+    // driving this token's buying, the "pump" is manufactured — skip it. (Cluster id +
+    // reputation come from the co-buy graph; fails safe until clusters have history.)
+    if !watch_buy {
+        if let Some(reason) = bundler_cluster_veto(&mint, &cfg) {
+            logger.log(format!("🕸️  Bundler-cluster veto {} — {}", mint, reason).yellow().to_string());
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("bundler-cluster: {}", reason));
+            return;
+        }
     }
 
     // Structure gate: require GENUINE, broad demand — not just a high momentum number.
@@ -4512,6 +4613,32 @@ mod tests {
         assert_eq!(cluster_id_for(b), ida, "B shares A's cluster");
         assert_eq!(cluster_id_for(c), ida, "C shares the cluster transitively");
         assert_eq!(cluster_id_for(lone), 0, "the lone wallet is still unclustered");
+    }
+
+    #[test]
+    fn cluster_dumper_reason_flags_bad_groups() {
+        let cfg = test_cfg(); // cluster_min_samples 8, bad_roi -0.2, bad_rug_rate 0.4 (from_env defaults)
+        // A rug-creating cluster -> flagged.
+        let root = "dumproot_unitX";
+        let mut mem = std::collections::HashSet::new();
+        mem.insert("dumpw_a".to_string());
+        mem.insert("dumpw_b".to_string());
+        CLUSTER_MEMBERS.insert(root.to_string(), mem);
+        WALLET_REP.insert("dumpw_a".to_string(), WalletRep { samples: 5, rugs_created: 1, ..Default::default() });
+        WALLET_REP.insert("dumpw_b".to_string(), WalletRep { samples: 5, ..Default::default() });
+        assert!(cluster_dumper_reason(root, &cfg).is_some(), "rug-creating cluster must be flagged");
+        // A profitable cluster -> not flagged.
+        let root2 = "cleanroot_unitY";
+        let mut mem2 = std::collections::HashSet::new();
+        mem2.insert("cleanw_a".to_string());
+        mem2.insert("cleanw_b".to_string());
+        CLUSTER_MEMBERS.insert(root2.to_string(), mem2);
+        WALLET_REP.insert("cleanw_a".to_string(), WalletRep { samples: 10, wins: 8, roi_sum: 5.0, ..Default::default() });
+        WALLET_REP.insert("cleanw_b".to_string(), WalletRep { samples: 10, wins: 7, roi_sum: 4.0, ..Default::default() });
+        assert!(cluster_dumper_reason(root2, &cfg).is_none(), "profitable cluster must not be flagged");
+        for k in ["dumpw_a", "dumpw_b", "cleanw_a", "cleanw_b"] { WALLET_REP.remove(k); }
+        CLUSTER_MEMBERS.remove(root);
+        CLUSTER_MEMBERS.remove(root2);
     }
 
     // ---- slow-rug cumulative accumulator (no double counting) ------------
