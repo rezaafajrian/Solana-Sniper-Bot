@@ -385,6 +385,14 @@ pub struct MomentumConfig {
     pub watch_size_sol: f64,
     /// Weight on the market-structure half of the composite (rest goes to convergence).
     pub watch_ms_weight: f64,
+    /// Bridge to the runner-research knowledge base: how much a token's match against the
+    /// VALIDATED runner patterns (runner_patterns.json) shifts its watch score. The
+    /// watchlist becomes "tokens matching the proven runner DNA." 0 = bridge off.
+    pub watch_dna_weight: f64,
+    /// Minimum knowledge-base confidence for a pattern to be used by the live bridge.
+    pub watch_dna_min_conf: f64,
+    /// Path to the runner-research knowledge base (written by scripts/runner_research.py).
+    pub watch_dna_file: String,
 
     // ---- Learned avoidance: stop repeating mistakes (creator + pattern) ----
     /// Skip a token whose CREATOR has lost money for the bot before (decaying memory).
@@ -667,6 +675,9 @@ impl MomentumConfig {
             watch_autobuy: std::env::var("MOMENTUM_WATCH_AUTOBUY").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             watch_size_sol: env_f64("MOMENTUM_WATCH_SIZE_SOL", 0.5),
             watch_ms_weight: env_f64("MOMENTUM_WATCH_MS_WEIGHT", 0.5).clamp(0.0, 1.0),
+            watch_dna_weight: env_f64("MOMENTUM_WATCH_DNA_WEIGHT", 0.40).clamp(0.0, 1.0),
+            watch_dna_min_conf: env_f64("MOMENTUM_WATCH_DNA_MIN_CONF", 0.30),
+            watch_dna_file: std::env::var("MOMENTUM_RUNNER_PATTERNS_FILE").unwrap_or_else(|_| "runner_patterns.json".to_string()),
             creator_avoid: std::env::var("MOMENTUM_CREATOR_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             creator_min_trades: env_u64("MOMENTUM_CREATOR_MIN_TRADES", 2) as u32,
             creator_avoid_pnl: env_f64("MOMENTUM_CREATOR_AVOID_PNL", -0.02),
@@ -1408,7 +1419,10 @@ fn smart_convergence(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(usiz
 ///      fresh launches, so this is the bot-window equivalent of "market structure".)
 ///   2) Smart-money convergence — how many PROVEN wallets are accumulating at once.
 /// Returns (total, market_structure, convergence_subscore).
-fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, cfg: &MomentumConfig) -> (f64, f64, f64) {
+///   3) Runner-DNA match — how well the token matches the VALIDATED runner patterns the
+///      research layer learned (the bridge). Only active once the knowledge base has
+///      proven patterns; otherwise the composite falls back to (1)+(2).
+fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, dna: Option<f64>, cfg: &MomentumConfig) -> (f64, f64, f64) {
     // --- market structure (0..100) ---
     let vol_mc = if signal.current_mcap > 0.0 { signal.buy_volume_short / signal.current_mcap } else { 0.0 };
     let vol_mc_norm = (vol_mc / 0.5).clamp(0.0, 1.0); // ~0.5 turnover = strong
@@ -1419,8 +1433,76 @@ fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, cfg: &Mom
     // --- smart-money convergence (0..100) ---
     let conv_full = (cfg.convergence_min + 2).max(1) as f64;
     let conv = (conv_count as f64 / conv_full).clamp(0.0, 1.0) * 100.0;
-    let total = cfg.watch_ms_weight * ms + (1.0 - cfg.watch_ms_weight) * conv;
+    let base = cfg.watch_ms_weight * ms + (1.0 - cfg.watch_ms_weight) * conv;
+    // --- runner-DNA bridge: shift toward the proven-runner-pattern match when available ---
+    let total = match dna {
+        Some(d) if cfg.watch_dna_weight > 0.0 => (1.0 - cfg.watch_dna_weight) * base + cfg.watch_dna_weight * d,
+        _ => base,
+    };
     (total, ms, conv)
+}
+
+/// One validated runner pattern from the research knowledge base: feature >= cutoff,
+/// weighted by how much confidence it has earned across re-validations.
+#[derive(Clone)]
+struct RunnerPattern {
+    feature: String,
+    cutoff: f64,
+    confidence: f64,
+}
+
+lazy_static! {
+    /// Validated runner patterns loaded from runner_patterns.json (the research bridge).
+    static ref RUNNER_PATTERNS: std::sync::Mutex<Vec<RunnerPattern>> = std::sync::Mutex::new(Vec::new());
+}
+
+/// Load the runner-research knowledge base into memory; keep only patterns above the
+/// confidence floor. Returns how many are now active. Called at startup + periodically.
+fn load_runner_patterns(path: &str, min_conf: f64) -> usize {
+    let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return 0 };
+    let v: serde_json::Value = match serde_json::from_str(&content) { Ok(v) => v, Err(_) => return 0 };
+    let mut out = Vec::new();
+    if let Some(obj) = v.as_object() {
+        for (_k, rec) in obj {
+            let feat = rec.get("feature").and_then(|x| x.as_str());
+            let cut = rec.get("cutoff").and_then(|x| x.as_f64());
+            let conf = rec.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            if let (Some(fe), Some(c)) = (feat, cut) {
+                if conf >= min_conf {
+                    out.push(RunnerPattern { feature: fe.to_string(), cutoff: c, confidence: conf });
+                }
+            }
+        }
+    }
+    let n = out.len();
+    if let Ok(mut g) = RUNNER_PATTERNS.lock() { *g = out; }
+    n
+}
+
+/// Score a token's live features against the validated runner patterns. Returns
+/// (0..100 confidence-weighted match, matched count), or None if no patterns are loaded
+/// (so the watchlist falls back to its structure+convergence composite until the
+/// research layer has proven something).
+fn runner_dna_score(features: &HashMap<&str, f64>) -> Option<(f64, usize)> {
+    let pats = RUNNER_PATTERNS.lock().ok()?;
+    if pats.is_empty() {
+        return None;
+    }
+    let total_conf: f64 = pats.iter().map(|p| p.confidence).sum();
+    if total_conf <= 0.0 {
+        return None;
+    }
+    let mut matched_conf = 0.0;
+    let mut count = 0usize;
+    for p in pats.iter() {
+        if let Some(&val) = features.get(p.feature.as_str()) {
+            if !val.is_nan() && val >= p.cutoff {
+                matched_conf += p.confidence;
+                count += 1;
+            }
+        }
+    }
+    Some((matched_conf / total_conf * 100.0, count))
 }
 
 /// Discrete feature bands describing a token at entry — the "kind" of token it is.
@@ -1744,6 +1826,11 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             since_save = 0;
             save_wallet_rep(&cfg.wallet_rep_file);
             save_avoidance(&cfg.avoidance_file);
+            // Reload the runner-research knowledge base so a freshly-written daily report
+            // sharpens the live watchlist without needing a restart.
+            if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
+                load_runner_patterns(&cfg.watch_dna_file, cfg.watch_dna_min_conf);
+            }
         }
     }
 }
@@ -2958,16 +3045,41 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // In beta (autobuy off) this only flags + alerts + tracks the token for learn.py
     // to validate; with autobuy on it becomes a large-size entry that bypasses the
     // normal score gate (but still respects the safety vetoes + capital below).
+    // Runner-DNA bridge: score this token against the validated runner patterns the
+    // research layer learned. Build the same feature map the decision log records.
+    let dna = if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
+        let (conc, insider, cbuy, smart_cnt) = concentration_metrics(&parsed, &mint, &cfg);
+        let cscore = if creator.is_empty() { 0.0 } else { WALLET_REP.get(&creator).map(|r| r.score).unwrap_or(0.0) };
+        let liq = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+        let conf = if cfg.entry_score > 0.0 { effective_score / cfg.entry_score } else { 0.0 };
+        let mut fm: HashMap<&str, f64> = HashMap::new();
+        fm.insert("creator_buy", cbuy);
+        fm.insert("creator_score", cscore);
+        fm.insert("wallet_score", signal.smart_money_boost);
+        fm.insert("insider_score", insider);
+        fm.insert("smart_wallet_count", smart_cnt as f64);
+        fm.insert("holder_concentration", conc);
+        fm.insert("marketcap", signal.current_mcap);
+        fm.insert("volume", signal.buy_volume_short);
+        fm.insert("liquidity", liq);
+        fm.insert("overall_score", effective_score);
+        fm.insert("confidence", conf);
+        runner_dna_score(&fm)
+    } else { None };
+    let dna_score = dna.map(|(s, _)| s);
+    let dna_matched = dna.map(|(_, c)| c).unwrap_or(0);
+
     let (wscore, ms_sub, conv_sub) = if cfg.watch_enabled {
-        watch_score(&signal, &mint, conv_count, &cfg)
+        watch_score(&signal, &mint, conv_count, dna_score, &cfg)
     } else { (0.0, 0.0, 0.0) };
     let is_watch = cfg.watch_enabled && wscore >= cfg.watch_score_min && signal.current_mcap > 0.0;
     if is_watch {
         WATCHLIST.insert(mint.clone(), (wscore, ms_sub, conv_sub, now));
         if !DECISION_LOGGED.contains_key(&mint) {
+            let dna_str = dna_score.map(|d| format!(", runner-DNA {:.0} [{} patterns]", d, dna_matched)).unwrap_or_default();
             logger.log(format!(
-                "👁  ONE TO WATCH {} | watch {:.0} (structure {:.0}, convergence {:.0}, {} whales) | mcap {:.1} SOL{}",
-                mint, wscore, ms_sub, conv_sub, conv_count, signal.current_mcap,
+                "👁  ONE TO WATCH {} | watch {:.0} (structure {:.0}, convergence {:.0}, {} whales{}) | mcap {:.1} SOL{}",
+                mint, wscore, ms_sub, conv_sub, conv_count, dna_str, signal.current_mcap,
                 if cfg.watch_autobuy { " | AUTOBUY" } else { " | alert-only (beta)" },
             ).magenta().bold().to_string());
         }
@@ -4211,6 +4323,16 @@ async fn momentum_startup(
         ).cyan().to_string());
     }
 
+    // Runner-DNA bridge: load the research layer's validated patterns into the watchlist.
+    if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
+        let n = load_runner_patterns(&cfg.watch_dna_file, cfg.watch_dna_min_conf);
+        if n > 0 {
+            logger.log(format!("🧬 Runner-DNA bridge ON: {} validated pattern(s) from {} steering the watchlist", n, cfg.watch_dna_file).cyan().bold().to_string());
+        } else {
+            logger.log(format!("🧬 Runner-DNA bridge armed — no validated patterns in {} yet (watchlist uses structure+convergence until the research layer proves some)", cfg.watch_dna_file).cyan().to_string());
+        }
+    }
+
     // Learned avoidance memory (creators + patterns that have lost) — compounds across runs.
     if cfg.creator_avoid || cfg.pattern_avoid {
         load_avoidance(&cfg.avoidance_file);
@@ -4608,6 +4730,31 @@ mod tests {
         sig.genuine_factor = 0.9;
         sig.unique_buyers_short = 12; // real crowd, organic demand
         assert!(structure_gate(&sig, "M", &cfg).is_none(), "genuine broad demand must pass");
+    }
+
+    // ---- runner-DNA bridge (watchlist scores tokens vs validated patterns) ----
+    #[test]
+    fn runner_dna_bridge_scores_matches() {
+        { RUNNER_PATTERNS.lock().unwrap().clear(); }
+        assert!(runner_dna_score(&HashMap::new()).is_none(), "no patterns loaded -> None (fallback)");
+        {
+            let mut g = RUNNER_PATTERNS.lock().unwrap();
+            *g = vec![
+                RunnerPattern { feature: "smart_wallet_count".into(), cutoff: 5.0, confidence: 0.8 },
+                RunnerPattern { feature: "liquidity".into(), cutoff: 20.0, confidence: 0.4 },
+            ];
+        }
+        let mut fm: HashMap<&str, f64> = HashMap::new();
+        fm.insert("smart_wallet_count", 6.0); // matches the 0.8 pattern only
+        fm.insert("liquidity", 10.0);
+        let (s, c) = runner_dna_score(&fm).unwrap();
+        assert_eq!(c, 1);
+        assert!((s - 66.67).abs() < 0.5, "weighted match got {s}");
+        fm.insert("liquidity", 25.0); // now matches both
+        let (s2, c2) = runner_dna_score(&fm).unwrap();
+        assert_eq!(c2, 2);
+        assert!((s2 - 100.0).abs() < 0.01);
+        { RUNNER_PATTERNS.lock().unwrap().clear(); }
     }
 
     // ---- co-buy clustering (cabal detection) -----------------------------

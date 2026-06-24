@@ -327,6 +327,8 @@ def main():
         key = f"{v['feature']}>={v['cutoff']}"
         seen_keys.add(key)
         rec = kb.get(key, {"first_seen": today, "validations": 0, "history": []})
+        rec["feature"] = v["feature"]      # explicit for the Rust bridge (don't parse the key)
+        rec["cutoff"] = v["cutoff"]
         rec["validations"] += 1
         rec["last_seen"] = today
         rec["last_precision"] = v["test_precision"]
