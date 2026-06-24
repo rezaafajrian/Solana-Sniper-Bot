@@ -80,6 +80,10 @@
   td{padding:2.5px 6px;border-bottom:1px solid #081210}
   tr:hover td{background:#06110d}
   .mint{color:var(--cyan)} .runner{color:var(--dim);font-size:9px}
+  .addr a{text-decoration:none}
+  .addr .lnk{color:var(--dim);font-size:9px;margin-left:3px;cursor:pointer;border:1px solid var(--dim);border-radius:2px;padding:0 2px}
+  .addr .lnk:hover{color:var(--green);border-color:var(--green)}
+  .addr .cp{font-size:10px}
   .miniwin{display:inline-block;height:5px;background:var(--green);box-shadow:0 0 5px var(--green);vertical-align:middle}
   .minilose{display:inline-block;height:5px;background:var(--red);box-shadow:0 0 5px var(--red);vertical-align:middle}
 
@@ -196,7 +200,7 @@
   <div class="panel">
     <div class="ph"><span class="x">SCOUT LIST · TOP LEARNED ALPHA</span></div>
     <table>
-      <thead><tr><th>wallet</th><th>tier</th><th>win%</th><th>score</th><th>n</th></tr></thead>
+      <thead><tr><th>wallet</th><th>tier</th><th>win%</th><th>score</th><th>roi</th><th>rug</th><th>clu</th><th>n</th></tr></thead>
       <tbody id="alphaBody"></tbody>
     </table>
   </div>
@@ -229,6 +233,27 @@ const $ = id => document.getElementById(id);
 const fmtSol = (v,sign=true)=>{ if(v==null||isNaN(v))return "—"; const s=(sign&&v>0?"+":"")+v.toFixed(4); return s; };
 const cls = v => v>0?"up":(v<0?"down":"dim");
 const shortMint = m => m? (m.length>12? m.slice(0,4)+"…"+m.slice(-4):m):"—";
+// Copy the full address to clipboard (for manual checking).
+function copyAddr(a){ navigator.clipboard?.writeText(a); }
+// A token cell: short address linking to Dexscreener, full address in the tooltip,
+// a copy button, and quick links to Solscan / pump.fun / GMGN for manual research.
+function tokenCell(m){
+  if(!m) return "—";
+  return `<span class="addr" title="${m}">`+
+    `<a href="https://dexscreener.com/solana/${m}" target="_blank" rel="noopener" class="mint">${shortMint(m)}</a>`+
+    `<a href="https://solscan.io/token/${m}" target="_blank" rel="noopener" class="lnk" title="Solscan">S</a>`+
+    `<a href="https://pump.fun/${m}" target="_blank" rel="noopener" class="lnk" title="pump.fun">P</a>`+
+    `<a href="https://gmgn.ai/sol/token/${m}" target="_blank" rel="noopener" class="lnk" title="GMGN">G</a>`+
+    `<span class="lnk cp" title="copy address" onclick="copyAddr('${m}')">⧉</span></span>`;
+}
+// A wallet cell: short address linking to Solscan (account), full in tooltip, copy button.
+function walletCell(w){
+  if(!w) return "—";
+  return `<span class="addr" title="${w}">`+
+    `<a href="https://solscan.io/account/${w}" target="_blank" rel="noopener" class="cy">${shortMint(w)}</a>`+
+    `<a href="https://gmgn.ai/sol/address/${w}" target="_blank" rel="noopener" class="lnk" title="GMGN wallet">G</a>`+
+    `<span class="lnk cp" title="copy address" onclick="copyAddr('${w}')">⧉</span></span>`;
+}
 const ago = ts => { const s=Math.max(0,Math.floor(Date.now()/1000)-ts); if(s<60)return s+"s"; if(s<3600)return Math.floor(s/60)+"m"; return Math.floor(s/3600)+"h"; };
 
 // ---- equity curve history (built client-side from polled session_realized) ----
@@ -374,7 +399,7 @@ function render(snap){
     const tr=document.createElement("tr");
     const lead=o.kol? `<span class="cy">${o.kol}</span>`:`<span class="dim">·</span>`;
     const sel=o.selling?` <span class="am">⟳</span>`:"";
-    tr.innerHTML=`<td class="mint">${shortMint(o.mint)}${sel}</td><td>${lead}</td>`+
+    tr.innerHTML=`<td>${tokenCell(o.mint)}${sel}</td><td>${lead}</td>`+
       `<td>${ago(snap.updated-(o.age_secs||0))}</td>`+
       `<td>${(o.current_mcap||0).toFixed(1)}</td>`+
       `<td class="dim">${(o.peak_pnl||0).toFixed(0)}%</td>`+
@@ -391,7 +416,7 @@ function render(snap){
     const div=document.createElement("div"); div.className="ev";
     const pl = e.event==="BUY"? "" : `<span class="pl ${cls(e.pnl_sol)}">${fmtSol(e.pnl_sol)}</span>`;
     div.innerHTML=`<span class="t">${ago(e.ts)}</span><span class="tag ${k}">${lab}</span>`+
-      `<span class="m" title="${e.reason||""}">${shortMint(e.mint)} <span class="dim">${(e.reason||"").replace(/momentum entry ?/,'')}</span></span>${pl}`;
+      `<span class="m">${tokenCell(e.mint)} <span class="dim" title="${e.reason||""}">${(e.reason||"").replace(/momentum entry ?/,'')}</span></span>${pl}`;
     fd.appendChild(div);
   });
   $("feedCount").textContent=feed.length;
@@ -415,12 +440,16 @@ function render(snap){
     const wrp=a.win_rate!=null?(a.win_rate*100).toFixed(0)+"%":"—";
     const sc=(a.score||0);
     const tcol = sc>=90?"up":(sc>=75?"up":(sc>=60?"am":"dim"));
-    tr.innerHTML=`<td class="cy">${shortMint(a.wallet)}</td>`+
+    const roi=a.avg_roi!=null?`<span class="${cls(a.avg_roi)}">${(a.avg_roi*100).toFixed(0)}%</span>`:"—";
+    const rugs=(a.rugs_created>0)?`<span class="down" title="created ${a.rugs_created} rug(s)">⚠${a.rugs_created}</span>`:(a.rugs_bought>0?`<span class="am" title="bought ${a.rugs_bought} rug(s)">${a.rugs_bought}</span>`:`<span class="dim">0</span>`);
+    const clu=(a.cluster_id>0)?`<span class="am" title="coordinated cluster">#${a.cluster_id}</span>`:`<span class="dim">·</span>`;
+    tr.innerHTML=`<td>${walletCell(a.wallet)}</td>`+
       `<td class="${tcol}">${a.tier||"—"}</td>`+
-      `<td>${wrp}</td><td class="${tcol}">${sc.toFixed(0)}</td><td class="dim">${a.samples}</td>`;
+      `<td>${wrp}</td><td class="${tcol}">${sc.toFixed(0)}</td>`+
+      `<td>${roi}</td><td>${rugs}</td><td>${clu}</td><td class="dim">${a.samples}</td>`;
     ab.appendChild(tr);
   });
-  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=5 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
+  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=8 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
 
   // exit mix (from the recent feed window — a live sample, not the full session)
   const mix={};
@@ -442,7 +471,7 @@ function render(snap){
     const tr=document.createElement("tr");
     const sc=(w.score||0);
     const col = sc>=85?"up":(sc>=70?"am":"dim");
-    tr.innerHTML=`<td class="cy">${shortMint(w.mint)}</td>`+
+    tr.innerHTML=`<td>${tokenCell(w.mint)}</td>`+
       `<td class="${col}">${sc.toFixed(0)}</td>`+
       `<td class="dim">${(w.structure||0).toFixed(0)}</td>`+
       `<td class="dim">${(w.convergence||0).toFixed(0)}</td>`+

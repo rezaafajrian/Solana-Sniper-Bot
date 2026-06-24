@@ -1900,19 +1900,29 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
     // The bot's self-discovered "scout list": wallets it learned are proven, plus
     // the strongest few — this is the compounding memory made visible.
     let mut proven = 0usize;
-    let mut top_alpha: Vec<(String, f64, u32, f64, String)> = Vec::new();
+    let mut top_alpha: Vec<(f64, serde_json::Value)> = Vec::new();
     for e in WALLET_REP.iter() {
         let r = e.value();
         if wallet_is_proven(&r, cfg) {
             proven += 1;
-            top_alpha.push((e.key().clone(), r.final_score(), r.samples, r.recent_winrate(50), r.tier(cfg.alpha_min_samples).to_string()));
+            top_alpha.push((r.final_score(), serde_json::json!({
+                "wallet": e.key(),
+                "score": r.final_score(),
+                "samples": r.samples,
+                "win_rate": r.recent_winrate(50),
+                "tier": r.tier(cfg.alpha_min_samples),
+                "avg_roi": r.avg_roi(),
+                "rugs_bought": r.rugs_bought,
+                "rugs_created": r.rugs_created,
+                "tokens_followed": r.tokens_followed,
+                "cluster_id": r.cluster_id,
+                "first_seen": r.first_seen,
+            })));
         }
     }
-    top_alpha.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_alpha.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     top_alpha.truncate(15);
-    let top_alpha: Vec<serde_json::Value> = top_alpha.into_iter()
-        .map(|(w, s, n, wr, tier)| serde_json::json!({ "wallet": w, "score": s, "samples": n, "win_rate": wr, "tier": tier }))
-        .collect();
+    let top_alpha: Vec<serde_json::Value> = top_alpha.into_iter().map(|(_, v)| v).collect();
 
     let snap = serde_json::json!({
         "updated": now,
