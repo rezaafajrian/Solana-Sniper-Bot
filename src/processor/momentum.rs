@@ -257,6 +257,11 @@ pub struct MomentumConfig {
     //      number. The existing vetoes remove BAD structure (concentrated/insider/bundled/
     //      honeypot); this requires GOOD structure (genuine, broad, organic demand) so the
     //      bot stops buying manufactured coin-flips even when their momentum score is high. ----
+    /// Co-buy clustering: link wallets that repeatedly buy the same tokens into a
+    /// shared cluster_id (cabal/sybil detection from the feed, no funding data needed).
+    pub cluster_enabled: bool,
+    /// Distinct shared tokens a wallet pair must co-buy before they're linked.
+    pub cluster_min_shared: u32,
     /// Master switch for the structure gate.
     pub require_structure: bool,
     /// Minimum genuine-demand factor (0..1: buyer diversity × anti-wash × anti-creator-buy)
@@ -593,6 +598,8 @@ impl MomentumConfig {
             min_buyer_diversity: env_f64("MOMENTUM_MIN_BUYER_DIVERSITY", 0.35),
             max_wash_fraction: env_f64("MOMENTUM_MAX_WASH_FRACTION", 0.40),
             max_creator_buy_frac: env_f64("MOMENTUM_MAX_CREATOR_BUY_FRAC", 0.15),
+            cluster_enabled: std::env::var("MOMENTUM_CLUSTER_ENABLED").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            cluster_min_shared: env_u64("MOMENTUM_CLUSTER_MIN_SHARED", 3) as u32,
             require_structure: std::env::var("MOMENTUM_REQUIRE_STRUCTURE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             struct_min_genuine: env_f64("MOMENTUM_STRUCT_MIN_GENUINE", 0.55),
             struct_min_buyers: env_usize("MOMENTUM_STRUCT_MIN_BUYERS", 4),
@@ -1494,6 +1501,62 @@ fn enqueue_attribution(wallet: String, mint: String, entry_mcap: f64, eval_at: u
     }
 }
 
+/// Co-buy clustering ("cabal" detection without funding data): wallets that repeatedly
+/// buy the SAME tokens are almost certainly one coordinated group. We count shared tokens
+/// per wallet pair and union them once they cross a threshold; `cluster_id` > 0 then marks
+/// every member of that group. Pure feed data — no indexer needed.
+lazy_static! {
+    /// "walletA|walletB" (sorted) -> number of distinct tokens both bought.
+    static ref CO_BUY: DashMap<String, u32> = DashMap::new();
+    /// Union-find parent pointers (a wallet with no entry is its own root).
+    static ref UF_PARENT: DashMap<String, String> = DashMap::new();
+    /// Root -> member count, so we only label clusters with >= 2 wallets.
+    static ref CLUSTER_SIZE: DashMap<String, u32> = DashMap::new();
+    /// Root -> small stable cluster id.
+    static ref CLUSTER_LABEL: DashMap<String, i64> = DashMap::new();
+}
+static CLUSTER_NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn uf_find(w: &str) -> String {
+    let mut cur = w.to_string();
+    let mut guard = 0;
+    while let Some(p) = UF_PARENT.get(&cur).map(|r| r.value().clone()) {
+        if p == cur { break; }
+        cur = p;
+        guard += 1;
+        if guard > 100_000 { break; }
+    }
+    cur
+}
+
+fn uf_union(a: &str, b: &str) {
+    let ra = uf_find(a);
+    let rb = uf_find(b);
+    if ra == rb { return; }
+    let sa = CLUSTER_SIZE.get(&ra).map(|s| *s).unwrap_or(1);
+    let sb = CLUSTER_SIZE.get(&rb).map(|s| *s).unwrap_or(1);
+    // Attach the smaller tree under the larger root.
+    let (root, child, merged) = if sa >= sb { (ra, rb, sa + sb) } else { (rb, ra, sa + sb) };
+    UF_PARENT.insert(child.clone(), root.clone());
+    CLUSTER_SIZE.insert(root, merged);
+    CLUSTER_SIZE.remove(&child);
+}
+
+/// Cluster id for a wallet: 0 = not in a coordinated group; > 0 = stable group id.
+fn cluster_id_for(w: &str) -> i64 {
+    let root = uf_find(w);
+    let size = CLUSTER_SIZE.get(&root).map(|s| *s).unwrap_or(1);
+    if size < 2 {
+        return 0;
+    }
+    if let Some(id) = CLUSTER_LABEL.get(&root) {
+        return *id;
+    }
+    let id = CLUSTER_NEXT.fetch_add(1, Ordering::SeqCst) as i64;
+    CLUSTER_LABEL.insert(root, id);
+    id
+}
+
 /// Background task: grade due buys on the token's forward return and update the
 /// buyer's reputation. A token that died (no longer tracked / zero mcap) grades
 /// as a loss, which is exactly the signal we want against rug-prone wallets.
@@ -1513,6 +1576,7 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             }
         }
 
+        let mut graded: Vec<(String, String)> = Vec::new(); // (mint, wallet) for clustering
         for a in due {
             let cur = TOKEN_STATE.get(&a.mint).map(|s| s.last_mcap).unwrap_or(0.0);
             let ret = if a.entry_mcap > 0.0 && cur > 0.0 {
@@ -1520,6 +1584,7 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             } else {
                 -1.0 // token went cold / untracked: treat as a loss
             };
+            graded.push((a.mint.clone(), a.wallet.clone()));
             let mut r = WALLET_REP.entry(a.wallet).or_default();
             if r.first_seen == 0 { r.first_seen = now; }
             // Time-decay old reputation toward 0 so stale wallets fade.
@@ -1537,6 +1602,50 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             r.push_outcome(ret > 0.0); // updates samples, wins, and the recent window
             r.last_update = now;
             r.last_mint = a.mint.clone();
+        }
+
+        // ---- Co-buy clustering: link wallets that bought the SAME token together ----
+        if cfg.cluster_enabled && !graded.is_empty() {
+            // Group this batch's graded wallets by the token they bought.
+            let mut by_mint: HashMap<String, Vec<String>> = HashMap::new();
+            for (mint, wallet) in &graded {
+                by_mint.entry(mint.clone()).or_default().push(wallet.clone());
+            }
+            for (_mint, mut buyers) in by_mint {
+                buyers.sort();
+                buyers.dedup();
+                if buyers.len() < 2 {
+                    continue;
+                }
+                let cap = buyers.len().min(8); // bound the O(n^2) pairing per token
+                for i in 0..cap {
+                    for j in (i + 1)..cap {
+                        let key = format!("{}|{}", buyers[i], buyers[j]); // sorted => stable
+                        let shared = {
+                            let mut c = CO_BUY.entry(key).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        if shared >= cfg.cluster_min_shared {
+                            uf_union(&buyers[i], &buyers[j]);
+                        }
+                    }
+                }
+            }
+            // Refresh cluster_id on every wallet touched this batch.
+            let mut seen = std::collections::HashSet::new();
+            for (_m, w) in &graded {
+                if seen.insert(w.clone()) {
+                    let cid = cluster_id_for(w);
+                    if let Some(mut r) = WALLET_REP.get_mut(w) {
+                        r.cluster_id = cid;
+                    }
+                }
+            }
+            // Bound memory: drop one-off pairs if the co-buy map grows large.
+            if CO_BUY.len() > 500_000 {
+                CO_BUY.retain(|_, c| *c >= 2);
+            }
         }
 
         // Persist reputation roughly every 60s so the edge compounds across runs.
@@ -4388,6 +4497,21 @@ mod tests {
         sig.genuine_factor = 0.9;
         sig.unique_buyers_short = 12; // real crowd, organic demand
         assert!(structure_gate(&sig, "M", &cfg).is_none(), "genuine broad demand must pass");
+    }
+
+    // ---- co-buy clustering (cabal detection) -----------------------------
+    #[test]
+    fn cobuy_clustering_links_and_labels() {
+        // unique names so parallel tests don't collide on the shared union-find.
+        let (a, b, c, lone) = ("cbtest_A1", "cbtest_B2", "cbtest_C3", "cbtest_solo9");
+        assert_eq!(cluster_id_for(lone), 0, "a lone wallet is unclustered (id 0)");
+        uf_union(a, b);
+        uf_union(b, c); // transitive: A-B-C all one group
+        let ida = cluster_id_for(a);
+        assert!(ida > 0, "clustered wallet must get a positive id");
+        assert_eq!(cluster_id_for(b), ida, "B shares A's cluster");
+        assert_eq!(cluster_id_for(c), ida, "C shares the cluster transitively");
+        assert_eq!(cluster_id_for(lone), 0, "the lone wallet is still unclustered");
     }
 
     // ---- slow-rug cumulative accumulator (no double counting) ------------
