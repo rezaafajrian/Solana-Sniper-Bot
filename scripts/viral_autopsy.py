@@ -201,7 +201,9 @@ def main():
           "← the ones a curve-only view misses")
     print(f"    median pre-pump liq   : ${dna['median_pre_pump_liquidity_usd']:,.0f}")
     print(f"    median holders        : {dna['median_holders']:,}")
-    json.dump(dna, open(OUT, "w"), indent=2)
+    tmp = OUT + ".tmp"  # atomic write (any live reader sees a complete file or none)
+    json.dump(dna, open(tmp, "w"), indent=2)
+    os.replace(tmp, OUT)
     print(f"\n  → viral DNA written to {OUT} (feed the live layers to hunt the next match).")
     if not key:
         print("  NOTE: no Birdeye key — holder/history depth was limited. Add BIRDEYE_API_KEY")

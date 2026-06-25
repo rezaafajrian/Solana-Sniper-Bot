@@ -342,7 +342,10 @@ def main():
         if key not in seen_keys:
             rec["confidence"] = round(rec.get("confidence", 0) * 0.8, 3)
     try:
-        json.dump(kb, open(KB_FILE, "w"), indent=2)
+        # Atomic write: the live bot reads this file, so it must never see a partial JSON.
+        tmp = KB_FILE + ".tmp"
+        json.dump(kb, open(tmp, "w"), indent=2)
+        os.replace(tmp, KB_FILE)
     except Exception:
         pass
     ranked = sorted(kb.items(), key=lambda x: -x[1].get("confidence", 0))

@@ -183,6 +183,28 @@ pings you — it does NOT crash or get stuck.
 - **gRPC feed** — for lowest latency set `MOMENTUM_FEED=grpc` + a Yellowstone endpoint
   (the default; the ws feed is the no-gRPC fallback).
 
+## 10b. Isolation: research layer vs. the sniper bot
+
+The two systems are deliberately decoupled so neither degrades the other:
+- **Separate processes.** The sniper bot is the long-running Rust service (systemd). The
+  research/analysis is short-lived Python run by cron (`daily_report.sh`) — a different
+  process entirely. They never share a runtime.
+- **CPU/IO isolation.** `daily_report.sh` runs every script at `nice -n 19` + `ionice -c3`
+  (idle), so the latency-sensitive bot always wins scheduling — the daily analysis burst
+  can't steal cycles or disk from live trading.
+- **One-way, atomic data hand-off.** The analysis only *reads* the bot's data (decision/
+  trade/outcome/wallet CSVs). The single file the bot reads back — `runner_patterns.json`
+  (the research→watchlist bridge) — is written atomically (temp + rename), and the bot's
+  reader fails safe (a bad/partial parse keeps the previous patterns, never crashes).
+- **Decision-logic isolation.** The research layer NEVER touches the bot's live entry/exit/
+  risk logic. Its only influence is advisory: it writes the validated-pattern file the
+  watchlist *scores* against — and even that only affects "Ones to Watch" (alert-only by
+  default), never the safety controls, sizing, or exits.
+
+For *maximum* isolation you can run the analysis on a different box (rsync the bot's CSVs
+to it nightly) — but on one VPS the priority + atomic-handoff setup above is enough that
+the bot is unaffected.
+
 ## 10. Daily self-learning report (every 24h)
 
 `scripts/daily_report.sh` runs `learn.py` over all accumulated data, saves a timestamped

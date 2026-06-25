@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
-# Daily self-learning report. Runs learn.py over all accumulated data, saves a
-# timestamped report to reports/, and pushes the executive synthesis to Telegram
-# (if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are set in .env).
+# Daily research/analysis pass — runs the self-learning + research layers over the data
+# the bot has produced, saves reports/, and pushes the synthesis to Telegram.
 #
-# Run it manually any time:   ./scripts/daily_report.sh
-# Schedule every 24h via cron (see docs/VPS_DEPLOYMENT.md), e.g. at 09:00:
+# ISOLATION: this is a SEPARATE process from the sniper bot and must never degrade it.
+# Everything here runs at the lowest CPU + idle I/O priority, so the latency-sensitive bot
+# always wins scheduling. The only file the bot reads back (runner_patterns.json) is written
+# atomically by runner_research.py, so the bot never sees a partial file. The analysis only
+# ever READS the bot's data and writes advisory files — it never touches the bot's live
+# decision/risk/exit logic.
+#
+# Run manually:   ./scripts/daily_report.sh
+# Schedule (cron, e.g. 09:00):
 #   0 9 * * * cd /opt/solbot/Solana-Sniper-Bot && ./scripts/daily_report.sh >> reports/cron.log 2>&1
 set -e
 cd "$(dirname "$0")/.."
+
+# Lowest-priority wrapper so the analysis can't steal CPU/IO from the bot.
+LOWPRIO="nice -n 19"
+command -v ionice >/dev/null 2>&1 && LOWPRIO="ionice -c3 $LOWPRIO"
+
 # 1. Daily self-learning report (entries, exits, edge, OOS-validated recs) + Telegram.
-python3 scripts/learn.py momentum_decisions --report-dir reports --telegram "$@"
+$LOWPRIO python3 scripts/learn.py momentum_decisions --report-dir reports --telegram "$@" || true
 # 2. Runner DNA research layer (studies the 10x+ winners, refines the knowledge base).
-python3 scripts/runner_research.py momentum_decisions --report-dir reports || true
+$LOWPRIO python3 scripts/runner_research.py momentum_decisions --report-dir reports || true
 # 3. Lifecycle tracker — keep watching tokens after graduation (find the slow-burn winners).
-python3 scripts/lifecycle_tracker.py || true
+$LOWPRIO python3 scripts/lifecycle_tracker.py || true
 # 4. Viral autopsy — re-dissect your known-winner list & refresh the viral DNA (if present).
-[ -f viral_tokens.txt ] && python3 scripts/viral_autopsy.py || true
+[ -f viral_tokens.txt ] && $LOWPRIO python3 scripts/viral_autopsy.py || true
