@@ -14,3 +14,5 @@ python3 scripts/learn.py momentum_decisions --report-dir reports --telegram "$@"
 python3 scripts/runner_research.py momentum_decisions --report-dir reports || true
 # 3. Lifecycle tracker — keep watching tokens after graduation (find the slow-burn winners).
 python3 scripts/lifecycle_tracker.py || true
+# 4. Viral autopsy — re-dissect your known-winner list & refresh the viral DNA (if present).
+[ -f viral_tokens.txt ] && python3 scripts/viral_autopsy.py || true

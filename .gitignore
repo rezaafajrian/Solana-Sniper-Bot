@@ -53,3 +53,5 @@ runner_patterns.json
 token_registry.json
 token_registry.json.tmp
 token_lifecycle.csv
+viral_dna.json
+viral_tokens.txt
