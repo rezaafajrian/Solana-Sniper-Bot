@@ -50,3 +50,6 @@ momentum_avoidance.csv.tmp
 # Generated daily learning reports
 reports/
 runner_patterns.json
+token_registry.json
+token_registry.json.tmp
+token_lifecycle.csv

@@ -12,3 +12,5 @@ cd "$(dirname "$0")/.."
 python3 scripts/learn.py momentum_decisions --report-dir reports --telegram "$@"
 # 2. Runner DNA research layer (studies the 10x+ winners, refines the knowledge base).
 python3 scripts/runner_research.py momentum_decisions --report-dir reports || true
+# 3. Lifecycle tracker — keep watching tokens after graduation (find the slow-burn winners).
+python3 scripts/lifecycle_tracker.py || true
