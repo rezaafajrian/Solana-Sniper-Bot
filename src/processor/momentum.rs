@@ -1489,30 +1489,50 @@ fn emit_pump_alerts(signal: &MomentumSignal, mint: &str, conv_count: usize, now:
     }
     let age = TOKEN_STATE.get(mint).and_then(|s| s.ticks.front().map(|t| now.saturating_sub(t.ts))).unwrap_or(0);
     let young = age <= cfg.pump_alert_young_secs;
-    let mut sigs: Vec<&str> = Vec::new();
+    // (machine key, human display) so we can both alert AND log signals for later scoring.
+    let mut sigs: Vec<(&str, &str)> = Vec::new();
     if signal.genuine_factor >= 0.75 && signal.score >= 55.0 {
-        sigs.push("💧 strong organic momentum forming");
+        sigs.push(("organic_momentum", "💧 strong organic momentum forming"));
     }
     if conv_count >= cfg.convergence_min as usize {
-        sigs.push("🟢 smart-money accumulation detected");
+        sigs.push(("smart_money", "🟢 smart-money accumulation detected"));
     }
     if conv_count >= 1 && signal.buy_volume_short >= cfg.pump_alert_whale_sol && young {
-        sigs.push("🐋 early whale positioning");
+        sigs.push(("whale_positioning", "🐋 early whale positioning"));
     }
     if signal.unique_buyers_short >= cfg.pump_alert_breadth && young {
-        sigs.push("📈 abnormal holder growth");
+        sigs.push(("holder_growth", "📈 abnormal holder growth"));
     }
     if signal.score >= 70.0 && signal.genuine_factor >= 0.7 && signal.unique_buyers_short >= cfg.pump_alert_breadth / 2 {
-        sigs.push("🚀 high-probability breakout setup");
+        sigs.push(("breakout_setup", "🚀 high-probability breakout setup"));
     }
     if sigs.len() < cfg.pump_alert_min_signals {
         return;
     }
     PUMP_ALERTED.insert(mint.to_string(), now);
+    let level = if sigs.len() >= 3 { "MAJOR" } else { "EARLY" };
     let head = if sigs.len() >= 3 { "⚡ POTENTIAL MAJOR PUMP INCOMING" } else { "👀 EARLY PUMP SIGNAL" };
     let short = &mint[..mint.len().min(8)];
-    logger.log(format!("{} {} | {} | mcap {:.1} SOL", head, short, sigs.join(" · "), signal.current_mcap).magenta().bold().to_string());
-    telegram::notify(format!("{}\n{}\nmcap {:.1} SOL · {} signals\n{}", head, sigs.join("\n"), signal.current_mcap, sigs.len(), mint));
+    let displays: Vec<&str> = sigs.iter().map(|(_, d)| *d).collect();
+    logger.log(format!("{} {} | {} | mcap {:.1} SOL", head, short, displays.join(" · "), signal.current_mcap).magenta().bold().to_string());
+    telegram::notify(format!("{}\n{}\nmcap {:.1} SOL · {} signals\n{}", head, displays.join("\n"), signal.current_mcap, sigs.len(), mint));
+
+    // Persist the alert so the research layer can score whether it was RIGHT (precision/recall
+    // per signal). One row per fired alert; best-effort, never blocks trading.
+    let base = { DECISION_LOG_PATH.lock().map(|p| p.clone()).unwrap_or_default() };
+    if !base.is_empty() {
+        use std::io::Write;
+        let path = format!("{}_signals.csv", base);
+        let keys: Vec<&str> = sigs.iter().map(|(k, _)| *k).collect();
+        let need_header = !std::path::Path::new(&path).exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if need_header {
+                let _ = writeln!(f, "timestamp,ca,level,signals,n_signals,mcap");
+            }
+            let _ = writeln!(f, "{},{},{},{},{},{:.3}",
+                chrono::Utc::now().to_rfc3339(), mint, level, keys.join("|"), keys.len(), signal.current_mcap);
+        }
+    }
 }
 
 /// Load the runner-research knowledge base into memory; keep only patterns above the

@@ -183,6 +183,21 @@ pings you — it does NOT crash or get stuck.
 - **gRPC feed** — for lowest latency set `MOMENTUM_FEED=grpc` + a Yellowstone endpoint
   (the default; the ws feed is the no-gRPC fallback).
 
+## 10c. Real-time smart-money watch (optional, separate always-on process)
+
+`smart_money_watch.py` follows the bot's PROVEN wallets market-wide via Helius webhooks and
+pings Telegram the instant any of them buys a token. The daily report re-syncs the wallet
+set; the *receiver* is a long-running process (like the bot), run it under its own systemd
+unit or tmux:
+```
+export HELIUS_API_KEY=...                                  # free at helius.dev
+export SMART_MONEY_WEBHOOK_URL=https://<vps-public>:8899    # the receiver's public URL
+python3 scripts/smart_money_watch.py --sync                # register the webhook (daily report does this too)
+python3 scripts/smart_money_watch.py --serve --port 8899   # the receiver (open 8899 in ufw)
+```
+Needs a publicly-reachable URL and the port open. It only READS the wallet rep file, so it's
+isolated from the bot. Optional — skip it if you don't want to run an inbound service.
+
 ## 10b. Isolation: research layer vs. the sniper bot
 
 The two systems are deliberately decoupled so neither degrades the other:

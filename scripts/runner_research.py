@@ -315,6 +315,43 @@ def main():
         print("  none validated yet. The discipline is working: we report NOTHING until it")
         print("  survives the held-out window. Better an honest 'no edge yet' than an overfit one.")
 
+    # ---- 7b. Near-miss analysis: WHY look-alikes fail (the false-positive killer) ----
+    section("7b. NEAR-MISS ANALYSIS (why look-alikes FAIL — the false-positive killer)")
+    # "Looks like a runner" = passes the validated filters, or (fallback) sits above the
+    # runner-typical level on the top-2 DNA features.
+    runner_med = {k: median([fval(r, k) for r in runners]) for k in FEATURES}
+    def looks_like(r):
+        if validated:
+            return all(not math.isnan(fval(r, v["feature"])) and fval(r, v["feature"]) >= v["cutoff"]
+                       for v in validated)
+        top = [k for _, k, *_ in dna[:2]]
+        return bool(top) and all(not math.isnan(fval(r, k)) and fval(r, k) >= runner_med[k] for k in top)
+    cands = [r for r in rows if looks_like(r)]
+    tp = [r for r in cands if maxret(r) >= runner_thr]   # matched AND ran
+    fp = [r for r in cands if maxret(r) < runner_thr]    # matched but FAILED = the near-misses
+    print(f"  {len(cands)} tokens matched the runner look | {len(tp)} ran, "
+          f"{len(fp)} were near-misses (false positives)")
+    if len(tp) >= 3 and len(fp) >= 5:
+        print(f"  precision of the raw 'looks-like-a-runner' filter: {pct(len(tp), len(cands)):.0f}%  "
+              f"(this is what the next filter must lift toward 80%)")
+        print(f"\n  what separated the WINNERS from the LOOK-ALIKES that died:")
+        print(f"  {'feature':20} {'winners':>10} {'near-miss':>10} {'gap':>8}")
+        seps = []
+        for k in FEATURES:
+            wm, nm = mean([fval(r, k) for r in tp]), mean([fval(r, k) for r in fp])
+            if math.isnan(wm) or math.isnan(nm):
+                continue
+            scale = max(abs(wm), abs(nm), 1e-9)
+            seps.append((abs((wm - nm) / scale), k, wm, nm, (wm - nm) / scale))
+        seps.sort(reverse=True)
+        for _, k, wm, nm, gap in seps[:5]:
+            flag = "  << false-positive killer" if abs(gap) > 0.3 else ""
+            print(f"  {k:20} {wm:>10.3f} {nm:>10.3f} {gap:>+7.0%}{flag}")
+        print("  (the top feature is your false-positive killer: winners have it, the look-alikes")
+        print("   that died don't. Add it as a SECONDARY filter to raise precision toward 80%.)")
+    else:
+        print("  not enough matched winners + near-misses yet to separate them — keep accumulating.")
+
     # ---- 8. Knowledge base: accumulate + refine over time -----------------
     section("8. KNOWLEDGE BASE (patterns refined across runs)")
     kb = {}

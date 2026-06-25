@@ -27,3 +27,5 @@ $LOWPRIO python3 scripts/runner_research.py momentum_decisions --report-dir repo
 $LOWPRIO python3 scripts/lifecycle_tracker.py || true
 # 4. Viral autopsy — re-dissect your known-winner list & refresh the viral DNA (if present).
 [ -f viral_tokens.txt ] && $LOWPRIO python3 scripts/viral_autopsy.py || true
+# 5. Refresh the proven smart-money wallet set (re-registers the Helius webhook if keys set).
+$LOWPRIO python3 scripts/smart_money_watch.py --sync || true

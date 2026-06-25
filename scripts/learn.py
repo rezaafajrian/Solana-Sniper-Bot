@@ -183,6 +183,17 @@ def realized_rows(rows):
 # ---------------------------------------------------------------------------
 # Statistics: significance + out-of-sample splitting (anti-overfitting).
 # ---------------------------------------------------------------------------
+def wilson_lower(w, n, z=1.96):
+    """Conservative lower bound on a proportion (a 100% on n=3 reads ~40%, not 100%)."""
+    if n == 0:
+        return 0.0
+    p = w / n
+    d = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return max(0.0, (centre - margin) / d)
+
+
 def z_prop(w1, n1, w2, n2):
     """Two-proportion z-score (absolute) for a win-rate difference. >1.96 ~ p<0.05."""
     if n1 < 1 or n2 < 1:
@@ -587,6 +598,64 @@ def main():
                 exit_recs.append(f"Signal '{sig}' edge is decaying (EV {ee:+.3f}→{re:+.3f}) and now negative — it's being copied out; down-weight it.")
     else:
         print("  not enough recent data to measure decay yet.")
+
+    # ---- 13. SIGNAL PRECISION (did our pre-pump alerts actually fire BEFORE pumps?) ----
+    section("13. SIGNAL PRECISION (are the early-warning alerts right?)")
+    sig_path = dec_path[:-4] + "_signals.csv"
+    if os.path.exists(sig_path):
+        row_by_ca = {r["ca"]: r for r in rows}
+        # per named signal: outcomes of every token where it fired
+        per_sig = defaultdict(lambda: {"n": 0, "pumped": 0, "won": 0})
+        lvl = defaultdict(lambda: {"n": 0, "pumped": 0})
+        total_alerts = 0
+        for a in csv.DictReader(open(sig_path, newline="")):
+            ca = a.get("ca")
+            total_alerts += 1
+            jr = row_by_ca.get(ca)
+            if not jr:
+                continue  # not labeled yet
+            pumped = f(jr, "o_max_return") >= 1.0  # >= 2x peak after the alert
+            won = is_winner(jr)
+            lvl[a.get("level", "?")]["n"] += 1
+            if pumped:
+                lvl[a.get("level", "?")]["pumped"] += 1
+            for s in (a.get("signals", "") or "").split("|"):
+                if not s:
+                    continue
+                per_sig[s]["n"] += 1
+                if pumped:
+                    per_sig[s]["pumped"] += 1
+                if won:
+                    per_sig[s]["won"] += 1
+        labeled = sum(d["n"] for d in lvl.values())
+        print(f"  {total_alerts} alerts fired, {labeled} now labeled.")
+        if labeled:
+            for L in ("MAJOR", "EARLY"):
+                d = lvl.get(L)
+                if d and d["n"]:
+                    print(f"  {L:6} alerts: {d['n']:>4} | {pct(d['pumped'],d['n']):.0f}% hit 2x+ peak")
+            print(f"\n  {'signal':20} {'fired':>6} {'→2x%':>6} {'→win%':>7}  precision (lower-bound)")
+            for s, d in sorted(per_sig.items(), key=lambda x: -x[1]["n"]):
+                if d["n"] < 5:
+                    continue
+                lb = wilson_lower(d["pumped"], d["n"]) * 100  # conservative
+                star = "  ⭐ KEEP" if lb >= 50 else ("  ✗ weak" if lb < 20 else "")
+                print(f"  {s:20} {d['n']:>6} {pct(d['pumped'],d['n']):>5.0f}% {pct(d['won'],d['n']):>6.0f}% "
+                      f"  {lb:>5.0f}%{star}")
+            print("  (precision = conservative % of alerted tokens that pumped. Keep the high")
+            print("   ones, cut the weak ones — this is the alert system grading itself.)")
+            # surface to the synthesis: signals proven to work / proven dead
+            for s, d in per_sig.items():
+                if d["n"] >= 10:
+                    lb = wilson_lower(d["pumped"], d["n"]) * 100
+                    if lb >= 50:
+                        synth["strengths"].append(f"Alert '{s}' is reliable: {lb:.0f}% of its fires pumped (n={d['n']}).")
+                    elif lb < 20:
+                        synth["weaknesses"].append(f"Alert '{s}' is noise: only {lb:.0f}% pumped (n={d['n']}) — cut/raise its threshold.")
+        else:
+            print("  alerts fired but none labeled yet (wait for the 2h outcome horizon).")
+    else:
+        print("  no signal log yet — fires accumulate once the bot runs with alerts on.")
 
     # ---- 5. Recommendations ----
     section("9. RECOMMENDATIONS (data-driven, verify before trusting)")
