@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Arsahir I — live terminal</title>
 <style>
   :root{
@@ -91,10 +91,38 @@
   footer{padding:6px 12px;color:var(--dimmer);font-size:9px;letter-spacing:1px;border-top:1px solid var(--line);display:flex;gap:14px}
   footer .sp{flex:1}
 
+  /* tablets: stack the columns */
   @media(max-width:900px){
     .wrap{grid-template-columns:1fr}
     .botgrid{grid-template-columns:1fr}
     .hero .big{font-size:34px}
+    .feed{max-height:360px}
+    .chartbox{min-height:220px}
+  }
+  /* phones: readable, tappable, and NOTHING overflows the screen */
+  @media(max-width:600px){
+    body{font-size:13px}
+    header{flex-wrap:wrap;gap:8px;padding:7px 10px}
+    .brand{font-size:14px;letter-spacing:2px}
+    .clock{font-size:11px}
+    .hero{gap:10px;padding:10px 12px 4px}
+    .hero .big{font-size:30px}
+    .hero .sub{font-size:12px}
+    .chartbox{min-height:170px}
+    .ph{font-size:10px}
+    .kv{font-size:12px;padding:3px 0}
+    /* wide data tables scroll sideways INSIDE their panel instead of breaking the page */
+    .panel{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    table{width:auto;min-width:100%}
+    th,td{white-space:nowrap;padding:5px 8px}     /* roomier rows = easier to read/tap */
+    th{font-size:10px}
+    /* bigger, finger-friendly address + explorer links */
+    .addr .lnk{font-size:12px;padding:2px 6px;margin-left:5px}
+    .addr .cp{font-size:14px}
+    .ev{gap:8px;padding:4px 0}
+    .feed{max-height:300px;overflow:auto;-webkit-overflow-scrolling:touch}
+    footer{flex-wrap:wrap;gap:8px}
+    .scan{display:none}                            /* scanline overlay hurts readability on small screens */
   }
   /* scrollbars */
   ::-webkit-scrollbar{width:7px;height:7px}
