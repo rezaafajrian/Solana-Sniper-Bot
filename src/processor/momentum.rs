@@ -393,6 +393,15 @@ pub struct MomentumConfig {
     pub watch_dna_min_conf: f64,
     /// Path to the runner-research knowledge base (written by scripts/runner_research.py).
     pub watch_dna_file: String,
+    /// Early-warning pump alerts: surface named pre-pump signals (smart-money accumulation,
+    /// whale positioning, organic momentum, holder growth, breakout) to Telegram BEFORE a
+    /// move, so the bot is proactive, not reactive. Fires only when enough signals stack.
+    pub pump_alerts: bool,
+    pub pump_alert_whale_sol: f64,
+    pub pump_alert_breadth: usize,
+    pub pump_alert_young_secs: u64,
+    pub pump_alert_min_signals: usize,
+    pub pump_alert_cooldown_secs: u64,
 
     // ---- Learned avoidance: stop repeating mistakes (creator + pattern) ----
     /// Skip a token whose CREATOR has lost money for the bot before (decaying memory).
@@ -678,6 +687,12 @@ impl MomentumConfig {
             watch_dna_weight: env_f64("MOMENTUM_WATCH_DNA_WEIGHT", 0.40).clamp(0.0, 1.0),
             watch_dna_min_conf: env_f64("MOMENTUM_WATCH_DNA_MIN_CONF", 0.30),
             watch_dna_file: std::env::var("MOMENTUM_RUNNER_PATTERNS_FILE").unwrap_or_else(|_| "runner_patterns.json".to_string()),
+            pump_alerts: std::env::var("MOMENTUM_PUMP_ALERTS").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            pump_alert_whale_sol: env_f64("MOMENTUM_PUMP_ALERT_WHALE_SOL", 1.0),
+            pump_alert_breadth: env_usize("MOMENTUM_PUMP_ALERT_BREADTH", 12),
+            pump_alert_young_secs: env_u64("MOMENTUM_PUMP_ALERT_YOUNG_SECS", 300),
+            pump_alert_min_signals: env_usize("MOMENTUM_PUMP_ALERT_MIN_SIGNALS", 2),
+            pump_alert_cooldown_secs: env_u64("MOMENTUM_PUMP_ALERT_COOLDOWN_SECS", 1800),
             creator_avoid: std::env::var("MOMENTUM_CREATOR_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             creator_min_trades: env_u64("MOMENTUM_CREATOR_MIN_TRADES", 2) as u32,
             creator_avoid_pnl: env_f64("MOMENTUM_CREATOR_AVOID_PNL", -0.02),
@@ -1454,6 +1469,50 @@ struct RunnerPattern {
 lazy_static! {
     /// Validated runner patterns loaded from runner_patterns.json (the research bridge).
     static ref RUNNER_PATTERNS: std::sync::Mutex<Vec<RunnerPattern>> = std::sync::Mutex::new(Vec::new());
+    /// Pump-alert dedup: mint -> last alert time, so we don't spam the same token.
+    static ref PUMP_ALERTED: DashMap<String, u64> = DashMap::new();
+}
+
+/// Early-warning pump detector: from the live signals the bot already computes, surface the
+/// NAMED pre-pump conditions (smart-money accumulation, whale positioning, organic momentum,
+/// holder growth, breakout) the moment they form — to Telegram + log — so we spot a move
+/// taking shape in the minutes before it happens, not after. Fires only when enough signals
+/// stack (rare by design), deduped per mint.
+fn emit_pump_alerts(signal: &MomentumSignal, mint: &str, conv_count: usize, now: u64, cfg: &MomentumConfig, logger: &Logger) {
+    if !cfg.pump_alerts {
+        return;
+    }
+    if let Some(t) = PUMP_ALERTED.get(mint) {
+        if now.saturating_sub(*t) < cfg.pump_alert_cooldown_secs {
+            return;
+        }
+    }
+    let age = TOKEN_STATE.get(mint).and_then(|s| s.ticks.front().map(|t| now.saturating_sub(t.ts))).unwrap_or(0);
+    let young = age <= cfg.pump_alert_young_secs;
+    let mut sigs: Vec<&str> = Vec::new();
+    if signal.genuine_factor >= 0.75 && signal.score >= 55.0 {
+        sigs.push("💧 strong organic momentum forming");
+    }
+    if conv_count >= cfg.convergence_min as usize {
+        sigs.push("🟢 smart-money accumulation detected");
+    }
+    if conv_count >= 1 && signal.buy_volume_short >= cfg.pump_alert_whale_sol && young {
+        sigs.push("🐋 early whale positioning");
+    }
+    if signal.unique_buyers_short >= cfg.pump_alert_breadth && young {
+        sigs.push("📈 abnormal holder growth");
+    }
+    if signal.score >= 70.0 && signal.genuine_factor >= 0.7 && signal.unique_buyers_short >= cfg.pump_alert_breadth / 2 {
+        sigs.push("🚀 high-probability breakout setup");
+    }
+    if sigs.len() < cfg.pump_alert_min_signals {
+        return;
+    }
+    PUMP_ALERTED.insert(mint.to_string(), now);
+    let head = if sigs.len() >= 3 { "⚡ POTENTIAL MAJOR PUMP INCOMING" } else { "👀 EARLY PUMP SIGNAL" };
+    let short = &mint[..mint.len().min(8)];
+    logger.log(format!("{} {} | {} | mcap {:.1} SOL", head, short, sigs.join(" · "), signal.current_mcap).magenta().bold().to_string());
+    telegram::notify(format!("{}\n{}\nmcap {:.1} SOL · {} signals\n{}", head, sigs.join("\n"), signal.current_mcap, sigs.len(), mint));
 }
 
 /// Load the runner-research knowledge base into memory; keep only patterns above the
@@ -3003,6 +3062,10 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let conv = if kol.is_none() { smart_convergence(&mint, now, &cfg) } else { None };
     let conv_count = conv.as_ref().map(|(c, _, _)| *c).unwrap_or(0);
     let is_convergence = conv.as_ref().map(|(c, _, _)| *c >= cfg.convergence_min).unwrap_or(false);
+
+    // Early-warning: surface named pre-pump signals BEFORE deciding to buy, so the bot
+    // flags a move forming even on tokens it won't (or can't yet) enter.
+    emit_pump_alerts(&signal, &mint, conv_count, now, &cfg, &logger);
     let alpha = conv.as_ref().map(|(_, _, w)| (w.clone(), 0.0));
     let alpha_pts = if is_convergence {
         cfg.convergence_boost
