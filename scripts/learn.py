@@ -18,6 +18,7 @@ Usage:
 """
 
 import csv, os, sys, math, argparse, datetime as dt, json, urllib.request
+from itertools import combinations
 from collections import defaultdict
 
 
@@ -657,9 +658,85 @@ def main():
     else:
         print("  no signal log yet — fires accumulate once the bot runs with alerts on.")
 
+    # ---- 14. AUTONOMOUS EDGE DISCOVERY ------------------------------------
+    # Search the hypothesis space on its own — single-feature rules (both directions) AND
+    # 2-feature combos among the top discriminators — fit on TRAIN, then keep only the ones
+    # that hold OUT-OF-SAMPLE with real significance. This is where it finds edges nobody
+    # hand-coded and "creates" novel, validated selection rules — with hard evidence, not vibes.
+    section("14. AUTONOMOUS EDGE DISCOVERY (self-found rules, OOS-validated)")
+    discovered = []
+    dtrain, dtest = time_split(rows, args.test_frac)
+    def base_wr(rs):
+        w = sum(1 for r in rs if is_winner(r)); l = sum(1 for r in rs if is_loser(r))
+        return w, w + l
+    bw, bn = base_wr(rows)
+    base = bw / bn if bn else 0.0
+    if len(dtrain) < 30 or len(dtest) < 15:
+        print(f"  baseline win rate {base*100:.0f}% — not enough data to search safely yet "
+              f"(train {len(dtrain)}/test {len(dtest)}). Searching would just overfit.")
+    else:
+        topfeats = [k for _, k, *_ in feats_ranked[:6]] or NUM_FEATURES[:6]
+        MIN_TR, MIN_TE, MARGIN, ZBAR = 10, 8, 0.10, 2.5  # ZBAR tightened for the search size
+        # build candidate predicates: (label, predicate)
+        cands = []
+        def deciles(rs, k):
+            v = sorted(f(r, k) for r in rs if not math.isnan(f(r, k)))
+            return [v[int(len(v) * q / 10)] for q in (3, 5, 7)] if len(v) >= 15 else []
+        for k in NUM_FEATURES:
+            for cut in deciles(dtrain, k):
+                cands.append((f"{k} >= {cut:.2f}", (lambda r, k=k, c=cut: not math.isnan(f(r, k)) and f(r, k) >= c)))
+                cands.append((f"{k} <= {cut:.2f}", (lambda r, k=k, c=cut: not math.isnan(f(r, k)) and f(r, k) <= c)))
+        for a, b in combinations(topfeats, 2):
+            for ca in deciles(dtrain, a)[:2]:
+                for cb in deciles(dtrain, b)[:2]:
+                    cands.append((f"{a} >= {ca:.2f} AND {b} >= {cb:.2f}",
+                                  (lambda r, a=a, b=b, ca=ca, cb=cb: not math.isnan(f(r, a)) and not math.isnan(f(r, b)) and f(r, a) >= ca and f(r, b) >= cb)))
+        seen_lbl = set()
+        cands = [(l, p) for (l, p) in cands if not (l in seen_lbl or seen_lbl.add(l))]
+        tested = 0
+        for label, pred in cands:
+            trs = [r for r in dtrain if pred(r)]
+            tw = sum(1 for r in trs if is_winner(r)); tl = sum(1 for r in trs if is_loser(r))
+            if tw + tl < MIN_TR or (tw / (tw + tl) if tw + tl else 0) - base < MARGIN:
+                continue
+            tested += 1
+            tes = [r for r in dtest if pred(r)]
+            ew = sum(1 for r in tes if is_winner(r)); el = sum(1 for r in tes if is_loser(r))
+            if ew + el < MIN_TE:
+                continue
+            test_wr = ew / (ew + el)
+            # significance: subset vs the rest of the test window
+            rest = [r for r in dtest if not pred(r)]
+            rw = sum(1 for r in rest if is_winner(r)); rl = sum(1 for r in rest if is_loser(r))
+            z = z_prop(ew, ew + el, rw, rw + rl)
+            if test_wr > base and z >= ZBAR:
+                discovered.append({"rule": label, "train_wr": tw / (tw + tl), "test_wr": test_wr,
+                                   "test_n": ew + el, "z": z, "conf": wilson_lower(ew, ew + el)})
+        discovered.sort(key=lambda d: -d["conf"])
+        print(f"  searched {len(cands)} candidate rules, {tested} cleared train, "
+              f"{len(discovered)} held OUT-OF-SAMPLE.  baseline win rate {base*100:.0f}%")
+        if discovered:
+            print(f"\n  {'discovered rule':44} {'train':>6} {'test':>6} {'n':>4} {'sig':>5} {'conf':>5}")
+            for d in discovered[:12]:
+                print(f"  {d['rule'][:44]:44} {d['train_wr']*100:>5.0f}% {d['test_wr']*100:>5.0f}% "
+                      f"{d['test_n']:>4} {d['z']:>5.1f} {d['conf']*100:>4.0f}%")
+            print("  (each held on data it was NOT fit on, at z>=2.5. conf = conservative")
+            print("   lower-bound win rate. These are edges the search found on its own.)")
+            for d in discovered[:3]:
+                synth["hidden"].append(f"DISCOVERED EDGE: '{d['rule']}' → {d['test_wr']*100:.0f}% win rate "
+                                       f"out-of-sample (base {base*100:.0f}%, n={d['test_n']}, z={d['z']:.1f}).")
+        else:
+            print("  → nothing survived. Honest: no hidden edge in this data yet (or too few")
+            print("    samples). The search refuses to manufacture one — that's the point.")
+
     # ---- 5. Recommendations ----
     section("9. RECOMMENDATIONS (data-driven, verify before trusting)")
     recs = []
+    # Lead with anything the autonomous search discovered (highest novelty).
+    for d in discovered[:2]:
+        recs.append(f"NEW EDGE found by the search: '{d['rule']}' → {d['test_wr']*100:.0f}% win rate "
+                    f"out-of-sample vs {base*100:.0f}% baseline (n={d['test_n']}, z={d['z']:.1f}). "
+                    "Encode it as a filter/scoring factor and A/B it.")
     # Per-signal edge: lean into the best, cut the worst.
     sig_ev = []
     for sig, rs in by_signal.items():
