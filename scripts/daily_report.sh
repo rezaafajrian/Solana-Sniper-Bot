@@ -14,6 +14,10 @@
 #   0 9 * * * cd /opt/solbot/Solana-Sniper-Bot && ./scripts/daily_report.sh >> reports/cron.log 2>&1
 set -e
 cd "$(dirname "$0")/.."
+mkdir -p reports   # log + report target (also used by the scheduler's cron.log)
+
+# Stamp each run so the cron/journal log is readable when this runs unattended.
+echo "──── research pass $(date '+%Y-%m-%d %H:%M:%S %z') ────"
 
 # Lowest-priority wrapper so the analysis can't steal CPU/IO from the bot.
 LOWPRIO="nice -n 19"

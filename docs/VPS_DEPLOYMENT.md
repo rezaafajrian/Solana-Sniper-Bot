@@ -233,3 +233,28 @@ Run it any time by hand: `./scripts/daily_report.sh`. (Telegram push needs
 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` in `.env`; without them it just saves the file.)
 The report is most useful once outcomes have matured — give the bot a couple of days of
 continuous running so there's enough labeled data for the out-of-sample validation.
+
+## 11. Full autonomy (one command)
+
+You don't have to wire any of section 4 / 10 by hand. From the repo dir:
+```
+./scripts/install_autonomy.sh --with-bot        # bot service + nightly research
+./scripts/install_autonomy.sh                   # just the nightly research
+./scripts/install_autonomy.sh --at 03:30        # pick the research time (default 09:00 local)
+./scripts/install_autonomy.sh --uninstall       # remove what it installed
+```
+It auto-detects paths and user (no hand-editing) and picks the best scheduler available:
+**system systemd** (run as root — survives reboot, fully headless) → **user systemd**
+(non-root; it also enables *lingering* so jobs run while you're logged out) → **cron**
+(universal fallback). The research timer uses `Persistent=true`, so a run missed while the
+box was off fires on next boot.
+
+Once installed, the loop is self-sustaining: the bot **auto-restarts** and **re-adopts open
+positions** on crash/reboot, the nightly pass **regenerates the knowledge base**
+(`runner_patterns.json`, `viral_dna.json`, smart-money set), and the bot **hot-reloads it
+every ~60s** — so each night's research sharpens the live watchlist with **no restart**.
+Check it's armed:
+```
+systemctl list-timers momentum-research.timer        # add --user for user-mode
+journalctl -u momentum-research -f                   # watch a run (add --user for user-mode)
+```

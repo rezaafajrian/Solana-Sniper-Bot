@@ -1,0 +1,24 @@
+[Unit]
+# Nightly research/learning pass — rebuilds the knowledge base (runner_patterns.json,
+# viral_dna.json, smart-money set, the learn.py synthesis) that the bot hot-reloads live.
+# Prefer the installer (auto-paths everything): ./scripts/install_autonomy.sh
+# This static unit is for manual installs — edit the paths/user to match your box.
+Description=Solana bot research/learning pass (oneshot, idle priority)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/solbot/Solana-Sniper-Bot
+ExecStart=/usr/bin/env bash /opt/solbot/Solana-Sniper-Bot/scripts/daily_report.sh
+# ISOLATION: never steal CPU/IO from the latency-sensitive bot.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+# This job only READS the bot's data and writes advisory files — keep it boxed in.
+ProtectSystem=strict
+ReadWritePaths=/opt/solbot/Solana-Sniper-Bot
+NoNewPrivileges=true
+PrivateTmp=true

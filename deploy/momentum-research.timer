@@ -1,0 +1,15 @@
+[Unit]
+# Fires momentum-research.service nightly. Install (manual):
+#   sudo cp deploy/momentum-research.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now momentum-research.timer
+# Or just: ./scripts/install_autonomy.sh   (does all of this, auto-pathed)
+Description=Nightly Solana bot research/learning pass
+
+[Timer]
+# 09:00 local time daily. Persistent=true catches up a run missed while the box was off.
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
