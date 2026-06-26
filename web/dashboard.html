@@ -156,8 +156,8 @@
 
     <div class="panel">
       <div class="ph"><span class="x">CAPITAL</span><span class="c" id="capmode"></span></div>
-      <div class="kv" id="equityRow" style="display:none"><span class="k">equity</span><span class="v" id="equity">—</span></div>
-      <div class="kv" id="availRow" style="display:none"><span class="k">available</span><span class="v" id="avail">—</span></div>
+      <div class="kv" id="equityRow"><span class="k">total SOL</span><span class="v" id="equity">—</span></div>
+      <div class="kv" id="availRow"><span class="k">available</span><span class="v" id="avail">—</span></div>
       <div class="kv"><span class="k">deployed</span><span class="v" id="deployed">—</span></div>
       <div class="bar" id="capbar"><i style="width:0%"></i></div>
       <div class="kv"><span class="k">open / max pos</span><span class="v" id="pos">—</span></div>
@@ -387,19 +387,19 @@ function render(snap){
   // capital
   const cap=snap.capital||{}; const c=snap.counts||{}; const cfg=snap.config||{};
   const dep=cap.deployed_sol||0, max=cap.max_deployed_sol||1;
+  // Total SOL = start capital + realized PnL (always emitted now). The "(+x)" is the
+  // realized growth on top of the starting capital. Shown in every mode.
+  const eq=cap.equity_sol||0, start=cap.start_capital_sol||0, avail=cap.available_sol||0;
+  const grow=eq-start;
+  $("equityRow").style.display="flex"; $("availRow").style.display="flex";
+  $("equity").innerHTML=`<span class="${cls(eq)}">${eq.toFixed(3)}</span> <span class="dim">(${grow>=0?"+":""}${grow.toFixed(3)})</span>`;
+  $("avail").textContent=avail.toFixed(3);
+  $("deployed").textContent=`${dep.toFixed(3)}`;
   if(cap.bankroll_mode){
-    const eq=cap.equity_sol||0, start=cap.start_capital_sol||0, avail=cap.available_sol||0;
-    const grow=eq-start;
     $("capmode").innerHTML = cap.margin_called? `<span class="down">💀 MARGIN CALL</span>` : `bankroll`;
-    $("equityRow").style.display="flex"; $("availRow").style.display="flex";
-    $("equity").innerHTML=`<span class="${cls(grow)}">${eq.toFixed(3)}</span> <span class="dim">(${grow>=0?"+":""}${grow.toFixed(3)})</span>`;
-    $("avail").textContent=avail.toFixed(3);
-    $("deployed").textContent=`${dep.toFixed(3)}`;
     $("capbar").firstElementChild.style.width=Math.min(100,eq>0?dep/eq*100:0)+"%";
   } else {
     $("capmode").textContent="";
-    $("equityRow").style.display="none"; $("availRow").style.display="none";
-    $("deployed").textContent=`${dep.toFixed(3)} / ${max.toFixed(2)}`;
     $("capbar").firstElementChild.style.width=Math.min(100,dep/max*100)+"%";
   }
   $("pos").textContent=`${c.open_positions||0} / ${c.max_positions||0}`;
@@ -471,13 +471,16 @@ function render(snap){
     const roi=a.avg_roi!=null?`<span class="${cls(a.avg_roi)}">${(a.avg_roi*100).toFixed(0)}%</span>`:"—";
     const rugs=(a.rugs_created>0)?`<span class="down" title="created ${a.rugs_created} rug(s)">⚠${a.rugs_created}</span>`:(a.rugs_bought>0?`<span class="am" title="bought ${a.rugs_bought} rug(s)">${a.rugs_bought}</span>`:`<span class="dim">0</span>`);
     const clu=(a.cluster_id>0)?`<span class="am" title="coordinated cluster">#${a.cluster_id}</span>`:`<span class="dim">·</span>`;
-    tr.innerHTML=`<td>${walletCell(a.wallet)}</td>`+
+    // proven wallets (cleared the follow bar) get a ✓; the rest are candidates the bot
+    // is still grading — shown so the panel reflects the accumulated memory, not blank.
+    const pv = a.proven ? `<span class="up" title="proven — followed for entries">✓ </span>` : ``;
+    tr.innerHTML=`<td>${pv}${walletCell(a.wallet)}</td>`+
       `<td class="${tcol}">${a.tier||"—"}</td>`+
       `<td>${wrp}</td><td class="${tcol}">${sc.toFixed(0)}</td>`+
       `<td>${roi}</td><td>${rugs}</td><td>${clu}</td><td class="dim">${a.samples}</td>`;
     ab.appendChild(tr);
   });
-  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=8 class="dim">learning… needs ${cfg.alpha_min_samples||5}+ samples/wallet</td></tr>`;
+  if(!(snap.top_alpha||[]).length) ab.innerHTML=`<tr><td colspan=8 class="dim">learning… no wallet has 3+ graded trades yet</td></tr>`;
 
   // exit mix (from the recent feed window — a live sample, not the full session)
   const mix={};

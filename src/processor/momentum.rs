@@ -279,7 +279,15 @@ pub struct MomentumConfig {
     /// one has 1–2 wallets cycling. Raise for stricter (fewer, higher-quality) entries.
     pub struct_min_buyers: usize,
     /// Minimum bonding-curve liquidity (SOL) for an entry to be considered exitable.
-    /// 0 disables (liquidity-aware sizing caps already bound exposure).
+    /// 0 disables. Default 1.5 is DATA-DERIVED, not arbitrary: in our own
+    /// out-of-sample-validated learn.py report, `liquidity >= 1.23` was the binding
+    /// term of an 82%-win-rate rule (n=87, z=6.3, held out of sample), winners
+    /// averaged 12.8 SOL liquidity vs losers 3.85, and the low-liquidity bucket won
+    /// only 36% vs 73% for the high bucket. 1.5 sits just above that validated 1.23
+    /// floor and well below the 3.85 loser average — it rejects the thinnest, most
+    /// rug-prone, hardest-to-exit tokens without starving the bot of entries. For a
+    /// stricter, EV-optimal cut, the report's held-out gate was `liquidity >= 15.06`
+    /// (+0.632 EV/token) — raise this env var to A/B that.
     pub struct_min_liq_sol: f64,
     // ---- Anti-dump: stream-based concentration veto (no API, works on fresh tokens) ----
     /// Reject entry if the top-N traders hold more than this share of the net
@@ -632,7 +640,7 @@ impl MomentumConfig {
             require_structure: std::env::var("MOMENTUM_REQUIRE_STRUCTURE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             struct_min_genuine: env_f64("MOMENTUM_STRUCT_MIN_GENUINE", 0.55),
             struct_min_buyers: env_usize("MOMENTUM_STRUCT_MIN_BUYERS", 4),
-            struct_min_liq_sol: env_f64("MOMENTUM_STRUCT_MIN_LIQ_SOL", 0.0),
+            struct_min_liq_sol: env_f64("MOMENTUM_STRUCT_MIN_LIQ_SOL", 1.5),
             max_top_holder_share: env_f64("MOMENTUM_MAX_TOP_HOLDER_SHARE", 0.0),
             top_holder_n: env_usize("MOMENTUM_TOP_HOLDER_N", 10),
             max_creator_share: env_f64("MOMENTUM_MAX_CREATOR_SHARE", 0.0),
@@ -2065,18 +2073,28 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
 
     // The bot's self-discovered "scout list": wallets it learned are proven, plus
     // the strongest few — this is the compounding memory made visible.
+    // Count the wallets that cleared the "proven" bar (for the headline count), but
+    // build the visible scout list from the TOP wallets BY SCORE so the panel reflects
+    // the accumulated memory even before any wallet is fully proven (otherwise 20k+
+    // tracked wallets show as an empty panel — the "wallet stuck" bug). Each row carries
+    // a `proven` flag + tier so the UI can distinguish proven alpha from candidates. We
+    // require a few samples so single-trade noise wallets don't dominate the list.
     let mut proven = 0usize;
     let mut top_alpha: Vec<(f64, serde_json::Value)> = Vec::new();
     for e in WALLET_REP.iter() {
         let r = e.value();
-        if wallet_is_proven(&r, cfg) {
+        let is_proven = wallet_is_proven(&r, cfg);
+        if is_proven {
             proven += 1;
+        }
+        if r.samples >= 3 {
             top_alpha.push((r.final_score(), serde_json::json!({
                 "wallet": e.key(),
                 "score": r.final_score(),
                 "samples": r.samples,
                 "win_rate": r.recent_winrate(50),
                 "tier": r.tier(cfg.alpha_min_samples),
+                "proven": is_proven,
                 "avg_roi": r.avg_roi(),
                 "rugs_bought": r.rugs_bought,
                 "rugs_created": r.rugs_created,
@@ -2107,8 +2125,11 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "deployed_sol": deployed_sol(),
             "max_deployed_sol": cfg.max_deployed_sol,
             "start_capital_sol": cfg.start_capital_sol,
-            "equity_sol": if cfg.start_capital_sol > 0.0 { equity(cfg) } else { 0.0 },
-            "available_sol": if cfg.start_capital_sol > 0.0 { available_capital(cfg) } else { 0.0 },
+            // Always emit a meaningful account total: starting capital + realized PnL.
+            // When start_capital is unset (0) this is just realized PnL — still a real
+            // "total SOL" the dashboard can show, instead of a hardcoded 0.
+            "equity_sol": equity(cfg),
+            "available_sol": available_capital(cfg),
             "bankroll_mode": cfg.start_capital_sol > 0.0,
             "margin_called": MARGIN_CALLED.load(Ordering::SeqCst),
         },

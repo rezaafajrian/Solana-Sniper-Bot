@@ -69,6 +69,9 @@ set_kv MOMENTUM_DRY_RUN true
 set_kv MOMENTUM_LIVE_CONFIRM false
 set_kv MOMENTUM_FEED ws
 set_kv MOMENTUM_DECISION_LOG momentum_decisions
+# Account model: start from 1 SOL so the dashboard's "total SOL" is meaningful and PnL
+# compounds against a real bankroll (paper money in dry run). Change to taste.
+set_kv MOMENTUM_START_CAPITAL_SOL 1
 chmod 600 .env
 
 echo
