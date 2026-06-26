@@ -33,19 +33,16 @@ use crate::processor::transaction_parser::{decode_pumpfun_event, TradeInfoFromTo
 pub type FeedItem = (TradeInfoFromToken, String);
 
 fn subscribe_msg() -> String {
+    // logsSubscribe (not blockSubscribe): every Solana RPC supports it (Helius/Chainstack/
+    // QuickNode/public), whereas blockSubscribe is gated on most. The pump.fun trade event
+    // rides in the tx logs as a "Program data:" line and carries the trader, so logs are enough.
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "blockSubscribe",
+        "method": "logsSubscribe",
         "params": [
-            { "mentionsAccountOrProgram": PUMP_FUN_PROGRAM },
-            {
-                "commitment": "confirmed",
-                "encoding": "json",
-                "transactionDetails": "full",
-                "maxSupportedTransactionVersion": 0,
-                "showRewards": false
-            }
+            { "mentions": [ PUMP_FUN_PROGRAM ] },
+            { "commitment": "confirmed" }
         ]
     })
     .to_string()
@@ -66,7 +63,7 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                     logger.log("ws: failed to send blockSubscribe".red().to_string());
                     continue;
                 }
-                logger.log("📡 Websocket feed connected (blockSubscribe → pump.fun)".green().to_string());
+                logger.log("📡 Websocket feed connected (logsSubscribe → pump.fun)".green().to_string());
 
                 let mut msg_count: u64 = 0;
                 let mut event_count: u64 = 0;
@@ -87,13 +84,8 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                                 logger.log(format!("ws first message: {}", head).cyan().to_string());
                             }
                             if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                                // One-shot: dump the shape of the first block notification
-                                // so we can see exactly where the transactions/inner data live.
-                                if !logged_shape && v.get("method").and_then(|m| m.as_str()) == Some("blockNotification") {
-                                    logged_shape = true;
-                                    log_block_shape(&v, &logger);
-                                }
-                                event_count += forward_block(&v, &tx).await as u64;
+                                let _ = &logged_shape; // (block-shape debug no longer used with logs)
+                                event_count += forward_logs(&v, &tx).await as u64;
                                 if tx.is_closed() {
                                     return;
                                 }
@@ -188,8 +180,48 @@ fn log_block_shape(v: &Value, logger: &Logger) {
     logger.log("shape: no successful tx with inner instructions in this block".yellow().to_string());
 }
 
+/// Pull pump.fun trades out of a logsNotification and forward them. The pump.fun trade
+/// event is emitted as a `Program data: <base64>` log line whose bytes carry the trader
+/// (`user`) at offset 65 — so we need neither the full block nor the account keys. Works on
+/// any RPC that supports logsSubscribe (i.e. effectively all of them).
+async fn forward_logs(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
+    let value = match v.pointer("/params/result/value") {
+        Some(x) => x,
+        None => return 0,
+    };
+    if value.get("err").map(|e| !e.is_null()).unwrap_or(false) {
+        return 0; // skip failed transactions
+    }
+    let logs = match value.get("logs").and_then(|l| l.as_array()) {
+        Some(l) => l,
+        None => return 0,
+    };
+    let mut forwarded = 0usize;
+    for line in logs {
+        let s = match line.as_str() { Some(s) => s, None => continue };
+        let b64 = match s.strip_prefix("Program data: ") { Some(b) => b, None => continue };
+        let bytes = match base64::decode(b64) { Ok(b) => b, Err(_) => continue };
+        if bytes.len() < 129 {
+            continue;
+        }
+        if let Some(parsed) = decode_pumpfun_event(&bytes) {
+            let trader = if bytes.len() >= 97 {
+                bs58::encode(&bytes[65..97]).into_string()  // user pubkey, offset 65..97
+            } else {
+                String::new()
+            };
+            if tx.send((parsed, trader)).await.is_err() {
+                return forwarded;
+            }
+            forwarded += 1;
+        }
+    }
+    forwarded
+}
+
 /// Pull pump.fun trades out of a blockNotification value and forward them.
 /// Returns the number of events forwarded.
+#[allow(dead_code)]
 async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
     // blockNotification: params.result.value.block.transactions[]
     let txns = match v
