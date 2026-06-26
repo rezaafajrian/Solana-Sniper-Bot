@@ -27,7 +27,9 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::common::logger::Logger;
 use crate::dex::pump_fun::PUMP_FUN_PROGRAM;
-use crate::processor::transaction_parser::{decode_pumpfun_event, TradeInfoFromToken};
+use crate::processor::transaction_parser::{
+    decode_pumpfun_event, TradeInfoFromToken, PUMPFUN_TRADE_DISCRIMINATOR,
+};
 
 /// One parsed pump.fun trade plus the transaction's fee-payer (trader) address.
 pub type FeedItem = (TradeInfoFromToken, String);
@@ -123,6 +125,7 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
 
 /// One-shot structural dump of a block notification, so we can map the real field
 /// layout (it varies by provider/encoding) and fix `forward_block`.
+#[allow(dead_code)]
 fn log_block_shape(v: &Value, logger: &Logger) {
     fn keys(v: Option<&Value>) -> String {
         match v {
@@ -200,16 +203,35 @@ async fn forward_logs(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
     for line in logs {
         let s = match line.as_str() { Some(s) => s, None => continue };
         let b64 = match s.strip_prefix("Program data: ") { Some(b) => b, None => continue };
-        let bytes = match base64::decode(b64) { Ok(b) => b, Err(_) => continue };
+        let raw = match base64::decode(b64) { Ok(b) => b, Err(_) => continue };
+
+        // pump.fun's TradeEvent reaches us in two byte layouts depending on how it
+        // was emitted, and `decode_pumpfun_event` expects the CPI inner-instruction
+        // layout where the 8-byte discriminator sits at offset 8 (mint at 16):
+        //
+        //   • CPI / inner-instruction (`emit_cpi!`): [8-byte CPI marker][8-byte disc][fields…]
+        //       → disc at 8..16  → feed straight to decode_pumpfun_event
+        //   • "Program data:" log line (`emit!` via sol_log_data): [8-byte disc][fields…]
+        //       → disc at 0..8  → SHORT by 8 bytes, so we left-pad 8 bytes to realign.
+        //
+        // A "Program data:" log nearly always carries the bare-disc layout (its base64
+        // begins "vdt/007mYe…", which is the discriminator itself), but we detect the
+        // layout from the bytes rather than assume, so either form decodes correctly.
+        let buf: Vec<u8>;
+        let bytes: &[u8] = if raw.get(0..8) == Some(&PUMPFUN_TRADE_DISCRIMINATOR[..]) {
+            // bare-disc (log) layout — left-pad 8 bytes so disc lands at 8..16.
+            buf = std::iter::repeat(0u8).take(8).chain(raw.iter().copied()).collect();
+            &buf
+        } else {
+            // already CPI layout (disc at 8..16) — use as-is.
+            &raw
+        };
         if bytes.len() < 129 {
             continue;
         }
-        if let Some(parsed) = decode_pumpfun_event(&bytes) {
-            let trader = if bytes.len() >= 97 {
-                bs58::encode(&bytes[65..97]).into_string()  // user pubkey, offset 65..97
-            } else {
-                String::new()
-            };
+        if let Some(parsed) = decode_pumpfun_event(bytes) {
+            // user/trader pubkey is at offset 65..97 in the aligned (CPI) layout.
+            let trader = bs58::encode(&bytes[65..97]).into_string();
             if tx.send((parsed, trader)).await.is_err() {
                 return forwarded;
             }
@@ -282,4 +304,89 @@ async fn forward_block(v: &Value, tx: &mpsc::Sender<FeedItem>) -> usize {
         }
     }
     forwarded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bare-discriminator ("Program data:" log) layout TradeEvent buffer:
+    /// [disc(8)][mint(32)][sol_amount(8)][token_amount(8)][is_buy(1)][user(32)]
+    /// [timestamp(8)][vsol(8)][vtok(8)][real_sol(8)] — i.e. the CPI layout minus the
+    /// 8-byte CPI marker. forward_logs must left-pad this to decode it.
+    fn build_log_layout_event(mint: &[u8; 32], user: &[u8; 32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&PUMPFUN_TRADE_DISCRIMINATOR); // 0..8
+        b.extend_from_slice(mint); // 8..40
+        b.extend_from_slice(&1_000_000_000u64.to_le_bytes()); // sol_amount 40..48 (1 SOL)
+        b.extend_from_slice(&5_000_000u64.to_le_bytes()); // token_amount 48..56
+        b.push(1u8); // is_buy 56
+        b.extend_from_slice(user); // user 57..89
+        b.extend_from_slice(&1_700_000_000u64.to_le_bytes()); // timestamp 89..97
+        b.extend_from_slice(&30_000_000_000u64.to_le_bytes()); // vsol 97..105
+        b.extend_from_slice(&1_000_000_000_000_000u64.to_le_bytes()); // vtok 105..113
+        b.extend_from_slice(&10_000_000_000u64.to_le_bytes()); // real_sol 113..121
+        b
+    }
+
+    #[tokio::test]
+    async fn forward_logs_decodes_program_data_log_layout() {
+        let mint = [7u8; 32];
+        let user = [9u8; 32];
+        let raw = build_log_layout_event(&mint, &user);
+        // sanity: the base64 must begin with the known pump.fun trade prefix
+        let b64 = base64::encode(&raw);
+        assert!(b64.starts_with("vdt/007mYe"), "unexpected event prefix: {}", &b64[..12]);
+
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "value": {
+                        "signature": "sig",
+                        "err": null,
+                        "logs": [
+                            "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+                            format!("Program data: {}", b64),
+                            "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+                        ]
+                    }
+                }
+            }
+        });
+
+        let (tx, mut rx) = mpsc::channel::<FeedItem>(8);
+        let n = forward_logs(&notif, &tx).await;
+        assert_eq!(n, 1, "expected exactly one decoded pump.fun event");
+
+        let (parsed, trader) = rx.recv().await.expect("event should be forwarded");
+        assert_eq!(parsed.mint, bs58::encode(&mint).into_string());
+        assert_eq!(trader, bs58::encode(&user).into_string());
+        assert!(parsed.is_buy);
+        assert_eq!(parsed.virtual_sol_reserves, 30_000_000_000);
+        assert_eq!(parsed.virtual_token_reserves, 1_000_000_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn forward_logs_skips_failed_and_unrelated() {
+        // failed tx → nothing
+        let failed = serde_json::json!({
+            "params": { "result": { "value": {
+                "err": {"InstructionError": [0, "Custom"]},
+                "logs": ["Program data: vdt/007mYe0000"]
+            }}}
+        });
+        let (tx, _rx) = mpsc::channel::<FeedItem>(8);
+        assert_eq!(forward_logs(&failed, &tx).await, 0);
+
+        // unrelated logs → nothing
+        let unrelated = serde_json::json!({
+            "params": { "result": { "value": {
+                "err": null,
+                "logs": ["Program log: hello", "Program data: AAAA"]
+            }}}
+        });
+        assert_eq!(forward_logs(&unrelated, &tx).await, 0);
+    }
 }
