@@ -391,6 +391,19 @@ pub struct MomentumConfig {
     pub watch_score_min: f64,
     pub watch_autobuy: bool,
     pub watch_size_sol: f64,
+    // ---- Hard watchlist floors: keep TRASH off "Ones to Watch" (gates, not soft score) ----
+    /// Liquidity lock: a watch candidate must have at least this much bonding-curve
+    /// liquidity (SOL). Below it the token can't be exited cleanly — never a "watch".
+    pub watch_min_liq_sol: f64,
+    /// Volume floor: minimum short-window buy volume (SOL) to qualify for watch.
+    pub watch_min_vol_sol: f64,
+    /// Whale gate: if `watch_require_whale`, a watch candidate must show either a single
+    /// buy of at least `watch_whale_sol`, proven smart money, or smart-money convergence.
+    pub watch_whale_sol: f64,
+    pub watch_require_whale: bool,
+    /// Reject a watch candidate whose top-holder share exceeds this (insider/bundler
+    /// concentration). 0 disables.
+    pub watch_max_concentration: f64,
     /// Weight on the market-structure half of the composite (rest goes to convergence).
     pub watch_ms_weight: f64,
     /// Bridge to the runner-research knowledge base: how much a token's match against the
@@ -691,6 +704,14 @@ impl MomentumConfig {
             watch_score_min: env_f64("MOMENTUM_WATCH_SCORE", 70.0),
             watch_autobuy: std::env::var("MOMENTUM_WATCH_AUTOBUY").map(|v| v.to_lowercase() == "true").unwrap_or(false),
             watch_size_sol: env_f64("MOMENTUM_WATCH_SIZE_SOL", 0.5),
+            // Hard watchlist floors. Strict by default so trash can't appear: a healthy
+            // curve (≥8 SOL liq), real volume (≥3 SOL), a whale or proven smart money,
+            // and no bundler/insider concentration (≤80% top holder).
+            watch_min_liq_sol: env_f64("MOMENTUM_WATCH_MIN_LIQ_SOL", 8.0),
+            watch_min_vol_sol: env_f64("MOMENTUM_WATCH_MIN_VOL_SOL", 3.0),
+            watch_whale_sol: env_f64("MOMENTUM_WATCH_WHALE_SOL", 5.0),
+            watch_require_whale: std::env::var("MOMENTUM_WATCH_REQUIRE_WHALE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            watch_max_concentration: env_f64("MOMENTUM_WATCH_MAX_CONCENTRATION", 0.80),
             watch_ms_weight: env_f64("MOMENTUM_WATCH_MS_WEIGHT", 0.5).clamp(0.0, 1.0),
             watch_dna_weight: env_f64("MOMENTUM_WATCH_DNA_WEIGHT", 0.40).clamp(0.0, 1.0),
             watch_dna_min_conf: env_f64("MOMENTUM_WATCH_DNA_MIN_CONF", 0.30),
@@ -931,6 +952,10 @@ pub struct MomentumSignal {
     pub smart_money_boost: f64,
     /// 0..1 authenticity multiplier (1 = organic; <1 = manufactured/wash momentum).
     pub genuine_factor: f64,
+    /// Largest single-wallet buy volume (SOL) in the short window — a "whale" proxy.
+    /// A wallet dropping size into one token is a conviction tell independent of whether
+    /// the bot has graded it yet. Used to keep the watchlist whale-gated.
+    pub max_wallet_buy_sol: f64,
 }
 
 /// An open position managed by the momentum exit policy.
@@ -1445,6 +1470,50 @@ fn smart_convergence(mint: &str, now: u64, cfg: &MomentumConfig) -> Option<(usiz
 ///   3) Runner-DNA match — how well the token matches the VALIDATED runner patterns the
 ///      research layer learned (the bridge). Only active once the knowledge base has
 ///      proven patterns; otherwise the composite falls back to (1)+(2).
+/// Hard qualification gate for "Ones to Watch" — these are FLOORS, not soft score
+/// inputs, so a high momentum score can no longer paper over a trash token. A candidate
+/// must clear EVERY check to be eligible for the watchlist. Returns the first failing
+/// reason, or None if it qualifies.
+///
+///   • liquidity lock  — enough bonding-curve SOL to actually exit
+///   • volume floor     — real short-window buy volume
+///   • genuine demand   — not wash/creator-faked (reuses the structure-gate floor)
+///   • no bundler       — not dominated by a coordinated buy cluster
+///   • no insider       — top holder doesn't own too much of the float
+///   • whale / smart $   — a sized buyer, proven wallet, or convergence is present
+fn watch_qualifies(
+    signal: &MomentumSignal,
+    mint: &str,
+    conv_count: usize,
+    conc: f64,
+    liq: f64,
+    cfg: &MomentumConfig,
+) -> Option<&'static str> {
+    if cfg.watch_min_liq_sol > 0.0 && liq < cfg.watch_min_liq_sol {
+        return Some("thin liquidity");
+    }
+    if cfg.watch_min_vol_sol > 0.0 && signal.buy_volume_short < cfg.watch_min_vol_sol {
+        return Some("low volume");
+    }
+    if signal.genuine_factor < cfg.struct_min_genuine {
+        return Some("manufactured demand");
+    }
+    if cfg.watch_max_concentration > 0.0 && conc > cfg.watch_max_concentration {
+        return Some("insider concentration");
+    }
+    if bundler_cluster_veto(mint, cfg).is_some() {
+        return Some("bundler cluster");
+    }
+    if cfg.watch_require_whale {
+        let has_whale = signal.max_wallet_buy_sol >= cfg.watch_whale_sol;
+        let has_smart = signal.smart_money_boost > 0.0 || conv_count >= 1;
+        if !has_whale && !has_smart {
+            return Some("no whale / smart money");
+        }
+    }
+    None
+}
+
 fn watch_score(signal: &MomentumSignal, mint: &str, conv_count: usize, dna: Option<f64>, cfg: &MomentumConfig) -> (f64, f64, f64) {
     // --- market structure (0..100) ---
     let vol_mc = if signal.current_mcap > 0.0 { signal.buy_volume_short / signal.current_mcap } else { 0.0 };
@@ -2374,8 +2443,9 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
     let mcap_score = clamp01(mcap_velocity / cfg.target_mcap_growth.max(1e-9));
 
     // 6. Holder distribution: penalize a single wallet dominating the buys.
+    let max_wallet_buy_sol = per_wallet_buy.values().cloned().fold(0.0_f64, f64::max);
     let max_wallet_frac = if buy_vol_s > 0.0 {
-        per_wallet_buy.values().cloned().fold(0.0_f64, f64::max) / buy_vol_s
+        max_wallet_buy_sol / buy_vol_s
     } else {
         0.0
     };
@@ -2452,6 +2522,7 @@ fn score_token(state: &TokenMomentum, cfg: &MomentumConfig, now: u64) -> Momentu
         current_mcap: last_mcap_s.or(Some(state.last_mcap)).unwrap_or(0.0),
         smart_money_boost: boost,
         genuine_factor,
+        max_wallet_buy_sol,
     }
 }
 
@@ -3151,21 +3222,27 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // normal score gate (but still respects the safety vetoes + capital below).
     // Runner-DNA bridge: score this token against the validated runner patterns the
     // research layer learned. Build the same feature map the decision log records.
-    let dna = if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
+    // Concentration / liquidity snapshot — computed once, shared by the runner-DNA
+    // feature map AND the hard watch gate below.
+    let (w_conc, w_insider, w_cbuy, w_smart_cnt, w_liq) = if cfg.watch_enabled {
         let (conc, insider, cbuy, smart_cnt) = concentration_metrics(&parsed, &mint, &cfg);
-        let cscore = if creator.is_empty() { 0.0 } else { WALLET_REP.get(&creator).map(|r| r.score).unwrap_or(0.0) };
         let liq = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+        (conc, insider, cbuy, smart_cnt, liq)
+    } else { (0.0, 0.0, 0.0, 0u32, 0.0) };
+
+    let dna = if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
+        let cscore = if creator.is_empty() { 0.0 } else { WALLET_REP.get(&creator).map(|r| r.score).unwrap_or(0.0) };
         let conf = if cfg.entry_score > 0.0 { effective_score / cfg.entry_score } else { 0.0 };
         let mut fm: HashMap<&str, f64> = HashMap::new();
-        fm.insert("creator_buy", cbuy);
+        fm.insert("creator_buy", w_cbuy);
         fm.insert("creator_score", cscore);
         fm.insert("wallet_score", signal.smart_money_boost);
-        fm.insert("insider_score", insider);
-        fm.insert("smart_wallet_count", smart_cnt as f64);
-        fm.insert("holder_concentration", conc);
+        fm.insert("insider_score", w_insider);
+        fm.insert("smart_wallet_count", w_smart_cnt as f64);
+        fm.insert("holder_concentration", w_conc);
         fm.insert("marketcap", signal.current_mcap);
         fm.insert("volume", signal.buy_volume_short);
-        fm.insert("liquidity", liq);
+        fm.insert("liquidity", w_liq);
         fm.insert("overall_score", effective_score);
         fm.insert("confidence", conf);
         runner_dna_score(&fm)
@@ -3176,7 +3253,13 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     let (wscore, ms_sub, conv_sub) = if cfg.watch_enabled {
         watch_score(&signal, &mint, conv_count, dna_score, &cfg)
     } else { (0.0, 0.0, 0.0) };
-    let is_watch = cfg.watch_enabled && wscore >= cfg.watch_score_min && signal.current_mcap > 0.0;
+    // The composite must clear the bar AND every hard floor (liquidity lock, volume,
+    // whale/smart-money, no bundler, no insider concentration). This is what stops
+    // trash tokens from ever appearing on "Ones to Watch".
+    let is_watch = cfg.watch_enabled
+        && wscore >= cfg.watch_score_min
+        && signal.current_mcap > 0.0
+        && watch_qualifies(&signal, &mint, conv_count, w_conc, w_liq, &cfg).is_none();
     if is_watch {
         WATCHLIST.insert(mint.clone(), (wscore, ms_sub, conv_sub, now));
         if !DECISION_LOGGED.contains_key(&mint) {
@@ -4834,6 +4917,59 @@ mod tests {
         sig.genuine_factor = 0.9;
         sig.unique_buyers_short = 12; // real crowd, organic demand
         assert!(structure_gate(&sig, "M", &cfg).is_none(), "genuine broad demand must pass");
+    }
+
+    // ---- "Ones to Watch" hard floors: keep trash off the watchlist ----
+    fn clean_watch_sig(cfg: &MomentumConfig) -> MomentumSignal {
+        let mut s = MomentumSignal::default();
+        s.buy_volume_short = cfg.watch_min_vol_sol + 5.0;   // volume clears floor
+        s.genuine_factor = 1.0;                              // organic
+        s.max_wallet_buy_sol = cfg.watch_whale_sol + 1.0;    // a whale is in
+        s
+    }
+    #[test]
+    fn watch_gate_passes_clean_whale_token() {
+        let cfg = test_cfg();
+        let sig = clean_watch_sig(&cfg);
+        let liq = cfg.watch_min_liq_sol + 5.0;
+        assert_eq!(watch_qualifies(&sig, "WQ_OK", 0, 0.10, liq, &cfg), None);
+    }
+    #[test]
+    fn watch_gate_rejects_thin_liquidity() {
+        let cfg = test_cfg();
+        let sig = clean_watch_sig(&cfg);
+        assert_eq!(watch_qualifies(&sig, "WQ_LIQ", 2, 0.10, cfg.watch_min_liq_sol - 0.1, &cfg), Some("thin liquidity"));
+    }
+    #[test]
+    fn watch_gate_rejects_low_volume() {
+        let cfg = test_cfg();
+        let mut sig = clean_watch_sig(&cfg);
+        sig.buy_volume_short = cfg.watch_min_vol_sol - 0.1; // below the volume floor
+        assert_eq!(watch_qualifies(&sig, "WQ_VOL", 2, 0.10, cfg.watch_min_liq_sol + 5.0, &cfg), Some("low volume"));
+    }
+    #[test]
+    fn watch_gate_rejects_insider_concentration() {
+        let cfg = test_cfg();
+        let sig = clean_watch_sig(&cfg);
+        let conc = cfg.watch_max_concentration + 0.05; // top holder owns too much
+        assert_eq!(watch_qualifies(&sig, "WQ_CONC", 2, conc, cfg.watch_min_liq_sol + 5.0, &cfg), Some("insider concentration"));
+    }
+    #[test]
+    fn watch_gate_requires_whale_or_smart_money() {
+        let cfg = test_cfg();
+        let mut sig = clean_watch_sig(&cfg);
+        sig.max_wallet_buy_sol = cfg.watch_whale_sol - 0.1; // no whale
+        sig.smart_money_boost = 0.0;                         // no proven smart money
+        // conv_count 0 => no convergence either
+        assert_eq!(watch_qualifies(&sig, "WQ_WHALE", 0, 0.10, cfg.watch_min_liq_sol + 5.0, &cfg), Some("no whale / smart money"));
+    }
+    #[test]
+    fn watch_gate_smart_money_satisfies_without_whale() {
+        let cfg = test_cfg();
+        let mut sig = clean_watch_sig(&cfg);
+        sig.max_wallet_buy_sol = 0.0;       // no whale-sized buy
+        sig.smart_money_boost = 5.0;        // but proven smart money is in
+        assert_eq!(watch_qualifies(&sig, "WQ_SM", 0, 0.10, cfg.watch_min_liq_sol + 5.0, &cfg), None);
     }
 
     // ---- runner-DNA bridge (watchlist scores tokens vs validated patterns) ----
