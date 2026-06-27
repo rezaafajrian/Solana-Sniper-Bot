@@ -35,7 +35,7 @@ SETUP
 All thresholds are env-tunable (MARKET_* below). Defaults are deliberately STRICT so trash
 never shows up — loosen them if the list is too quiet.
 """
-import os, sys, csv, json, time, argparse, urllib.request, urllib.parse, datetime as dt
+import os, sys, csv, json, time, argparse, urllib.request, urllib.parse, urllib.error, datetime as dt
 
 BIRDEYE = "https://public-api.birdeye.so"
 OUT = "market_watch.json"
@@ -82,7 +82,8 @@ MIN_LIQ_MC    = envf("MARKET_MIN_LIQ_MC", 0.03)        # liquidity >= 3% of mcap
 MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >60% in 24h (dying)
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 100))    # tokens per list call (<=100)
-ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 80))     # how many survivors to enrich w/ holders
+ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 25))     # how many survivors to enrich w/ holders
+RATE_DELAY    = envf("MARKET_RATE_DELAY", 1.2)         # min seconds between Birdeye calls (free tier ~1 rps)
 INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 180)) # loop cadence
 ALERT_COOLDOWN = int(envf("MARKET_ALERT_COOLDOWN_SECS", 3600))  # per-token re-alert gap
 PAGES         = int(envf("MARKET_PAGES", 2))           # pages (of SCAN_LIMIT) per sort dimension
@@ -108,18 +109,46 @@ def telegram(text):
         pass
 
 
-def _bget(path, key, params=None):
-    """GET a Birdeye endpoint; return parsed JSON or None. Auth + chain headers per Birdeye."""
+_last_call = [0.0]
+def _throttle():
+    """Global pacing so we stay under the Birdeye rate limit (free tier ~1 rps)."""
+    wait = RATE_DELAY - (time.time() - _last_call[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_call[0] = time.time()
+
+
+# Sentinel telling fetch_token_list "the call ERRORED" vs "returned empty data" — so a 429
+# never triggers the legacy fallback (which would just 429 again and double the storm).
+ERRORED = object()
+
+
+def _bget(path, key, params=None, retries=4):
+    """GET a Birdeye endpoint with throttling + backoff. Returns parsed JSON, or ERRORED on
+    a transport/rate error (vs None for a clean-but-empty body)."""
     url = f"{BIRDEYE}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
     h = {"X-API-KEY": key, "x-chain": "solana", "accept": "application/json", "User-Agent": "market-watch"}
-    try:
-        req = urllib.request.Request(url, headers=h)
-        return json.load(urllib.request.urlopen(req, timeout=15))
-    except Exception as e:
-        sys.stderr.write(f"  birdeye {path} failed: {e}\n")
-        return None
+    for attempt in range(retries):
+        _throttle()
+        try:
+            return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                back = float(ra) if (ra and str(ra).isdigit()) else RATE_DELAY * (2 ** attempt)
+                back = min(back, 30.0)
+                sys.stderr.write(f"  birdeye {path} {e.code} — backing off {back:.1f}s (try {attempt+1}/{retries})\n")
+                time.sleep(back)
+                continue
+            sys.stderr.write(f"  birdeye {path} failed: HTTP {e.code} {e.reason}\n")
+            return ERRORED
+        except Exception as e:
+            sys.stderr.write(f"  birdeye {path} failed: {e}\n")
+            return ERRORED
+    sys.stderr.write(f"  birdeye {path}: gave up after {retries} tries (rate limited)\n")
+    return ERRORED
 
 
 def g(row, *keys, default=0.0):
@@ -137,17 +166,27 @@ def g(row, *keys, default=0.0):
 # ---------------------------------------------------------------------------
 # Birdeye fetchers
 # ---------------------------------------------------------------------------
+def _data(d):
+    """Pull the token rows from a Birdeye response, ERRORED/None-safe."""
+    if not isinstance(d, dict):
+        return None
+    data = d.get("data") or {}
+    return data.get("items") or data.get("tokens")
+
+
 def fetch_token_list(key, sort_by, limit, offset=0):
-    """One page of the Token List V3, sorted by `sort_by` (falls back to the legacy list)."""
-    st = "asc" if sort_by == "recent_listing_time" else "desc"
+    """One page of the Token List V3, sorted by `sort_by` (legacy fallback on a CLEAN empty,
+    never on a rate-limit error — that would just 429 again)."""
+    st = "desc" if sort_by != "recent_listing_time" else "asc"
     d = _bget("/defi/v3/token/list", key,
-              {"sort_by": sort_by, "sort_type": "desc" if sort_by != "recent_listing_time" else st,
-               "offset": offset, "limit": min(limit, 100)})
-    rows = (((d or {}).get("data") or {}).get("items")) or ((d or {}).get("data") or {}).get("tokens")
+              {"sort_by": sort_by, "sort_type": st, "offset": offset, "limit": min(limit, 100)})
+    if d is ERRORED:
+        return []
+    rows = _data(d)
     if not rows and offset == 0 and sort_by == "volume_24h_usd":  # legacy fallback (volume only)
         d = _bget("/defi/tokenlist", key,
                   {"sort_by": "v24hUSD", "sort_type": "desc", "offset": 0, "limit": min(limit, 100)})
-        rows = (((d or {}).get("data") or {}).get("tokens")) or []
+        rows = _data(d) if d is not ERRORED else []
     return rows or []
 
 
@@ -170,20 +209,18 @@ def gather_candidates(key):
                 a = t.get("address") or t.get("mint")
                 if a and a not in SKIP and isinstance(t, dict):
                     by_addr.setdefault(a, {}).update(t)
-            time.sleep(0.2)  # gentle pacing across list calls (isolation)
     return by_addr, trank
 
 
 def fetch_trending(key, limit=20):
     d = _bget("/defi/token_trending", key,
               {"sort_by": "rank", "sort_type": "asc", "offset": 0, "limit": min(limit, 20)})
-    rows = (((d or {}).get("data") or {}).get("items")) or ((d or {}).get("data") or {}).get("tokens") or []
-    return rows or []
+    return (_data(d) or []) if d is not ERRORED else []
 
 
 def fetch_overview(key, mint):
     d = _bget("/defi/token_overview", key, {"address": mint})
-    return ((d or {}).get("data")) or {}
+    return (d.get("data") or {}) if isinstance(d, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +300,6 @@ def scan(key):
             ov = fetch_overview(key, a)
             if ov:
                 t.update(ov)
-            time.sleep(0.25)  # be gentle on the rate limit (isolation: never hammer)
         ok, why = passes_filters(t)
         if not ok:
             continue
@@ -369,6 +405,17 @@ def main():
     if not key:
         print("  ❌ BIRDEYE_API_KEY not set. Get one at birdeye.so and add it to .env, then re-run.")
         sys.exit(1)
+
+    # Preflight: one cheap call to verify the key + which plan/endpoints it can reach.
+    pf = _bget("/defi/v3/token/list", key, {"sort_by": "volume_24h_usd", "sort_type": "desc", "offset": 0, "limit": 1})
+    if pf is ERRORED:
+        print("  ⚠️  Birdeye Token List V3 is unreachable for this key (rate-limited or not on your plan).")
+        print("     The whole-market list needs the STARTER plan. On the free plan you'll see 429s.")
+        print("     Options: upgrade at birdeye.so, or raise MARKET_RATE_DELAY (e.g. 2.0) if it's just throttling.")
+    elif not _data(pf):
+        print("  ⚠️  Birdeye returned an empty token list — check the key, or your plan's endpoint access.")
+    else:
+        print("  ✅ Birdeye key OK — Token List V3 reachable.")
 
     if args.once:
         run_once(key)
