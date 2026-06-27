@@ -88,10 +88,19 @@ ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshol
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 50))     # tokens per list call (some plans cap at 50)
 ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 0))      # per-token overview calls (0 = rely on list; saves CU)
 RATE_DELAY    = envf("MARKET_RATE_DELAY", 1.2)         # min seconds between Birdeye calls (free tier ~1 rps)
-INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 600)) # loop cadence (longer = less CU burn)
+INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 0))   # 0 = AUTO-pace from the CU budget (recommended)
 ALERT_COOLDOWN = int(envf("MARKET_ALERT_COOLDOWN_SECS", 3600))  # per-token re-alert gap
 CU_COOLDOWN   = int(envf("MARKET_CU_COOLDOWN_SECS", 3600))      # back off this long when CU quota is hit
 PAGES         = int(envf("MARKET_PAGES", 1))           # pages (of SCAN_LIMIT) per sort dimension
+# CU BUDGET — make a free key last a MONTH. The scanner spreads CU_BUDGET across BUDGET_DAYS
+# and auto-paces its scan interval so it can't burn the quota early; it tracks usage (reset
+# monthly) and stops before going over.
+CU_BUDGET     = int(envf("MARKET_CU_BUDGET", 30000))   # free Standard ~30k CU/month
+CU_PER_CALL   = envf("MARKET_CU_PER_CALL", 30)         # estimated CU per Birdeye call (tune to your plan)
+BUDGET_DAYS   = int(envf("MARKET_BUDGET_DAYS", 30))    # spread the budget across this many days
+RESERVE_FRAC  = envf("MARKET_BUDGET_RESERVE", 0.10)    # keep this fraction of budget as a safety margin
+USE_TRENDING  = env("MARKET_USE_TRENDING", "false").lower() == "true"  # +1 call/scan; off by default to save CU
+BUDGET_FILE   = "market_watch_budget.json"             # {month, cu_used} — persists across restarts
 # COVERAGE vs COST. Each sort × page is a Birdeye call that costs compute units (CU). The free
 # plan's monthly CU runs out fast, so the DEFAULT is frugal: 1 sort (volume), 1 page. On a paid
 # plan, widen it back out for maximum recall by setting MARKET_SORTS to the full list:
@@ -114,6 +123,7 @@ def telegram(text):
 
 _last_call = [0.0]
 _cu_exhausted = [False]   # set True when Birdeye reports the monthly compute-unit quota is gone
+_calls = [0]              # actual HTTP calls made this process (for CU accounting)
 def _throttle():
     """Global pacing so we stay under the Birdeye rate limit (free tier ~1 rps)."""
     wait = RATE_DELAY - (time.time() - _last_call[0])
@@ -136,6 +146,7 @@ def _bget(path, key, params=None, retries=4):
     h = {"X-API-KEY": key, "x-chain": "solana", "accept": "application/json", "User-Agent": "market-watch"}
     for attempt in range(retries):
         _throttle()
+        _calls[0] += 1
         try:
             return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20))
         except urllib.error.HTTPError as e:
@@ -208,11 +219,12 @@ def gather_candidates(key):
     surging degen that isn't yet top-volume still gets caught. Dedup by address."""
     by_addr = {}
     trank = {}
-    for t in fetch_trending(key):
-        a = t.get("address") or t.get("mint")
-        if a and a not in SKIP:
-            trank[a] = len(trank)
-            by_addr.setdefault(a, {}).update(t)
+    if USE_TRENDING:
+        for t in fetch_trending(key):
+            a = t.get("address") or t.get("mint")
+            if a and a not in SKIP:
+                trank[a] = len(trank)
+                by_addr.setdefault(a, {}).update(t)
     for sort_by in SORTS:
         for page in range(PAGES):
             rows = fetch_token_list(key, sort_by, SCAN_LIMIT, offset=page * SCAN_LIMIT)
@@ -405,6 +417,47 @@ def save_json(path, obj):
     os.replace(path + ".tmp", path)
 
 
+# ---------------------------------------------------------------------------
+# CU budget — make a free key last a month (auto-pace + monthly reset)
+# ---------------------------------------------------------------------------
+def _this_month():
+    return dt.datetime.now().strftime("%Y-%m")
+
+
+def load_budget():
+    try:
+        b = json.load(open(BUDGET_FILE))
+    except Exception:
+        b = {}
+    if b.get("month") != _this_month():          # new billing month -> quota refills
+        b = {"month": _this_month(), "cu_used": 0}
+    return b
+
+
+def calls_per_scan():
+    return max(len(SORTS) * PAGES + (1 if USE_TRENDING else 0) + ENRICH_TOP, 1)
+
+
+def seconds_until_reset():
+    """Seconds until the start of next month (when the CU quota refills)."""
+    now = dt.datetime.now()
+    nxt = dt.datetime(now.year + 1, 1, 1) if now.month == 12 else dt.datetime(now.year, now.month + 1, 1)
+    return max((nxt - now).total_seconds(), 3600)
+
+
+def usable_budget():
+    return CU_BUDGET * (1.0 - RESERVE_FRAC)
+
+
+def auto_interval(cu_used=0):
+    """Adaptive pacing: spread the REMAINING budget over the time left until the monthly
+    reset, so the key lasts the whole month no matter when you (re)start it."""
+    remaining = max(usable_budget() - cu_used, 0)
+    cu_per_scan = calls_per_scan() * CU_PER_CALL
+    scans_left = max(remaining / max(cu_per_scan, 1), 1)
+    return max(int(seconds_until_reset() / scans_left), 60)   # never tighter than 60s
+
+
 def append_study(study):
     """Record already-ran tokens (deduped) for the research/study layer to dissect later —
     'why did THIS one run?' is how the watchlist's pattern keeps improving."""
@@ -525,19 +578,40 @@ def main():
         run_once(key)
         return
 
-    print(f"  market-watch loop every {INTERVAL}s — isolated scanner, writes {OUT}. Ctrl-C to stop.")
+    cps = calls_per_scan()
+    b0 = load_budget()
+    iv0 = INTERVAL if INTERVAL > 0 else auto_interval(b0["cu_used"])
+    mode = "fixed" if INTERVAL > 0 else "AUTO"
+    print(f"  market-watch — budget {CU_BUDGET} CU/mo · ~{cps} call(s)/scan (~{cps*CU_PER_CALL:.0f} CU) · "
+          f"{mode}-paced ~1 scan / {iv0//60} min so the key lasts to the monthly reset. Ctrl-C to stop.")
     while True:
         _cu_exhausted[0] = False
+        b = load_budget()
+        cost = cps * CU_PER_CALL
+        # HARD cap: if a scan would push us over the usable budget, pause until the reset.
+        if b["cu_used"] + cost > usable_budget():
+            print(f"  ⛔ CU budget for {b['month']} spent ({b['cu_used']:.0f}/{usable_budget():.0f}). "
+                  f"Pausing until the monthly reset — re-checking hourly.")
+            time.sleep(CU_COOLDOWN)
+            continue
+        start = _calls[0]
         try:
             run_once(key)
         except Exception as e:
             sys.stderr.write(f"  scan error: {e}\n")
-        # If the CU quota is gone, don't hammer the API every INTERVAL — back off hard.
+        used = (_calls[0] - start) * CU_PER_CALL
+        b["cu_used"] += used
+        save_json(BUDGET_FILE, b)
         if _cu_exhausted[0]:
-            print(f"  ⛔ CU quota exhausted — backing off {CU_COOLDOWN}s instead of hammering.")
+            # Birdeye says quota is gone — mark spent + back off so we don't hammer it.
+            b["cu_used"] = max(b["cu_used"], usable_budget())
+            save_json(BUDGET_FILE, b)
+            print(f"  ⛔ Birdeye reports CU exhausted — pausing {CU_COOLDOWN}s.")
             time.sleep(CU_COOLDOWN)
-        else:
-            time.sleep(INTERVAL)
+            continue
+        iv = INTERVAL if INTERVAL > 0 else auto_interval(b["cu_used"])
+        print(f"  CU {b['cu_used']:.0f}/{usable_budget():.0f} used this month · next scan in {iv//60} min")
+        time.sleep(iv)
 
 
 if __name__ == "__main__":
