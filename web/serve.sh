@@ -13,6 +13,15 @@ PORT="${1:-8787}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Free the port if a previous dashboard is still bound to it (Errno 48 / Address in use).
+if command -v lsof >/dev/null 2>&1 && lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
+  echo "ℹ️  port ${PORT} busy — stopping the previous dashboard on it."
+  lsof -ti "tcp:${PORT}" | xargs kill 2>/dev/null || true
+  sleep 1
+elif command -v pkill >/dev/null 2>&1; then
+  pkill -f "http.server ${PORT}" 2>/dev/null || true
+fi
+
 # Make the live status (written to repo root) reachable from web/ as momentum_status.json.
 if [ -f momentum_status.json ]; then
   ln -sf ../momentum_status.json web/momentum_status.json 2>/dev/null || cp momentum_status.json web/momentum_status.json
