@@ -24,11 +24,14 @@ cleanup(){
 }
 trap cleanup EXIT INT TERM
 
-# --- 1. market watch (isolated) — background, only if a Birdeye key is present ---
+# --- 1. market watch (isolated, self-paced) — background, only if a Birdeye key is present ---
 if grep -qE '^BIRDEYE_API_KEY=.+' .env 2>/dev/null; then
-  echo "🌐 market watch  → background (log: reports/market_watch.log)"
+  echo "🌐 market watch  → self-paced background scanner (log: reports/market_watch.log)"
   python3 scripts/market_watch.py >> reports/market_watch.log 2>&1 &
   PIDS+=($!)
+  # surface the first verdict inline (key OK? budget? early runners?) without an extra scan
+  sleep 6
+  grep -hE '✅|⛔|⚠️|budget|scanned|EARLY' reports/market_watch.log 2>/dev/null | tail -3 | sed 's/^/   /' || true
 else
   echo "⚠️  no BIRDEYE_API_KEY in .env — running WITHOUT market watch."
   echo "    add it:  printf 'BIRDEYE_API_KEY=YOURKEY\\n' >> .env   (then re-run)"
