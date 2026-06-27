@@ -40,6 +40,8 @@ import os, sys, csv, json, time, argparse, urllib.request, urllib.parse, urllib.
 BIRDEYE = "https://public-api.birdeye.so"
 OUT = "market_watch.json"
 STATE = "market_watch_state.json"        # last-alerted map, so we don't spam the same token
+HISTORY = "market_watch_history.json"    # per-token snapshots over time → growth/accel signals
+STUDY = "runners_to_study.txt"           # tokens that ALREADY ran → feed the research/study layer
 # never "watch" the base/stable assets
 SKIP = {
     "So11111111111111111111111111111111111111112",  # wSOL
@@ -80,6 +82,8 @@ MIN_MC_USD    = envf("MARKET_MIN_MC_USD", 50000)       # not dust
 MAX_MC_USD    = envf("MARKET_MAX_MC_USD", 50_000_000)  # still has room to run
 MIN_LIQ_MC    = envf("MARKET_MIN_LIQ_MC", 0.03)        # liquidity >= 3% of mcap (exit sanity)
 MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >60% in 24h (dying)
+MAX_PUMP_24H  = envf("MARKET_MAX_PUMP_24H", 100)       # ABOVE this it ALREADY RAN → study, don't watch
+HISTORY_HOURS = envf("MARKET_HISTORY_HOURS", 6)        # how long to keep per-token snapshots
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 100))    # tokens per list call (<=100)
 ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 25))     # how many survivors to enrich w/ holders
@@ -224,6 +228,40 @@ def fetch_overview(key, mint):
 
 
 # ---------------------------------------------------------------------------
+# per-token history → growth/acceleration (the real "about to run" signal)
+# ---------------------------------------------------------------------------
+def load_history():
+    try:
+        return json.load(open(HISTORY))
+    except Exception:
+        return {}
+
+
+def update_history(hist, mint, snap, now):
+    """Append this scan's snapshot for a token and keep the recent window. Returns the series."""
+    arr = hist.get(mint, [])
+    arr.append(snap)
+    cutoff = now - HISTORY_HOURS * 3600
+    arr = [s for s in arr if s.get("ts", 0) >= cutoff][-40:]
+    hist[mint] = arr
+    return arr
+
+
+def growth(arr, key):
+    """Fractional change PER HOUR of `key` across the snapshot history (None if <2 points).
+    This is what tells us holders/volume are RISING — accumulation in progress — before price
+    has moved. The whole point: catch the runner forming, not after it ran."""
+    if not arr or len(arr) < 2:
+        return None
+    old, new = arr[0], arr[-1]
+    span_h = max((new.get("ts", 0) - old.get("ts", 0)) / 3600.0, 1e-6)
+    base = old.get(key, 0.0) or 0.0
+    if base <= 0:
+        return None
+    return (new.get(key, 0.0) - base) / base / span_h
+
+
+# ---------------------------------------------------------------------------
 # quality filter + scoring
 # ---------------------------------------------------------------------------
 def passes_filters(t):
@@ -246,34 +284,45 @@ def clamp01(x):
     return 0.0 if x < 0 else (1.0 if x > 1 else x)
 
 
-def score(t, trending_rank=None):
-    """0..100 watch score: volume surge + price momentum + liquidity health + holders +
-    trending. Designed to surface a move FORMING with real, exitable structure — not a
-    blow-off top and not a dead chart."""
+def already_ran(t):
+    """True if this token has ALREADY made its big move (24h change above the ceiling). These
+    go to the STUDY pile (learn why they ran), NOT the watch list."""
+    return g(t, "priceChange24hPercent", "price_change_24h_percent", default=0.0) > MAX_PUMP_24H
+
+
+def score(t, arr, trending_rank=None):
+    """EARLY-RUNNER score (0..100). The goal is to catch accumulation BEFORE the move, not to
+    reward a pump that already happened. Leading signals: volume ACCELERATING and holders
+    GROWING while price is still EARLY (not yet mooned), on a real/liquid/small-enough token."""
     liq = g(t, "liquidity")
     mc  = g(t, "mc", "market_cap", "marketCap") or 1.0
     v24 = g(t, "v24hUSD", "volume_24h_usd", default=0.0)
     v1  = g(t, "v1hUSD", "volume_1h_usd", default=0.0)
-    holders = g(t, "holder", "holders", "holder_count", default=0.0)
-    pc1 = g(t, "priceChange1hPercent", "price_change_1h_percent", default=0.0)
     pc24 = g(t, "priceChange24hPercent", "price_change_24h_percent", default=0.0)
 
-    # volume surge: 1h rate vs the 24h average rate (>1 means accelerating)
-    surge = (v1 / (v24 / 24.0)) if v24 > 0 else 0.0
-    surge_term = clamp01((surge - 1.0) / 2.0)                 # 3x avg rate -> full marks
-    # turnover: 24h volume relative to mcap (real interest, not a ghost token)
-    turnover_term = clamp01(v24 / max(mc, 1.0) / 1.0)         # 1x mcap traded -> full
-    # price momentum: reward 1h strength but DON'T chase a vertical blow-off
-    mom_term = clamp01(pc1 / 30.0) * (0.4 if pc24 > 300 else 1.0)
-    # liquidity health (exitability)
-    liq_term = clamp01(liq / mc / 0.15)                       # liq = 15% of mcap -> full
-    # crowd size (anti-rug + staying power), log-scaled
-    import math
-    holders_term = clamp01(math.log10(max(holders, 1.0)) / 3.5)  # ~3000 holders -> full
-    base = (0.30 * surge_term + 0.20 * turnover_term + 0.20 * mom_term
-            + 0.15 * liq_term + 0.15 * holders_term) * 100.0
+    # 1) volume ACCELERATION: 1h rate vs the 24h average rate (the move building up)
+    accel = (v1 / (v24 / 24.0)) if v24 > 0 else 0.0
+    accel_term = clamp01((accel - 1.0) / 2.0)                  # 3x avg rate -> full
+    # 2) EARLINESS: reward NOT-yet-pumped; the closer to the already-ran ceiling, the lower
+    earliness_term = clamp01((MAX_PUMP_24H - max(pc24, 0.0)) / max(MAX_PUMP_24H, 1.0))
+    # 3) turnover: real interest relative to size
+    turnover_term = clamp01(v24 / max(mc, 1.0))
+    # 4) liquidity health (exitability)
+    liq_term = clamp01(liq / mc / 0.15)
+    # 5) room to run: smaller mcap = more upside left
+    room_term = clamp01(1.0 - mc / max(MAX_MC_USD, 1.0))
+    base = (0.30 * accel_term + 0.25 * earliness_term + 0.20 * turnover_term
+            + 0.15 * liq_term + 0.10 * room_term) * 100.0
+    # GROWTH BONUS — the real leading indicator, available once we've watched the token across
+    # scans: holders and volume RISING over time = accumulation in progress, before price moves.
+    hg = growth(arr, "holders")
+    vg = growth(arr, "vol24")
+    if hg is not None:
+        base += clamp01(hg / 0.20) * 15.0                     # +20%/hr holder growth -> +15
+    if vg is not None:
+        base += clamp01(vg / 0.50) * 10.0                     # +50%/hr volume growth -> +10
     if trending_rank is not None:
-        base += max(0.0, 12.0 - trending_rank * 0.5)         # small bonus for trending rank
+        base += max(0.0, 8.0 - trending_rank * 0.4)
     return round(min(base, 100.0), 1)
 
 
@@ -294,7 +343,9 @@ def scan(key):
             prelim.append((vol, a, t))
     prelim.sort(reverse=True)
 
-    out = []
+    hist = load_history()
+    now = int(time.time())
+    watch, study = [], []
     for _, a, t in prelim[:ENRICH_TOP]:
         if g(t, "holder", "holders", "holder_count", default=-1) < 0:
             ov = fetch_overview(key, a)
@@ -303,21 +354,34 @@ def scan(key):
         ok, why = passes_filters(t)
         if not ok:
             continue
-        out.append({
+        # record this scan's snapshot so we can measure holder/volume GROWTH over time
+        arr = update_history(hist, a, {
+            "ts": now,
+            "holders": g(t, "holder", "holders", "holder_count", default=0.0),
+            "vol24": g(t, "v24hUSD", "volume_24h_usd", default=0.0),
+            "mcap": g(t, "mc", "market_cap", "marketCap", default=0.0),
+        }, now)
+        row = {
             "mint": a,
             "symbol": t.get("symbol") or "",
             "name": t.get("name") or "",
-            "score": score(t, trank.get(a)),
+            "score": score(t, arr, trank.get(a)),
             "liquidity_usd": round(g(t, "liquidity"), 0),
             "volume24h_usd": round(g(t, "v24hUSD", "volume_24h_usd"), 0),
             "mcap_usd": round(g(t, "mc", "market_cap", "marketCap"), 0),
             "holders": int(g(t, "holder", "holders", "holder_count", default=0)),
+            "holder_growth_hr": round((growth(arr, "holders") or 0.0) * 100, 1),  # %/hr
             "price_change_1h": round(g(t, "priceChange1hPercent", "price_change_1h_percent", default=0.0), 1),
             "price_change_24h": round(g(t, "priceChange24hPercent", "price_change_24h_percent", default=0.0), 1),
             "trending_rank": trank.get(a, None),
-        })
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out
+        }
+        # ALREADY RAN → study pile (learn the pattern). Still EARLY → the watch list.
+        (study if already_ran(t) else watch).append(row)
+    # keep history only for tokens we still track, then persist
+    save_json(HISTORY, {k: v for k, v in hist.items() if k in {r["mint"] for r in watch + study}})
+    watch.sort(key=lambda x: x["score"], reverse=True)
+    study.sort(key=lambda x: x["price_change_24h"], reverse=True)
+    return watch, study
 
 
 def load_state():
@@ -332,14 +396,32 @@ def save_json(path, obj):
     os.replace(path + ".tmp", path)
 
 
+def append_study(study):
+    """Record already-ran tokens (deduped) for the research/study layer to dissect later —
+    'why did THIS one run?' is how the watchlist's pattern keeps improving."""
+    if not study:
+        return
+    try:
+        seen = set(l.strip() for l in open(STUDY)) if os.path.exists(STUDY) else set()
+    except OSError:
+        seen = set()
+    new = [r["mint"] for r in study if r["mint"] not in seen]
+    if new:
+        with open(STUDY, "a") as f:
+            for m in new:
+                f.write(m + "\n")
+
+
 def run_once(key):
-    rows = scan(key)
-    save_json(OUT, {"updated": int(time.time()), "count": len(rows), "watchlist": rows})
-    # alert NEW high-conviction names (dedup with a cooldown)
+    watch, study = scan(key)
+    save_json(OUT, {"updated": int(time.time()), "count": len(watch),
+                    "watchlist": watch, "studied": study[:20]})
+    append_study(study)
+    # alert NEW early runners (dedup with a cooldown)
     state = load_state()
     now = int(time.time())
     alerts = 0
-    for r in rows:
+    for r in watch:
         if r["score"] < ALERT_SCORE:
             continue
         last = state.get(r["mint"], 0)
@@ -347,48 +429,57 @@ def run_once(key):
             continue
         state[r["mint"]] = now
         alerts += 1
-        msg = (f"📈 ONE TO WATCH — potential pump\n"
+        msg = (f"🌱 EARLY RUNNER forming — potential pump (not yet run)\n"
                f"{r['symbol'] or r['mint'][:8]}  (score {r['score']})\n"
                f"liq ${r['liquidity_usd']:,.0f} · vol24h ${r['volume24h_usd']:,.0f} · "
-               f"mc ${r['mcap_usd']:,.0f} · {r['holders']} holders\n"
-               f"1h {r['price_change_1h']:+.1f}% · 24h {r['price_change_24h']:+.1f}%\n"
+               f"mc ${r['mcap_usd']:,.0f} · {r['holders']} holders (+{r['holder_growth_hr']:.0f}%/hr)\n"
+               f"1h {r['price_change_1h']:+.1f}% · 24h {r['price_change_24h']:+.1f}% (still early)\n"
                f"https://birdeye.so/token/{r['mint']}?chain=solana\n"
                f"https://dexscreener.com/solana/{r['mint']}")
-        print(f"  {dt.datetime.now():%H:%M:%S} ALERT {r['symbol'] or r['mint'][:8]} score {r['score']}")
+        print(f"  {dt.datetime.now():%H:%M:%S} EARLY {r['symbol'] or r['mint'][:8]} score {r['score']} (+{r['holder_growth_hr']:.0f}%/hr holders)")
         telegram(msg)
-    # prune old state entries
     state = {k: v for k, v in state.items() if now - v < ALERT_COOLDOWN * 6}
     save_json(STATE, state)
-    print(f"  scanned → {len(rows)} on watch, {alerts} new alert(s) → {OUT}")
-    return rows
+    print(f"  scanned → {len(watch)} EARLY on watch, {len(study)} already-ran → study, {alerts} new alert(s) → {OUT}")
+    return watch
 
 
 # ---------------------------------------------------------------------------
 def mock():
-    """Offline self-test: exercise the filter + score + alert logic with no network."""
-    print("  MOCK: filtering + scoring synthetic market data (no network)…")
-    sample = [
-        # a clean, surging, liquid, well-held mover — should pass & score high
-        {"address": "GoodRunner1111111111111111111111111111111", "symbol": "RUN", "liquidity": 120000,
-         "v24hUSD": 800000, "v1hUSD": 120000, "mc": 1500000, "holder": 1800,
-         "priceChange1hPercent": 22, "priceChange24hPercent": 60},
-        # a rug-shaped token: tiny liquidity, few holders — must be REJECTED
-        {"address": "RugTrap22222222222222222222222222222222222", "symbol": "RUG", "liquidity": 3000,
-         "v24hUSD": 40000, "v1hUSD": 9000, "mc": 900000, "holder": 18,
-         "priceChange1hPercent": 140, "priceChange24hPercent": 410},
-        # a dying token: already dumped 80% — must be REJECTED
-        {"address": "Dying333333333333333333333333333333333333", "symbol": "DEAD", "liquidity": 60000,
-         "v24hUSD": 200000, "v1hUSD": 4000, "mc": 800000, "holder": 600,
-         "priceChange1hPercent": -12, "priceChange24hPercent": -82},
-    ]
-    for t in sample:
+    """Offline self-test: prove we WATCH the early accumulator, STUDY the already-ran, and
+    cut the rug + the dying token — with no network."""
+    print("  MOCK: early-runner detection on synthetic market data (no network)…")
+    EARLY = {"address": "EarlyAccum1111111111111111111111111111111", "symbol": "EARLY", "liquidity": 80000,
+             "v24hUSD": 900000, "v1hUSD": 180000, "mc": 600000, "holder": 900,
+             "priceChange1hPercent": 6, "priceChange24hPercent": 18}   # flat-ish price, volume SURGING
+    RAN   = {"address": "AlreadyRan2222222222222222222222222222222", "symbol": "RAN", "liquidity": 240000,
+             "v24hUSD": 30000000, "v1hUSD": 500000, "mc": 1200000, "holder": 3300,
+             "priceChange1hPercent": 9, "priceChange24hPercent": 335}  # already +335% → STUDY
+    RUG   = {"address": "RugTrap33333333333333333333333333333333333", "symbol": "RUG", "liquidity": 3000,
+             "v24hUSD": 40000, "v1hUSD": 9000, "mc": 900000, "holder": 18,
+             "priceChange1hPercent": 140, "priceChange24hPercent": 95}
+    DEAD  = {"address": "Dying444444444444444444444444444444444444", "symbol": "DEAD", "liquidity": 60000,
+             "v24hUSD": 200000, "v1hUSD": 4000, "mc": 800000, "holder": 600,
+             "priceChange1hPercent": -12, "priceChange24hPercent": -82}
+    # a 2-point history showing holders climbing (+ that's the accumulation tell)
+    now = int(time.time())
+    arr_early = [{"ts": now - 3600, "holders": 700, "vol24": 500000},
+                 {"ts": now, "holders": 900, "vol24": 900000}]
+    for t, arr in [(EARLY, arr_early), (RAN, []), (RUG, []), (DEAD, [])]:
         ok, why = passes_filters(t)
-        verdict = f"score {score(t)}" if ok else f"REJECT ({why})"
-        print(f"   {t['symbol']:>4}  {'PASS ' if ok else 'cut  '} {verdict}")
-    assert passes_filters(sample[0])[0], "clean runner must pass"
-    assert not passes_filters(sample[1])[0], "rug must be cut"
-    assert not passes_filters(sample[2])[0], "dying token must be cut"
-    print("  ✅ filters keep the clean runner, cut the rug and the dying token.")
+        if not ok:
+            print(f"   {t['symbol']:>5}  cut   REJECT ({why})")
+        elif already_ran(t):
+            print(f"   {t['symbol']:>5}  STUDY already ran (+{t['priceChange24hPercent']:.0f}% 24h) → research pile")
+        else:
+            print(f"   {t['symbol']:>5}  WATCH early runner, score {score(t, arr)}")
+    assert passes_filters(EARLY)[0] and not already_ran(EARLY), "early accumulator must be WATCHED"
+    assert passes_filters(RAN)[0] and already_ran(RAN), "already-ran must go to STUDY, not watch"
+    assert not passes_filters(RUG)[0], "rug must be cut"
+    assert not passes_filters(DEAD)[0], "dying token must be cut"
+    # the holder-growth bonus must lift the early runner above a no-history version of itself
+    assert score(EARLY, arr_early) > score(EARLY, []), "rising holders must raise the score"
+    print("  ✅ WATCH the early accumulator · STUDY the already-ran · cut the rug & the dead.")
 
 
 def main():

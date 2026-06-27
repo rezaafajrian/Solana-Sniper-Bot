@@ -61,3 +61,10 @@ momentum_decisions_signals.csv
 smart_money_wallets.json
 smart_money_wallets.json.tmp
 backups/
+
+# Market watch (isolated whole-market scanner) runtime artifacts
+market_watch.json
+market_watch_state.json
+market_watch_history.json
+runners_to_study.txt
+web/market_watch.json
