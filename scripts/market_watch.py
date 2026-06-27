@@ -86,18 +86,17 @@ MAX_PUMP_24H  = envf("MARKET_MAX_PUMP_24H", 100)       # ABOVE this it ALREADY R
 HISTORY_HOURS = envf("MARKET_HISTORY_HOURS", 6)        # how long to keep per-token snapshots
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 50))     # tokens per list call (some plans cap at 50)
-ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 25))     # how many survivors to enrich w/ holders
+ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 0))      # per-token overview calls (0 = rely on list; saves CU)
 RATE_DELAY    = envf("MARKET_RATE_DELAY", 1.2)         # min seconds between Birdeye calls (free tier ~1 rps)
-INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 180)) # loop cadence
+INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 600)) # loop cadence (longer = less CU burn)
 ALERT_COOLDOWN = int(envf("MARKET_ALERT_COOLDOWN_SECS", 3600))  # per-token re-alert gap
-PAGES         = int(envf("MARKET_PAGES", 2))           # pages (of SCAN_LIMIT) per sort dimension
-# MAXIMIZE COVERAGE — scan the market from EVERY angle so a degen play can't slip through:
-# top volume, biggest gainers, fastest volume RISERS, freshest listings, deepest liquidity.
-# Each is a different way a runner shows up; the union is the funnel, the hard floors are the
-# filter. Tune via MARKET_SORTS (comma-separated Birdeye sort_by keys).
-SORTS = [s.strip() for s in env("MARKET_SORTS",
-         "volume_24h_usd,price_change_24h_percent,volume_24h_change_percent,recent_listing_time,liquidity"
-         ).split(",") if s.strip()]
+CU_COOLDOWN   = int(envf("MARKET_CU_COOLDOWN_SECS", 3600))      # back off this long when CU quota is hit
+PAGES         = int(envf("MARKET_PAGES", 1))           # pages (of SCAN_LIMIT) per sort dimension
+# COVERAGE vs COST. Each sort × page is a Birdeye call that costs compute units (CU). The free
+# plan's monthly CU runs out fast, so the DEFAULT is frugal: 1 sort (volume), 1 page. On a paid
+# plan, widen it back out for maximum recall by setting MARKET_SORTS to the full list:
+#   volume_24h_usd,price_change_24h_percent,volume_24h_change_percent,recent_listing_time,liquidity
+SORTS = [s.strip() for s in env("MARKET_SORTS", "volume_24h_usd").split(",") if s.strip()]
 
 
 def telegram(text):
@@ -114,6 +113,7 @@ def telegram(text):
 
 
 _last_call = [0.0]
+_cu_exhausted = [False]   # set True when Birdeye reports the monthly compute-unit quota is gone
 def _throttle():
     """Global pacing so we stay under the Birdeye rate limit (free tier ~1 rps)."""
     wait = RATE_DELAY - (time.time() - _last_call[0])
@@ -151,6 +151,9 @@ def _bget(path, key, params=None, retries=4):
                 body = e.read().decode("utf-8", "replace")[:300]
             except Exception:
                 pass
+            if "compute unit" in body.lower() or "usage limit" in body.lower():
+                _cu_exhausted[0] = True   # quota gone — the loop will back off instead of hammering
+                return ERRORED
             sys.stderr.write(f"  birdeye {path} failed: HTTP {e.code} {e.reason} — {body}\n")
             if params:
                 sys.stderr.write(f"    (params: {urllib.parse.urlencode(params)})\n")
@@ -508,10 +511,15 @@ def main():
     pf = fetch_token_list(key, "volume_24h_usd", 5)
     if pf:
         print(f"  ✅ Birdeye reachable — got {len(pf)} tokens from the list endpoint.")
+    elif _cu_exhausted[0]:
+        print("  ⛔ Birdeye COMPUTE-UNIT quota is exhausted for this billing period.")
+        print("     This is a plan limit, not a bug. Options:")
+        print("       • wait for the monthly CU reset, or upgrade at birdeye.so (Starter+),")
+        print("       • keep it frugal: MARKET_SORTS=volume_24h_usd, MARKET_PAGES=1,")
+        print("         MARKET_ENRICH_TOP=0, and a long MARKET_INTERVAL_SECS (e.g. 1800).")
     else:
         print("  ⚠️  Birdeye returned NO tokens. See the HTTP error above for the exact reason")
-        print("     (400 = bad param/limit for your plan, 401/403 = key/plan, 429 = rate limit).")
-        print("     Try: lower MARKET_SCAN_LIMIT, raise MARKET_RATE_DELAY, or check the key at birdeye.so.")
+        print("     (400 = bad param/limit, 401/403 = key/plan, 429 = rate limit).")
 
     if args.once:
         run_once(key)
@@ -519,11 +527,17 @@ def main():
 
     print(f"  market-watch loop every {INTERVAL}s — isolated scanner, writes {OUT}. Ctrl-C to stop.")
     while True:
+        _cu_exhausted[0] = False
         try:
             run_once(key)
         except Exception as e:
             sys.stderr.write(f"  scan error: {e}\n")
-        time.sleep(INTERVAL)
+        # If the CU quota is gone, don't hammer the API every INTERVAL — back off hard.
+        if _cu_exhausted[0]:
+            print(f"  ⛔ CU quota exhausted — backing off {CU_COOLDOWN}s instead of hammering.")
+            time.sleep(CU_COOLDOWN)
+        else:
+            time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":
