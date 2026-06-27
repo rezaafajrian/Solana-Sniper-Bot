@@ -81,10 +81,18 @@ MAX_MC_USD    = envf("MARKET_MAX_MC_USD", 50_000_000)  # still has room to run
 MIN_LIQ_MC    = envf("MARKET_MIN_LIQ_MC", 0.03)        # liquidity >= 3% of mcap (exit sanity)
 MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >60% in 24h (dying)
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
-SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 100))    # top-by-volume to pull (<=100/call)
-ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 40))     # how many survivors to enrich w/ holders
+SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 100))    # tokens per list call (<=100)
+ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 80))     # how many survivors to enrich w/ holders
 INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 180)) # loop cadence
 ALERT_COOLDOWN = int(envf("MARKET_ALERT_COOLDOWN_SECS", 3600))  # per-token re-alert gap
+PAGES         = int(envf("MARKET_PAGES", 2))           # pages (of SCAN_LIMIT) per sort dimension
+# MAXIMIZE COVERAGE — scan the market from EVERY angle so a degen play can't slip through:
+# top volume, biggest gainers, fastest volume RISERS, freshest listings, deepest liquidity.
+# Each is a different way a runner shows up; the union is the funnel, the hard floors are the
+# filter. Tune via MARKET_SORTS (comma-separated Birdeye sort_by keys).
+SORTS = [s.strip() for s in env("MARKET_SORTS",
+         "volume_24h_usd,price_change_24h_percent,volume_24h_change_percent,recent_listing_time,liquidity"
+         ).split(",") if s.strip()]
 
 
 def telegram(text):
@@ -129,16 +137,41 @@ def g(row, *keys, default=0.0):
 # ---------------------------------------------------------------------------
 # Birdeye fetchers
 # ---------------------------------------------------------------------------
-def fetch_token_list(key, limit):
-    """Top tokens by 24h volume (Token List V3, falling back to the legacy list)."""
+def fetch_token_list(key, sort_by, limit, offset=0):
+    """One page of the Token List V3, sorted by `sort_by` (falls back to the legacy list)."""
+    st = "asc" if sort_by == "recent_listing_time" else "desc"
     d = _bget("/defi/v3/token/list", key,
-              {"sort_by": "volume_24h_usd", "sort_type": "desc", "offset": 0, "limit": min(limit, 100)})
+              {"sort_by": sort_by, "sort_type": "desc" if sort_by != "recent_listing_time" else st,
+               "offset": offset, "limit": min(limit, 100)})
     rows = (((d or {}).get("data") or {}).get("items")) or ((d or {}).get("data") or {}).get("tokens")
-    if not rows:  # fallback to the older endpoint name + sort key
+    if not rows and offset == 0 and sort_by == "volume_24h_usd":  # legacy fallback (volume only)
         d = _bget("/defi/tokenlist", key,
                   {"sort_by": "v24hUSD", "sort_type": "desc", "offset": 0, "limit": min(limit, 100)})
         rows = (((d or {}).get("data") or {}).get("tokens")) or []
     return rows or []
+
+
+def gather_candidates(key):
+    """MAXIMIZE recall: union the market across every sort dimension + pages + trending, so a
+    surging degen that isn't yet top-volume still gets caught. Dedup by address."""
+    by_addr = {}
+    trank = {}
+    for t in fetch_trending(key):
+        a = t.get("address") or t.get("mint")
+        if a and a not in SKIP:
+            trank[a] = len(trank)
+            by_addr.setdefault(a, {}).update(t)
+    for sort_by in SORTS:
+        for page in range(PAGES):
+            rows = fetch_token_list(key, sort_by, SCAN_LIMIT, offset=page * SCAN_LIMIT)
+            if not rows:
+                break  # no more pages / unsupported sort -> move on
+            for t in rows:
+                a = t.get("address") or t.get("mint")
+                if a and a not in SKIP and isinstance(t, dict):
+                    by_addr.setdefault(a, {}).update(t)
+            time.sleep(0.2)  # gentle pacing across list calls (isolation)
+    return by_addr, trank
 
 
 def fetch_trending(key, limit=20):
@@ -211,19 +244,10 @@ def score(t, trending_rank=None):
 # scan
 # ---------------------------------------------------------------------------
 def scan(key):
-    listed = fetch_token_list(key, SCAN_LIMIT)
-    trending = fetch_trending(key)
-    trank = {}
-    for i, t in enumerate(trending):
-        a = t.get("address") or t.get("mint")
-        if a:
-            trank[a] = i
-    # union by address (list is the spine; trending contributes rank + any extras)
-    by_addr = {}
-    for t in listed + trending:
-        a = t.get("address") or t.get("mint")
-        if a and a not in SKIP:
-            by_addr.setdefault(a, {}).update(t if isinstance(t, dict) else {})
+    # MAXIMIZE: gather candidates from every angle (volume, gainers, volume-risers, new
+    # listings, liquidity, trending) across pages — then filter hard so only quality survives.
+    by_addr, trank = gather_candidates(key)
+    print(f"  gathered {len(by_addr)} unique tokens across {len(SORTS)} sorts × {PAGES} pages + trending")
 
     # cheap filter first (on list fields), then enrich the top survivors for holders
     prelim = []

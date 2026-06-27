@@ -240,10 +240,17 @@
     </table>
   </div>
   <div class="panel" style="grid-column:1/-1">
-    <div class="ph"><span class="x">👁 ONES TO WATCH · high-conviction composite</span><span class="c" id="watchMode"></span></div>
+    <div class="ph"><span class="x">👁 SNIPER WATCH · pre-bonding composite</span><span class="c" id="watchMode"></span></div>
     <table>
       <thead><tr><th>mint</th><th>watch</th><th>structure</th><th>convergence</th><th>age</th></tr></thead>
       <tbody id="watchBody"></tbody>
+    </table>
+  </div>
+  <div class="panel" style="grid-column:1/-1">
+    <div class="ph"><span class="x">🌐 MARKET WATCH · whole market (Birdeye, isolated)</span><span class="c" id="mwStamp">—</span></div>
+    <table>
+      <thead><tr><th>token</th><th>score</th><th>liq</th><th>vol 24h</th><th>mcap</th><th>holders</th><th>1h</th><th>24h</th></tr></thead>
+      <tbody id="mwBody"></tbody>
     </table>
   </div>
 </div>
@@ -536,6 +543,41 @@ async function poll(){
   }
 }
 poll(); setInterval(poll,1500);
+
+// ---- MARKET WATCH (whole-market Birdeye scanner) — polled INDEPENDENTLY of the sniper
+// status, since it's a separate isolated process writing its own market_watch.json. ----
+const usd = v => { v=+v||0; if(v>=1e6)return "$"+(v/1e6).toFixed(1)+"M"; if(v>=1e3)return "$"+(v/1e3).toFixed(0)+"k"; return "$"+v.toFixed(0); };
+function renderMarket(m){
+  const rows = (m&&m.watchlist)||[];
+  const mb=$("mwBody"); mb.innerHTML="";
+  rows.forEach(w=>{
+    const sc=+w.score||0;
+    const scol = sc>=85?"up":(sc>=70?"am":"dim");
+    const pc1=+w.price_change_1h||0, pc24=+w.price_change_24h||0;
+    const sym = w.symbol? `<b>${w.symbol}</b> ` : "";
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${sym}${tokenCell(w.mint)}</td>`+
+      `<td class="${scol}">${sc.toFixed(0)}</td>`+
+      `<td class="dim">${usd(w.liquidity_usd)}</td>`+
+      `<td class="dim">${usd(w.volume24h_usd)}</td>`+
+      `<td class="dim">${usd(w.mcap_usd)}</td>`+
+      `<td class="dim">${(+w.holders||0).toLocaleString()}</td>`+
+      `<td class="${cls(pc1)}">${pc1>0?"+":""}${pc1.toFixed(0)}%</td>`+
+      `<td class="${cls(pc24)}">${pc24>0?"+":""}${pc24.toFixed(0)}%</td>`;
+    mb.appendChild(tr);
+  });
+  if(!rows.length) mb.innerHTML=`<tr><td colspan=8 class="dim">no market watch data — run scripts/market_watch.py (needs BIRDEYE_API_KEY)</td></tr>`;
+  const age = m&&m.updated? Math.floor(Date.now()/1000)-m.updated : null;
+  $("mwStamp").textContent = age==null? "—" : (rows.length+" tokens · "+ago(m.updated)+" ago");
+}
+async function pollMarket(){
+  try{
+    const r=await fetch("market_watch.json?_="+Date.now(),{cache:"no-store"});
+    if(!r.ok) throw new Error(r.status);
+    renderMarket(await r.json());
+  }catch(e){ renderMarket(null); }
+}
+pollMarket(); setInterval(pollMarket,15000);
 window.addEventListener("resize",drawChart);
 </script>
 </body>

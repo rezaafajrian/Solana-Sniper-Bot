@@ -24,9 +24,10 @@ fi
 
 echo "🌐 Dashboard:  http://localhost:${PORT}/dashboard.html"
 echo "   (Ctrl-C to stop)"
-# Keep web/momentum_status.json pointed at the live file as it updates.
+# Keep web/momentum_status.json (+ the isolated market_watch.json) fresh as they update.
 ( while true; do
     if [ -f momentum_status.json ]; then cp -f momentum_status.json web/momentum_status.json 2>/dev/null || true; fi
+    if [ -f market_watch.json ]; then cp -f market_watch.json web/market_watch.json 2>/dev/null || true; fi
     sleep 2
   done ) &
 COPYPID=$!
