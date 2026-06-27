@@ -85,7 +85,7 @@ MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >6
 MAX_PUMP_24H  = envf("MARKET_MAX_PUMP_24H", 100)       # ABOVE this it ALREADY RAN → study, don't watch
 HISTORY_HOURS = envf("MARKET_HISTORY_HOURS", 6)        # how long to keep per-token snapshots
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
-SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 100))    # tokens per list call (<=100)
+SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 50))     # tokens per list call (some plans cap at 50)
 ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 25))     # how many survivors to enrich w/ holders
 RATE_DELAY    = envf("MARKET_RATE_DELAY", 1.2)         # min seconds between Birdeye calls (free tier ~1 rps)
 INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 180)) # loop cadence
@@ -146,7 +146,14 @@ def _bget(path, key, params=None, retries=4):
                 sys.stderr.write(f"  birdeye {path} {e.code} — backing off {back:.1f}s (try {attempt+1}/{retries})\n")
                 time.sleep(back)
                 continue
-            sys.stderr.write(f"  birdeye {path} failed: HTTP {e.code} {e.reason}\n")
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            sys.stderr.write(f"  birdeye {path} failed: HTTP {e.code} {e.reason} — {body}\n")
+            if params:
+                sys.stderr.write(f"    (params: {urllib.parse.urlencode(params)})\n")
             return ERRORED
         except Exception as e:
             sys.stderr.write(f"  birdeye {path} failed: {e}\n")
@@ -179,18 +186,17 @@ def _data(d):
 
 
 def fetch_token_list(key, sort_by, limit, offset=0):
-    """One page of the Token List V3, sorted by `sort_by` (legacy fallback on a CLEAN empty,
-    never on a rate-limit error — that would just 429 again)."""
+    """One page of the Token List V3, sorted by `sort_by`. Falls back to the legacy V1 list
+    for the volume sort whenever V3 returns nothing OR errors (e.g. a 400 because the plan
+    caps the limit or doesn't expose V3) — the V1 list is what most keys can actually reach."""
     st = "desc" if sort_by != "recent_listing_time" else "asc"
     d = _bget("/defi/v3/token/list", key,
-              {"sort_by": sort_by, "sort_type": st, "offset": offset, "limit": min(limit, 100)})
-    if d is ERRORED:
-        return []
-    rows = _data(d)
-    if not rows and offset == 0 and sort_by == "volume_24h_usd":  # legacy fallback (volume only)
-        d = _bget("/defi/tokenlist", key,
-                  {"sort_by": "v24hUSD", "sort_type": "desc", "offset": 0, "limit": min(limit, 100)})
-        rows = _data(d) if d is not ERRORED else []
+              {"sort_by": sort_by, "sort_type": st, "offset": offset, "limit": min(limit, 50)})
+    rows = _data(d) if d is not ERRORED else None
+    if not rows and offset == 0 and sort_by == "volume_24h_usd":  # legacy V1 fallback (volume only)
+        d2 = _bget("/defi/tokenlist", key,
+                   {"sort_by": "v24hUSD", "sort_type": "desc", "offset": 0, "limit": min(limit, 50)})
+        rows = _data(d2) if d2 is not ERRORED else []
     return rows or []
 
 
@@ -497,16 +503,15 @@ def main():
         print("  ❌ BIRDEYE_API_KEY not set. Get one at birdeye.so and add it to .env, then re-run.")
         sys.exit(1)
 
-    # Preflight: one cheap call to verify the key + which plan/endpoints it can reach.
-    pf = _bget("/defi/v3/token/list", key, {"sort_by": "volume_24h_usd", "sort_type": "desc", "offset": 0, "limit": 1})
-    if pf is ERRORED:
-        print("  ⚠️  Birdeye Token List V3 is unreachable for this key (rate-limited or not on your plan).")
-        print("     The whole-market list needs the STARTER plan. On the free plan you'll see 429s.")
-        print("     Options: upgrade at birdeye.so, or raise MARKET_RATE_DELAY (e.g. 2.0) if it's just throttling.")
-    elif not _data(pf):
-        print("  ⚠️  Birdeye returned an empty token list — check the key, or your plan's endpoint access.")
+    # Preflight: exercise the REAL list path (V3 with V1 fallback) so the verdict matches
+    # what the scan will actually get.
+    pf = fetch_token_list(key, "volume_24h_usd", 5)
+    if pf:
+        print(f"  ✅ Birdeye reachable — got {len(pf)} tokens from the list endpoint.")
     else:
-        print("  ✅ Birdeye key OK — Token List V3 reachable.")
+        print("  ⚠️  Birdeye returned NO tokens. See the HTTP error above for the exact reason")
+        print("     (400 = bad param/limit for your plan, 401/403 = key/plan, 429 = rate limit).")
+        print("     Try: lower MARKET_SCAN_LIMIT, raise MARKET_RATE_DELAY, or check the key at birdeye.so.")
 
     if args.once:
         run_once(key)
