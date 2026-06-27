@@ -55,13 +55,22 @@ SKIP = {
 # ---------------------------------------------------------------------------
 def env(key, default=None):
     v = os.environ.get(key)
-    if v is not None and v != "":
-        return v
+    if v is not None and v.strip() != "":
+        return v.strip()
     try:
         for line in open(".env"):
             s = line.strip()
-            if s.startswith(f"{key}=") and not s.startswith("#"):
-                return s.split("=", 1)[1].strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):              # tolerate `export KEY=val`
+                s = s[len("export "):].lstrip()
+            if "=" not in s:
+                continue
+            k, val = s.split("=", 1)
+            if k.strip() == key:                     # tolerate spaces: `KEY = val`
+                val = val.strip().strip('"').strip("'")  # tolerate quotes
+                if val:                              # skip empty/placeholder lines, keep looking
+                    return val
     except OSError:
         pass
     return default
