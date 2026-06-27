@@ -176,7 +176,7 @@
     <div class="panel">
       <div class="ph"><span class="x">CONFIG</span></div>
       <div class="kv"><span class="k">entry score ≥</span><span class="v" id="cfgScore">—</span></div>
-      <div class="kv"><span class="k">position size</span><span class="v" id="cfgSize">—</span></div>
+      <div class="kv"><span class="k">sizing</span><span class="v" id="cfgSize">—</span></div>
       <div class="kv"><span class="k">hard stop</span><span class="v down" id="cfgStop">—</span></div>
       <div class="kv"><span class="k">daily loss limit</span><span class="v" id="cfgLoss">—</span></div>
       <div class="kv"><span class="k">alpha-follow</span><span class="v" id="cfgAlpha">—</span></div>
@@ -202,7 +202,7 @@
     <div class="panel">
       <div class="ph"><span class="x">OPEN POSITIONS</span><span class="c" id="posCount">0</span></div>
       <table id="posTable">
-        <thead><tr><th>mint</th><th>lead</th><th>age</th><th>mcap</th><th>peak</th><th>left</th><th>PnL%</th></tr></thead>
+        <thead><tr><th>mint</th><th>lead</th><th>size</th><th>age</th><th>mcap</th><th>peak</th><th>left</th><th>PnL%</th></tr></thead>
         <tbody id="posBody"></tbody>
       </table>
     </div>
@@ -415,7 +415,9 @@ function render(snap){
 
   // config
   $("cfgScore").textContent=cfg.entry_score ?? "—";
-  $("cfgSize").textContent=(cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—");
+  $("cfgSize").innerHTML = cfg.kelly_sizing
+    ? `<span class="up">Kelly</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
+    : (cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—");
   $("cfgStop").textContent=(cfg.hard_stop_pct!=null?cfg.hard_stop_pct+"%":"—");
   $("cfgLoss").textContent=(cfg.daily_loss_limit_sol!=null?cfg.daily_loss_limit_sol+" SOL":"—");
   $("cfgAlpha").innerHTML = cfg.alpha_follow? `<span class="up">ON</span> · rep≥${cfg.alpha_rep_min}/${cfg.alpha_min_samples}` : `<span class="dim">off</span>`;
@@ -428,6 +430,7 @@ function render(snap){
     const lead=o.kol? `<span class="cy">${o.kol}</span>`:`<span class="dim">·</span>`;
     const sel=o.selling?` <span class="am">⟳</span>`:"";
     tr.innerHTML=`<td>${tokenCell(o.mint)}${sel}</td><td>${lead}</td>`+
+      `<td class="cy" title="SOL deployed on this position">${(o.size_sol||0).toFixed(3)}</td>`+
       `<td>${ago(snap.updated-(o.age_secs||0))}</td>`+
       `<td>${(o.current_mcap||0).toFixed(1)}</td>`+
       `<td class="dim">${(o.peak_pnl||0).toFixed(0)}%</td>`+

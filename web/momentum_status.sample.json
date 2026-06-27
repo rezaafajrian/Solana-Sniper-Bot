@@ -42,7 +42,9 @@
     "alpha_min_samples": 5,
     "watch_enabled": true,
     "watch_autobuy": false,
-    "watch_score_min": 70
+    "watch_score_min": 70,
+    "kelly_sizing": true,
+    "kelly_max_fraction": 0.25
   },
   "positions": [
     {
@@ -51,7 +53,7 @@
       "current_mcap": 88.2,
       "pnl_pct": 180.9,
       "peak_pnl": 210.0,
-      "size_sol": 0.2,
+      "size_sol": 0.216,
       "remaining_pct": 60.0,
       "rungs_hit": 2,
       "age_secs": 142,
@@ -64,7 +66,7 @@
       "current_mcap": 49.6,
       "pnl_pct": 18.1,
       "peak_pnl": 33.0,
-      "size_sol": 0.2,
+      "size_sol": 0.085,
       "remaining_pct": 100.0,
       "rungs_hit": 0,
       "age_secs": 38,
@@ -77,7 +79,7 @@
       "current_mcap": 41.2,
       "pnl_pct": -25.1,
       "peak_pnl": 12.0,
-      "size_sol": 0.2,
+      "size_sol": 0.052,
       "remaining_pct": 100.0,
       "rungs_hit": 0,
       "age_secs": 96,
@@ -147,14 +149,16 @@
       "score": 96,
       "samples": 8,
       "win_rate": 0.95,
-      "tier": "ELITE"
+      "tier": "ELITE",
+      "proven": true
     },
     {
       "wallet": "MFQKMm2NPcVtnmBZFouvQpowvD4EJDWjWs238NdXL9P",
       "score": 82,
       "samples": 8,
       "win_rate": 0.87,
-      "tier": "STRONG"
+      "tier": "STRONG",
+      "proven": true
     },
     {
       "wallet": "sR4QwzCRt7yJ14x6oxqcAWLXTN8Q7feS4CkiVYhdX7F",
