@@ -472,6 +472,30 @@ pub struct MomentumConfig {
     /// Maximum size multiple at very high scores.
     pub conviction_max_mult: f64,
 
+    // ---- Edge: fractional-Kelly sizing (the calculated "scale up your bets") ----
+    /// When on, position size is set by FRACTIONAL KELLY on the estimated edge of THIS
+    /// setup, instead of the linear score multiple above. Kelly bets f* = p - (1-p)/b of
+    /// the bankroll (p = win prob, b = payoff). Full Kelly maximizes long-run growth but
+    /// is brutally volatile and assumes p,b are known exactly — so we bet a FRACTION of it
+    /// and clamp hard. This makes big bets only when the edge is genuinely big.
+    pub kelly_sizing: bool,
+    /// Fraction of full Kelly to actually bet (0.3 = "30% Kelly" — standard conservative).
+    pub kelly_fraction: f64,
+    /// Hard ceiling on the fraction of equity a single bet may take.
+    pub kelly_max_fraction: f64,
+    /// Payoff ratio b (avg win / avg loss). Default 2.5 is conservative vs the ~2.7–3.1x
+    /// realized in validation — understating b shrinks the bet, which is the safe error.
+    pub kelly_payoff_b: f64,
+    /// Win prob mapped to conviction 0 (a bet that just clears the gate) — the realized
+    /// baseline win rate (~0.35).
+    pub kelly_p_floor: f64,
+    /// Win prob mapped to conviction 1 (alpha/convergence + whale) — the validated
+    /// high-conviction win rate (~0.80; alpha hit 83%).
+    pub kelly_p_ceiling: f64,
+    /// Liquidity (SOL) at which the liquidity term of conviction saturates — anchored to
+    /// the EV-optimal out-of-sample gate (~15 SOL).
+    pub kelly_liq_ref: f64,
+
     // ---- Risk controls ----
     /// Hard cap on total SOL deployed across all open positions. New entries are
     /// blocked (or trimmed) so concurrent + conviction sizing can't overspend.
@@ -748,6 +772,16 @@ impl MomentumConfig {
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
             conviction_max_mult: env_f64("MOMENTUM_CONVICTION_MAX_MULT", 2.0),
+            // Fractional-Kelly sizing. Off by default — it's a sizing change, so A/B it.
+            // Defaults are data-anchored: p_floor=realized win rate, p_ceiling=alpha win
+            // rate, b conservative vs realized payoff, liq_ref=EV-optimal liquidity gate.
+            kelly_sizing: std::env::var("MOMENTUM_KELLY_SIZING").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            kelly_fraction: env_f64("MOMENTUM_KELLY_FRACTION", 0.30).clamp(0.01, 1.0),
+            kelly_max_fraction: env_f64("MOMENTUM_KELLY_MAX_FRACTION", 0.25).clamp(0.01, 1.0),
+            kelly_payoff_b: env_f64("MOMENTUM_KELLY_PAYOFF_B", 2.5).max(0.1),
+            kelly_p_floor: env_f64("MOMENTUM_KELLY_P_FLOOR", 0.35).clamp(0.01, 0.99),
+            kelly_p_ceiling: env_f64("MOMENTUM_KELLY_P_CEILING", 0.80).clamp(0.01, 0.99),
+            kelly_liq_ref: env_f64("MOMENTUM_KELLY_LIQ_REF", 15.0).max(0.1),
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             start_capital_sol: env_f64("MOMENTUM_START_CAPITAL_SOL", 0.0),
@@ -2227,6 +2261,8 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "watch_enabled": cfg.watch_enabled,
             "watch_autobuy": cfg.watch_autobuy,
             "watch_score_min": cfg.watch_score_min,
+            "kelly_sizing": cfg.kelly_sizing,
+            "kelly_max_fraction": cfg.kelly_max_fraction,
         },
         "positions": positions,
         "feed": feed,
@@ -2647,6 +2683,48 @@ fn base_position_size(cfg: &MomentumConfig) -> f64 {
     } else {
         cfg.position_size_sol
     }
+}
+
+/// Conviction of a setup in [0,1], built ONLY from signals learn.py validated as
+/// predictive — kept a transparent weighted blend (not a black box) so the bet size is
+/// auditable. This is the `c` that drives the Kelly win-probability estimate.
+///
+/// Weights are data-justified: smart-money convergence is the highest-EV signal
+/// (alpha EV +1.5/token, wallet_score the top winners-vs-losers separator), so it carries
+/// the most weight; the composite score is predictive (big win-rate spread by bucket);
+/// whale positioning and liquidity health round it out.
+fn entry_conviction(
+    signal: &MomentumSignal,
+    effective_score: f64,
+    has_alpha: bool,
+    is_convergence: bool,
+    liq: f64,
+    cfg: &MomentumConfig,
+) -> f64 {
+    // composite score above the entry bar, saturating ~2x the bar
+    let score_term = ((effective_score / cfg.entry_score.max(1.0)) - 1.0).clamp(0.0, 1.0);
+    // smart money: convergence > single proven wallet > any graded smart-money boost
+    let smart_term = if is_convergence { 1.0 }
+        else if has_alpha { 0.7 }
+        else if signal.smart_money_boost > 0.0 { 0.4 }
+        else { 0.0 };
+    // whale: a single sized buy relative to the whale threshold
+    let whale_term = (signal.max_wallet_buy_sol / cfg.watch_whale_sol.max(1e-9)).clamp(0.0, 1.0);
+    // liquidity health (exitability), saturating at the EV-optimal reference
+    let liq_term = (liq / cfg.kelly_liq_ref.max(1e-9)).clamp(0.0, 1.0);
+    (0.30 * score_term + 0.40 * smart_term + 0.15 * whale_term + 0.15 * liq_term).clamp(0.0, 1.0)
+}
+
+/// Fractional-Kelly bet fraction of the bankroll for a setup of the given conviction.
+/// Kelly: f* = p - (1-p)/b. We map conviction → p over [p_floor, p_ceiling], use a
+/// conservative payoff b, bet `kelly_fraction` OF full Kelly, and clamp to a hard ceiling.
+/// Returns the fraction of equity to deploy (0 if the edge is non-positive).
+fn kelly_fraction(conviction: f64, cfg: &MomentumConfig) -> f64 {
+    let c = conviction.clamp(0.0, 1.0);
+    let p = (cfg.kelly_p_floor + (cfg.kelly_p_ceiling - cfg.kelly_p_floor) * c).clamp(0.01, 0.99);
+    let b = cfg.kelly_payoff_b.max(0.1);
+    let f_star = p - (1.0 - p) / b; // full-Kelly fraction; <= 0 when the edge is gone
+    (cfg.kelly_fraction * f_star).clamp(0.0, cfg.kelly_max_fraction)
 }
 
 fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
@@ -3380,20 +3458,43 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // Base size: a fraction of equity in bankroll+percent mode (scales with the
     // account), else the fixed position size. Conviction then scales up from there.
     let base_size = base_position_size(&cfg);
-    let mut entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
-        let mult = (signal.score / cfg.entry_score).clamp(1.0, cfg.conviction_max_mult);
-        base_size * mult
+    let mut entry_size;
+    if cfg.kelly_sizing {
+        // CALCULATED scale-up: size THIS bet by its measured edge via fractional Kelly.
+        // Bankroll = equity (bankroll mode) or the deployment cap (legacy mode). The
+        // conviction blend already folds in alpha/convergence + whale, so we do NOT also
+        // apply the linear conviction/follow multipliers (that would double-count).
+        let liq = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+        let conviction = entry_conviction(&signal, effective_score, alpha.is_some(), is_convergence, liq, &cfg);
+        let f = kelly_fraction(conviction, &cfg);
+        let bankroll = if cfg.start_capital_sol > 0.0 { equity(&cfg) } else { cfg.max_deployed_sol };
+        entry_size = (bankroll * f).max(cfg.min_position_sol);
+        let p = (cfg.kelly_p_floor + (cfg.kelly_p_ceiling - cfg.kelly_p_floor) * conviction).clamp(0.01, 0.99);
+        // Make the scale-up VISIBLE — log conviction, implied p, Kelly fraction, size, and
+        // how many x the base bet this is, so the sizing is never a black box.
+        if !DECISION_LOGGED.contains_key(&mint) {
+            logger.log(format!(
+                "📈 Kelly size {} | conviction {:.2} → p {:.0}% · f {:.1}% of {:.3} SOL → {:.4} SOL ({:.1}x base)",
+                mint, conviction, p * 100.0, f * 100.0, bankroll, entry_size,
+                if base_size > 0.0 { entry_size / base_size } else { 0.0 },
+            ).cyan().to_string());
+        }
     } else {
-        base_size
-    };
-    // Following a proven wallet (curated KOL or learned alpha) is our highest-
-    // conviction signal — size up. Capped so one trade can't dwarf the book.
-    let following = kol.is_some() || alpha.is_some();
-    if following && cfg.alpha_size_mult > 1.0 {
-        // Convergence (several proven wallets) earns an extra size bump over a single one.
-        let follow_mult = if is_convergence { cfg.alpha_size_mult * cfg.convergence_size_mult } else { cfg.alpha_size_mult };
-        let cap = base_size * cfg.conviction_max_mult.max(follow_mult);
-        entry_size = (entry_size * follow_mult).min(cap);
+        entry_size = if cfg.conviction_sizing && cfg.entry_score > 0.0 {
+            let mult = (signal.score / cfg.entry_score).clamp(1.0, cfg.conviction_max_mult);
+            base_size * mult
+        } else {
+            base_size
+        };
+        // Following a proven wallet (curated KOL or learned alpha) is our highest-
+        // conviction signal — size up. Capped so one trade can't dwarf the book.
+        let following = kol.is_some() || alpha.is_some();
+        if following && cfg.alpha_size_mult > 1.0 {
+            // Convergence (several proven wallets) earns an extra bump over a single one.
+            let follow_mult = if is_convergence { cfg.alpha_size_mult * cfg.convergence_size_mult } else { cfg.alpha_size_mult };
+            let cap = base_size * cfg.conviction_max_mult.max(follow_mult);
+            entry_size = (entry_size * follow_mult).min(cap);
+        }
     }
     // "Ones to Watch" autobuy: these are the highest-conviction setups, so they get
     // the larger watch size (not the usual position size).
@@ -4970,6 +5071,43 @@ mod tests {
         sig.max_wallet_buy_sol = 0.0;       // no whale-sized buy
         sig.smart_money_boost = 5.0;        // but proven smart money is in
         assert_eq!(watch_qualifies(&sig, "WQ_SM", 0, 0.10, cfg.watch_min_liq_sol + 5.0, &cfg), None);
+    }
+
+    // ---- fractional-Kelly position sizing (the calculated scale-up) ----
+    #[test]
+    fn kelly_fraction_scales_with_conviction_and_is_bounded() {
+        let cfg = test_cfg();
+        let f_lo = kelly_fraction(0.0, &cfg);
+        let f_mid = kelly_fraction(0.5, &cfg);
+        let f_hi = kelly_fraction(1.0, &cfg);
+        assert!(f_lo < f_mid && f_mid < f_hi, "must rise with conviction: {f_lo} {f_mid} {f_hi}");
+        assert!(f_hi <= cfg.kelly_max_fraction + 1e-9, "must respect the hard ceiling");
+        assert!(f_lo >= 0.0, "never negative");
+    }
+    #[test]
+    fn kelly_fraction_zero_when_no_edge() {
+        let mut cfg = test_cfg();
+        cfg.kelly_p_floor = 0.20; cfg.kelly_p_ceiling = 0.20; cfg.kelly_payoff_b = 1.0;
+        // p=0.2, b=1 → f* = 0.2 - 0.8 = -0.6 → clamped to 0 (don't bet a losing edge)
+        assert_eq!(kelly_fraction(1.0, &cfg), 0.0);
+    }
+    #[test]
+    fn entry_conviction_orders_signals() {
+        let cfg = test_cfg();
+        let s = MomentumSignal::default(); // no smart money, no whale
+        let momentum = entry_conviction(&s, cfg.entry_score, false, false, 0.0, &cfg);
+        let alpha = entry_conviction(&s, cfg.entry_score, true, false, 0.0, &cfg);
+        let conv = entry_conviction(&s, cfg.entry_score, true, true, 0.0, &cfg);
+        assert!(momentum < alpha && alpha < conv, "convergence > alpha > momentum: {momentum} {alpha} {conv}");
+        assert!(momentum >= 0.0 && conv <= 1.0);
+    }
+    #[test]
+    fn entry_conviction_maxes_on_a_loaded_setup() {
+        let cfg = test_cfg();
+        let mut s = MomentumSignal::default();
+        s.max_wallet_buy_sol = cfg.watch_whale_sol * 2.0;           // whale in
+        let c = entry_conviction(&s, cfg.entry_score * 2.0, true, true, cfg.kelly_liq_ref * 2.0, &cfg);
+        assert!(c > 0.95, "score 2x bar + convergence + whale + deep liq should be ~max, got {c}");
     }
 
     // ---- runner-DNA bridge (watchlist scores tokens vs validated patterns) ----
