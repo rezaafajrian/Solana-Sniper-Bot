@@ -1,0 +1,29 @@
+[Unit]
+# Whole-market "Ones to Watch" scanner (Birdeye) — ISOLATED from the sniper bot.
+# A separate long-running process; it only reads Birdeye and writes market_watch.json +
+# Telegram alerts. It cannot affect a single sniper decision.
+# Prefer the installer (auto-paths everything): ./scripts/install_autonomy.sh --with-market-watch
+# This static unit is for manual installs — edit the paths/user to match your box.
+Description=Solana whole-market watch (Birdeye, isolated from the sniper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/solbot/Solana-Sniper-Bot
+ExecStart=/usr/bin/env python3 /opt/solbot/Solana-Sniper-Bot/scripts/market_watch.py
+Restart=always
+RestartSec=15
+# Low priority so it never competes with the latency-sensitive sniper.
+Nice=15
+IOSchedulingClass=idle
+SyslogIdentifier=market-watch
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/solbot/Solana-Sniper-Bot
+
+[Install]
+WantedBy=multi-user.target

@@ -20,10 +20,11 @@
 # ZERO hand-editing: the repo path and run-user are detected from where you run this.
 #
 # Usage:
-#   ./scripts/install_autonomy.sh                 # schedule nightly research
-#   ./scripts/install_autonomy.sh --with-bot      # ALSO install the always-on bot service
-#   ./scripts/install_autonomy.sh --at 03:30      # nightly run time (default 09:00, local tz)
-#   ./scripts/install_autonomy.sh --uninstall     # remove everything this installed
+#   ./scripts/install_autonomy.sh                      # schedule nightly research
+#   ./scripts/install_autonomy.sh --with-bot           # ALSO install the always-on bot service
+#   ./scripts/install_autonomy.sh --with-market-watch  # ALSO run the whole-market Birdeye watch (isolated)
+#   ./scripts/install_autonomy.sh --at 03:30           # nightly run time (default 09:00, local tz)
+#   ./scripts/install_autonomy.sh --uninstall          # remove everything this installed
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,12 +34,14 @@ RUNGROUP="$(id -gn)"
 BIN="$REPO/target/release/solana-vntr-sniper"
 AT="09:00"
 WITH_BOT=false
+WITH_MARKET=false
 UNINSTALL=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --with-bot)   WITH_BOT=true ;;
-    --uninstall)  UNINSTALL=true ;;
+    --with-bot)          WITH_BOT=true ;;
+    --with-market-watch) WITH_MARKET=true ;;
+    --uninstall)         UNINSTALL=true ;;
     --at)         AT="${2:-09:00}"; shift ;;
     --at=*)       AT="${1#--at=}" ;;
     -h|--help)    grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -56,6 +59,7 @@ echo "  AUTONOMY INSTALLER"
 echo "  repo : $REPO"
 echo "  user : $RUNUSER   nightly research at $AT (local time)"
 $WITH_BOT && echo "  + always-on bot service (auto-restart, re-adopts positions)"
+$WITH_MARKET && echo "  + whole-market watch (Birdeye, ISOLATED from the sniper)"
 echo "════════════════════════════════════════════════════════════"
 
 # --- detect which scheduler we can use -------------------------------------
@@ -88,8 +92,9 @@ if [ "$MODE" = "system" ] || [ "$MODE" = "user" ]; then
   if $UNINSTALL; then
     SC disable --now momentum-research.timer 2>/dev/null || true
     SC disable --now momentum-bot.service 2>/dev/null || true
+    SC disable --now momentum-market-watch.service 2>/dev/null || true
     rm -f "$UNIT_DIR/momentum-research.service" "$UNIT_DIR/momentum-research.timer"
-    $WITH_BOT && rm -f "$UNIT_DIR/momentum-bot.service"
+    rm -f "$UNIT_DIR/momentum-bot.service" "$UNIT_DIR/momentum-market-watch.service"
     SC daemon-reload 2>/dev/null || true
     echo "✅ removed systemd units ($MODE)."
     exit 0
@@ -167,9 +172,39 @@ WantedBy=$([ "$MODE" = system ] && echo multi-user.target || echo default.target
 EOF
   fi
 
+  # --- optional: whole-market watch (Birdeye) — ISOLATED from the sniper ---
+  if $WITH_MARKET; then
+    grep -qE '^BIRDEYE_API_KEY=.+' "$REPO/.env" 2>/dev/null || echo "  ⚠️  BIRDEYE_API_KEY not set in .env — market-watch needs it (birdeye.so)."
+    cat > "$UNIT_DIR/momentum-market-watch.service" <<EOF
+[Unit]
+Description=Solana whole-market watch (Birdeye, isolated from the sniper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+$USER_LINE
+WorkingDirectory=$REPO
+ExecStart=/usr/bin/env python3 $REPO/scripts/market_watch.py
+Restart=always
+RestartSec=15
+Nice=15
+IOSchedulingClass=idle
+SyslogIdentifier=market-watch
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$REPO
+
+[Install]
+WantedBy=$([ "$MODE" = system ] && echo multi-user.target || echo default.target)
+EOF
+  fi
+
   SC daemon-reload
   SC enable --now momentum-research.timer
   $WITH_BOT && SC enable --now momentum-bot.service || true
+  $WITH_MARKET && SC enable --now momentum-market-watch.service || true
 
   # for user-mode: make it run even when logged out
   if [ "$MODE" = "user" ] && have loginctl; then
@@ -183,6 +218,7 @@ EOF
   echo "   next research run : $(SC list-timers momentum-research.timer --no-pager 2>/dev/null | awk 'NR==2{print $1,$2,$3}')"
   echo "   watch research    : journalctl $([ "$MODE" = user ] && echo --user) -u momentum-research -f"
   $WITH_BOT && echo "   watch the bot     : journalctl $([ "$MODE" = user ] && echo --user) -u momentum-bot -f"
+  $WITH_MARKET && echo "   watch the market  : journalctl $([ "$MODE" = user ] && echo --user) -u market-watch -f"
   echo "   run research now  : systemctl $([ "$MODE" = user ] && echo --user) start momentum-research.service"
   exit 0
 fi
@@ -192,19 +228,23 @@ fi
 # ===========================================================================
 if [ "$MODE" = "cron" ]; then
   MARKER="# momentum-research (installed by install_autonomy.sh)"
+  MARKETMARK="# momentum-market-watch (installed by install_autonomy.sh)"
   CRON_LINE="$MM $HH * * * cd $REPO && ./scripts/daily_report.sh >> $REPO/reports/cron.log 2>&1 $MARKER"
+  # cron can't keep a loop alive, so run the scanner one-shot every 3 minutes instead
+  MARKET_LINE="*/3 * * * * cd $REPO && python3 scripts/market_watch.py --once >> $REPO/reports/market_watch.log 2>&1 $MARKETMARK"
   CUR="$(crontab -l 2>/dev/null || true)"
-  # always strip our previous line first (idempotent)
-  NEW="$(printf '%s\n' "$CUR" | grep -vF "$MARKER" || true)"
+  # always strip our previous lines first (idempotent)
+  NEW="$(printf '%s\n' "$CUR" | grep -vF "$MARKER" | grep -vF "$MARKETMARK" || true)"
 
   if $UNINSTALL; then
     printf '%s\n' "$NEW" | crontab -
-    echo "✅ removed the cron entry. (The bot itself isn't managed by cron — stop it however you started it.)"
+    echo "✅ removed the cron entries. (The bot itself isn't managed by cron — stop it however you started it.)"
     exit 0
   fi
 
-  printf '%s\n%s\n' "$NEW" "$CRON_LINE" | sed '/^$/d' | crontab -
+  { printf '%s\n%s\n' "$NEW" "$CRON_LINE"; $WITH_MARKET && printf '%s\n' "$MARKET_LINE"; } | sed '/^$/d' | crontab -
   echo "✅ Autonomy installed (cron). Nightly research at $AT → logs in reports/cron.log"
+  $WITH_MARKET && echo "   market watch: every 3 min → reports/market_watch.log (needs BIRDEYE_API_KEY)"
   if $WITH_BOT; then
     echo
     echo "  ⚠️  cron can schedule the research, but NOT keep the bot alive across reboots."
