@@ -510,6 +510,13 @@ pub struct MomentumConfig {
     pub adaptive_min_confidence: f64,
     /// Minimum expected value (in R, i.e. EV / risked) to take a trade; below it → skip.
     pub adaptive_min_ev_r: f64,
+    /// Auto-calibrate the sizer's win-prob/payoff from learn.py's measured outcomes
+    /// (hot-reloaded from `sizing_cal_file`). This ONLY feeds the sizing math — it never
+    /// touches the edge, entry signals, vetoes, or exits.
+    pub sizing_autocalibrate: bool,
+    pub sizing_cal_file: String,
+    /// Minimum labeled samples in the calibration before the bot trusts it.
+    pub sizing_cal_min_samples: u64,
 
     // ---- Risk controls ----
     /// Hard cap on total SOL deployed across all open positions. New entries are
@@ -801,6 +808,9 @@ impl MomentumConfig {
             adaptive_prior_k: env_f64("MOMENTUM_ADAPTIVE_PRIOR_K", 25.0).max(1.0),
             adaptive_min_confidence: env_f64("MOMENTUM_ADAPTIVE_MIN_CONFIDENCE", 0.30).clamp(0.0, 1.0),
             adaptive_min_ev_r: env_f64("MOMENTUM_ADAPTIVE_MIN_EV_R", 0.0),
+            sizing_autocalibrate: std::env::var("MOMENTUM_SIZING_AUTOCALIBRATE").map(|v| v.to_lowercase() != "false").unwrap_or(true),
+            sizing_cal_file: std::env::var("MOMENTUM_SIZING_CALIBRATION_FILE").unwrap_or_else(|_| "sizing_calibration.json".to_string()),
+            sizing_cal_min_samples: env_u64("MOMENTUM_SIZING_MIN_SAMPLES", 50),
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             start_capital_sol: env_f64("MOMENTUM_START_CAPITAL_SOL", 0.0),
@@ -2069,6 +2079,11 @@ async fn run_attribution(cfg: Arc<MomentumConfig>) {
             if cfg.watch_enabled && cfg.watch_dna_weight > 0.0 {
                 load_runner_patterns(&cfg.watch_dna_file, cfg.watch_dna_min_conf);
             }
+            // Hot-reload the data-calibrated sizer params so a fresh learn.py run retunes the
+            // bet sizing live — no restart, no manual paste. Sizing only; edge untouched.
+            if cfg.sizing_autocalibrate {
+                load_sizing_calibration(&cfg.sizing_cal_file, cfg.sizing_cal_min_samples);
+            }
         }
     }
 }
@@ -2771,10 +2786,57 @@ fn entry_conviction(
 /// Kelly: f* = p - (1-p)/b. We map conviction → p over [p_floor, p_ceiling], use a
 /// conservative payoff b, bet `kelly_fraction` OF full Kelly, and clamp to a hard ceiling.
 /// Returns the fraction of equity to deploy (0 if the edge is non-positive).
+lazy_static! {
+    /// Data-calibrated sizer params from learn.py: (p_floor, p_ceiling, payoff_b?). None until
+    /// a valid calibration with enough samples is loaded. Hot-reloaded like runner patterns.
+    /// This state feeds ONLY the sizing math — never the edge, entry signals, vetoes, or exits.
+    static ref SIZING_CAL: std::sync::Mutex<Option<(f64, f64, Option<f64>)>> = std::sync::Mutex::new(None);
+}
+
+/// Parse + validate a sizing-calibration JSON body (pure — no global state, no I/O).
+/// Valid only if 0 < p_floor < p_ceiling < 1 and samples >= min.
+fn parse_sizing_cal(content: &str, min_samples: u64) -> Option<(f64, f64, Option<f64>)> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let pf = v.get("p_floor").and_then(|x| x.as_f64())?;
+    let pc = v.get("p_ceiling").and_then(|x| x.as_f64())?;
+    let n = v.get("samples").and_then(|x| x.as_u64()).unwrap_or(0);
+    let b = v.get("payoff_b").and_then(|x| x.as_f64());
+    if pf > 0.0 && pc > pf && pc < 1.0 && n >= min_samples { Some((pf, pc, b)) } else { None }
+}
+
+/// Load learn.py's sizing calibration into the live state. Returns true if a valid
+/// calibration is now active. ONLY affects sizing math.
+fn load_sizing_calibration(path: &str, min_samples: u64) -> bool {
+    if path.is_empty() { return false; }
+    let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return false };
+    match parse_sizing_cal(&content, min_samples) {
+        Some(cal) => { if let Ok(mut g) = SIZING_CAL.lock() { *g = Some(cal); } true }
+        None => false,
+    }
+}
+
+fn sizing_cal() -> Option<(f64, f64, Option<f64>)> { SIZING_CAL.lock().ok().and_then(|g| *g) }
+
+// Effective sizing params: data-calibrated when available (+ autocalibrate on), else the
+// static config defaults. These feed ONLY the sizer — the edge/entry/exit logic is untouched.
+fn eff_p_floor(cfg: &MomentumConfig) -> f64 {
+    if cfg.sizing_autocalibrate { if let Some((pf, _, _)) = sizing_cal() { return pf; } }
+    cfg.kelly_p_floor
+}
+fn eff_p_ceiling(cfg: &MomentumConfig) -> f64 {
+    if cfg.sizing_autocalibrate { if let Some((_, pc, _)) = sizing_cal() { return pc; } }
+    cfg.kelly_p_ceiling
+}
+fn eff_payoff_b(cfg: &MomentumConfig) -> f64 {
+    if cfg.sizing_autocalibrate { if let Some((_, _, Some(b))) = sizing_cal() { if b > 0.0 { return b; } } }
+    cfg.kelly_payoff_b
+}
+
 fn kelly_fraction(conviction: f64, cfg: &MomentumConfig) -> f64 {
     let c = conviction.clamp(0.0, 1.0);
-    let p = (cfg.kelly_p_floor + (cfg.kelly_p_ceiling - cfg.kelly_p_floor) * c).clamp(0.01, 0.99);
-    let b = cfg.kelly_payoff_b.max(0.1);
+    let (pf, pc) = (eff_p_floor(cfg), eff_p_ceiling(cfg));
+    let p = (pf + (pc - pf) * c).clamp(0.01, 0.99);
+    let b = eff_payoff_b(cfg).max(0.1);
     let f_star = p - (1.0 - p) / b; // full-Kelly fraction; <= 0 when the edge is gone
     (cfg.kelly_fraction * f_star).clamp(0.0, cfg.kelly_max_fraction)
 }
@@ -2864,16 +2926,17 @@ fn ensemble_win_prob(
         ModelVote { strength: s(signal.unique_buyers_short as f64 / cfg.target_unique_buyers.max(1e-9)),
                     weight: 0.7, present: signal.unique_buyers_short > 0 },
     ];
+    let (pf, pc) = (eff_p_floor(cfg), eff_p_ceiling(cfg));
     let mut wsum = 0.0; let mut psum = 0.0; let mut present_w = 0.0; let mut total_w = 0.0;
     for v in &votes {
         total_w += v.weight;
         if !v.present { continue; }
-        let p = cfg.kelly_p_floor + (cfg.kelly_p_ceiling - cfg.kelly_p_floor) * clamp01(v.strength);
+        let p = pf + (pc - pf) * clamp01(v.strength);
         psum += v.weight * p;
         wsum += v.weight;
         present_w += v.weight;
     }
-    let p = if wsum > 0.0 { psum / wsum } else { cfg.kelly_p_floor };
+    let p = if wsum > 0.0 { psum / wsum } else { pf };
     let data_quality = if total_w > 0.0 { present_w / total_w } else { 0.0 };
     // signal confidence: agreement-weighted coverage (more present, higher-weight votes = surer)
     let confidence = clamp01(present_w / total_w);
@@ -2915,9 +2978,9 @@ fn adaptive_size(
     // data or thin signals → low confidence → smaller fraction or skip)
     d.confidence = clamp01(0.5 * sig_conf + 0.5 * data_conf).max(sig_conf * 0.5);
 
-    // STEP 3: EV in R. Payoff b = avg win / avg loss (conservative default). With a stop at
-    // -1R, EV_R = p*b - (1-p). Skip if non-positive (or below the floor).
-    let b = cfg.kelly_payoff_b.max(0.1);
+    // STEP 3: EV in R. Payoff b = avg win / avg loss (data-calibrated when available). With a
+    // stop at -1R, EV_R = p*b - (1-p). Skip if non-positive (or below the floor).
+    let b = eff_payoff_b(cfg).max(0.1);
     d.ev_r = bp * b - (1.0 - bp);
     if d.ev_r <= cfg.adaptive_min_ev_r {
         d.skip = true; d.reason = format!("EV {:+.2}R ≤ {:.2}R", d.ev_r, cfg.adaptive_min_ev_r);
@@ -4879,6 +4942,21 @@ async fn momentum_startup(
         }
     }
 
+    // Sizing auto-calibration: load learn.py's measured win-prob/payoff so the sizer bets on
+    // REALITY, not static defaults. Sizing only — the edge, entry, vetoes, and exits are untouched.
+    if cfg.sizing_autocalibrate {
+        if load_sizing_calibration(&cfg.sizing_cal_file, cfg.sizing_cal_min_samples) {
+            if let Some((pf, pc, b)) = sizing_cal() {
+                logger.log(format!(
+                    "📐 Sizer calibrated from data: p_floor {:.2}, p_ceiling {:.2}{} (from {}) — sizing only, edge unchanged",
+                    pf, pc, b.map(|x| format!(", payoff b {:.2}", x)).unwrap_or_default(), cfg.sizing_cal_file,
+                ).cyan().bold().to_string());
+            }
+        } else {
+            logger.log(format!("📐 Sizer auto-calibration armed — using static defaults until learn.py writes a validated {} (≥{} samples)", cfg.sizing_cal_file, cfg.sizing_cal_min_samples).cyan().to_string());
+        }
+    }
+
     // Learned avoidance memory (creators + patterns that have lost) — compounds across runs.
     if cfg.creator_avoid || cfg.pattern_avoid {
         load_avoidance(&cfg.avoidance_file);
@@ -5151,6 +5229,7 @@ mod tests {
     }
     fn test_cfg() -> MomentumConfig {
         let mut c = MomentumConfig::from_env();
+        c.sizing_autocalibrate = false;  // tests use static p_floor/p_ceiling, not any loaded calibration
         c.short_window_secs = 30;
         c.medium_window_secs = 120;
         c.min_buy_volume_sol = 1.0;
@@ -5369,6 +5448,22 @@ mod tests {
     }
 
     // ---- adaptive sizing policy (capital-preservation pipeline) ----
+    #[test]
+    fn sizing_calibration_parses_and_validates() {
+        // valid calibration with payoff
+        let ok = parse_sizing_cal(r#"{"p_floor":0.29,"p_ceiling":0.70,"payoff_b":2.4,"samples":80}"#, 50);
+        assert_eq!(ok, Some((0.29, 0.70, Some(2.4))));
+        // valid without payoff
+        assert_eq!(parse_sizing_cal(r#"{"p_floor":0.3,"p_ceiling":0.6,"samples":60}"#, 50), Some((0.3, 0.6, None)));
+        // rejected: too few samples
+        assert_eq!(parse_sizing_cal(r#"{"p_floor":0.3,"p_ceiling":0.6,"samples":10}"#, 50), None);
+        // rejected: ceiling <= floor (conviction doesn't order outcomes)
+        assert_eq!(parse_sizing_cal(r#"{"p_floor":0.6,"p_ceiling":0.5,"samples":99}"#, 50), None);
+        // rejected: out of range
+        assert_eq!(parse_sizing_cal(r#"{"p_floor":0.0,"p_ceiling":1.2,"samples":99}"#, 50), None);
+        // rejected: junk
+        assert_eq!(parse_sizing_cal("not json", 50), None);
+    }
     #[test]
     fn drawdown_multiplier_follows_the_policy_table() {
         assert_eq!(drawdown_multiplier(0.02), 1.0);

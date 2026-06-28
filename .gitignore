@@ -66,6 +66,7 @@ backups/
 market_watch.json
 market_watch_state.json
 market_watch_history.json
+sizing_calibration.json
 market_watch_budget.json
 runners_to_study.txt
 web/market_watch.json

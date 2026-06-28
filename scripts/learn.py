@@ -241,6 +241,9 @@ def main():
                     help="also save the full report to <dir>/learn_<date>.txt")
     ap.add_argument("--telegram", action="store_true",
                     help="push the executive synthesis to Telegram (uses .env creds)")
+    ap.add_argument("--sizing-file", default="sizing_calibration.json",
+                    help="write the data-calibrated sizer params here for the bot to hot-reload "
+                         "(set empty to disable)")
     args = ap.parse_args()
     config_lines = []  # populated by validated recommendations for --emit-config
     synth = {"strengths": [], "weaknesses": [], "risks": [], "hidden": [],
@@ -852,6 +855,24 @@ def main():
                 print(f"  → recommend p_floor {pf:.2f}, p_ceiling {pc:.2f}"
                       + (f", payoff b {payoff:.2f}" if not math.isnan(payoff) else "")
                       + " (these REPLACE the static defaults — the sizer's own self-learning step)")
+                # WIRE IT: write the calibration for the bot to HOT-RELOAD (no manual paste).
+                # This only feeds the sizer's probability/payoff — it never touches the edge,
+                # entry signals, vetoes, or exits.
+                if args.sizing_file:
+                    cal = {"p_floor": round(pf, 4), "p_ceiling": round(pc, 4),
+                           "samples": len(conf_rows),
+                           "calibration_error": round(mean(cal_err), 4) if cal_err else None,
+                           "updated": int(dt.datetime.now().timestamp())}
+                    if not math.isnan(payoff) and payoff > 0:
+                        cal["payoff_b"] = round(payoff, 4)
+                    try:
+                        tmp = args.sizing_file + ".tmp"
+                        with open(tmp, "w") as fh:
+                            json.dump(cal, fh, indent=1)
+                        os.replace(tmp, args.sizing_file)
+                        print(f"  ✍️  wrote {args.sizing_file} — the bot hot-reloads it; sizer now uses these. ")
+                    except OSError as e:
+                        print(f"  (could not write {args.sizing_file}: {e})")
                 synth["hypotheses"].append(
                     f"Recalibrate sizer from data: P_FLOOR={pf:.2f}, P_CEILING={pc:.2f}"
                     + (f", PAYOFF_B={payoff:.2f}" if not math.isnan(payoff) else "") + " (emit-config).")
