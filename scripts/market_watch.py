@@ -94,19 +94,21 @@ MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >6
 MAX_PUMP_24H  = envf("MARKET_MAX_PUMP_24H", 100)       # ABOVE this it ALREADY RAN → study, don't watch
 HISTORY_HOURS = envf("MARKET_HISTORY_HOURS", 6)        # how long to keep per-token snapshots
 
-# SAFE MODE — "safe tokens, no rug worry" preset. Trades depth + crowd + steadiness for
-# multiples: deep liquidity, thousands of holders, real volume, no blow-off. These are
-# established names (1.3–3x, not 100x) — the base-hits sleeve, not the moonshot hunt.
-# Needs holder data, so it forces a little enrichment (more CU). Toggle: MARKET_SAFE_MODE=true
+# SAFE MODE — POST-BONDED 10x preset. Targets freshly GRADUATED pump.fun tokens: they're past
+# the bonding curve, so the worst rugs are already filtered (real demand pushed them past
+# graduation), but they're still EARLY on the DEX where the 10x lives. Graduation seeds only
+# modest LP, so the liquidity floor is LOW on purpose — the graduation IS the safety filter,
+# not deep liquidity. Caps mcap so there's 10x room left. Toggle: MARKET_SAFE_MODE=true
 SAFE_MODE = env("MARKET_SAFE_MODE", "false").lower() == "true"
 if SAFE_MODE:
-    MIN_LIQ_USD  = envf("MARKET_SAFE_MIN_LIQ_USD", 150000)   # deep, hard to rug, easy to exit
-    MIN_VOL_USD  = envf("MARKET_SAFE_MIN_VOL_USD", 250000)   # real, sustained turnover
-    MIN_HOLDERS  = envf("MARKET_SAFE_MIN_HOLDERS", 1500)     # an established crowd
-    MIN_MC_USD   = envf("MARKET_SAFE_MIN_MC_USD", 500000)    # not a micro-cap
-    MIN_LIQ_MC   = envf("MARKET_SAFE_MIN_LIQ_MC", 0.06)      # extra exit-liquidity cushion
-    MAX_PUMP_24H = envf("MARKET_SAFE_MAX_PUMP_24H", 40)      # steady uptrend, not a blow-off
-    MAX_DD_24H   = envf("MARKET_SAFE_MAX_DD_24H", -25)       # not even mildly bleeding
+    MIN_LIQ_USD  = envf("MARKET_SAFE_MIN_LIQ_USD", 12000)    # fresh-graduate LP (NOT $150k)
+    MIN_VOL_USD  = envf("MARKET_SAFE_MIN_VOL_USD", 30000)    # it's trading, not abandoned
+    MIN_HOLDERS  = envf("MARKET_SAFE_MIN_HOLDERS", 150)      # a real crowd, not a 5-wallet rug
+    MIN_MC_USD   = envf("MARKET_SAFE_MIN_MC_USD", 50000)     # ~graduation market cap and up
+    MAX_MC_USD   = envf("MARKET_SAFE_MAX_MC_USD", 3000000)   # cap so a 10x is still on the table
+    MIN_LIQ_MC   = envf("MARKET_SAFE_MIN_LIQ_MC", 0.025)     # exit sanity (you can get out)
+    MAX_PUMP_24H = envf("MARKET_SAFE_MAX_PUMP_24H", 150)     # allow the graduation pop; already-mooned → study
+    MAX_DD_24H   = envf("MARKET_SAFE_MAX_DD_24H", -50)       # not falling apart
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 50))     # tokens per list call (some plans cap at 50)
 ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 0))      # per-token overview calls (0 = rely on list; saves CU)
@@ -134,7 +136,7 @@ BUDGET_FILE   = "market_watch_budget.json"             # {month, cu_used} — pe
 # On a paid plan, widen for max recall by adding: volume_24h_usd,price_change_24h_percent,liquidity
 SORTS = [s.strip() for s in env("MARKET_SORTS", "volume_24h_change_percent,recent_listing_time").split(",") if s.strip()]
 if SAFE_MODE and not env("MARKET_SORTS"):
-    SORTS = ["volume_24h_usd", "liquidity"]   # established names: top volume + deepest liquidity
+    SORTS = ["recent_listing_time", "volume_24h_change_percent"]   # fresh graduates + rising volume
 
 
 def telegram(text):
