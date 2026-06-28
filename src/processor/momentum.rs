@@ -1063,6 +1063,10 @@ lazy_static! {
     /// PnL across all sells is >= 0.
     static ref SESSION_WINS: AtomicU64 = AtomicU64::new(0);
     static ref SESSION_LOSSES: AtomicU64 = AtomicU64::new(0);
+    /// DAILY win/loss counts — reset at the configured day boundary (e.g. 00:00 WIB), so the
+    /// dashboard can show today's record separately from the whole session.
+    static ref DAILY_WINS: AtomicU64 = AtomicU64::new(0);
+    static ref DAILY_LOSSES: AtomicU64 = AtomicU64::new(0);
     /// Decision/learning log: mints already logged (one decision row per token),
     /// and per-token post-detection outcome tracking.
     static ref DECISION_LOGGED: DashMap<String, ()> = DashMap::new();
@@ -1171,6 +1175,17 @@ fn daily_realized() -> f64 {
     cum - base
 }
 
+/// Tally a closed trade's outcome into BOTH the session and the daily win/loss counters.
+fn tally_win_loss(win: bool) {
+    if win {
+        SESSION_WINS.fetch_add(1, Ordering::SeqCst);
+        DAILY_WINS.fetch_add(1, Ordering::SeqCst);
+    } else {
+        SESSION_LOSSES.fetch_add(1, Ordering::SeqCst);
+        DAILY_LOSSES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Roll the breaker into a new day when the date changes: rebase the daily PnL,
 /// clear the loss streak, and auto-resume if it was halted. No-op within a day.
 fn maybe_roll_day(cfg: &MomentumConfig, logger: &Logger) {
@@ -1186,6 +1201,8 @@ fn maybe_roll_day(cfg: &MomentumConfig, logger: &Logger) {
     if let Ok(mut base) = DAY_START_REALIZED.lock() {
         *base = PNL_TALLY.lock().map(|g| g.0).unwrap_or(*base);
     }
+    DAILY_WINS.store(0, Ordering::SeqCst);     // new day -> today's record starts fresh
+    DAILY_LOSSES.store(0, Ordering::SeqCst);
     CONSECUTIVE_LOSSES.store(0, Ordering::SeqCst);
     let was_halted = TRADING_HALTED.swap(false, Ordering::SeqCst);
     logger.log(format!(
@@ -2223,6 +2240,8 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "sells": sells,
             "wins": SESSION_WINS.load(Ordering::SeqCst),
             "losses": SESSION_LOSSES.load(Ordering::SeqCst),
+            "daily_wins": DAILY_WINS.load(Ordering::SeqCst),
+            "daily_losses": DAILY_LOSSES.load(Ordering::SeqCst),
         },
         "capital": {
             "deployed_sol": deployed_sol(),
@@ -2263,6 +2282,7 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "watch_score_min": cfg.watch_score_min,
             "kelly_sizing": cfg.kelly_sizing,
             "kelly_max_fraction": cfg.kelly_max_fraction,
+            "daily_reset_utc_offset_hours": cfg.daily_reset_utc_offset_hours,
         },
         "positions": positions,
         "feed": feed,
@@ -3970,7 +3990,7 @@ async fn force_close(mint: &str, app_state: &Arc<AppState>, cfg: &Arc<MomentumCo
     let pos_total = prior_realized + realized;
     learn_avoidance(&creator, &token_bands(&sig_type, conv, entry_mcap, base_score), pos_total);
     record_kol_pnl(&kol_label, realized, true, realized);
-    if pos_total >= 0.0 { SESSION_WINS.fetch_add(1, Ordering::SeqCst); } else { SESSION_LOSSES.fetch_add(1, Ordering::SeqCst); }
+    tally_win_loss(pos_total >= 0.0);
     finalize_exit(mint);
     record_full_exit(pos_total, cfg, logger);
     logger.log(format!("⏱  Force-closed {} — stale/dead position reaped | PnL {:+.4} SOL (priced at {:.1} mcap)", mint, realized, cur_mcap).yellow().to_string());
@@ -4230,11 +4250,7 @@ async fn evaluate_position(mint: String, app_state: Arc<AppState>, cfg: Arc<Mome
     // Count a closed position as a win/loss by its TOTAL realized PnL (honest, whole-
     // position win rate), and run the circuit breaker on that total.
     let finalize_win_loss = |pos_total: f64, cfg: &MomentumConfig, logger: &Logger| {
-        if pos_total >= 0.0 {
-            SESSION_WINS.fetch_add(1, Ordering::SeqCst);
-        } else {
-            SESSION_LOSSES.fetch_add(1, Ordering::SeqCst);
-        }
+        tally_win_loss(pos_total >= 0.0);
         record_full_exit(pos_total, cfg, logger);
     };
 

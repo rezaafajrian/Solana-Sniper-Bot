@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Today · Solana bot</title>
+<style>
+  :root{--green:#1dff9b;--red:#ff4d6a;--bg:#04100c;--panel:#071712;--dim:#3a6356;--ink:#bfe9d8}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:ui-monospace,Menlo,Consolas,monospace;
+       min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px}
+  .card{width:100%;max-width:520px;background:var(--panel);border:1px solid #0e241c;border-radius:14px;padding:22px}
+  .top{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #0e241c;padding-bottom:10px;margin-bottom:16px}
+  .top b{color:var(--green);letter-spacing:.08em}
+  .reset{color:var(--dim);font-size:12px}
+  .hero{text-align:center;margin:10px 0 22px}
+  .hlab{color:var(--dim);font-size:12px;letter-spacing:.12em}
+  .big{font-size:54px;font-weight:700;line-height:1.05;margin-top:4px}
+  .up{color:var(--green)} .down{color:var(--red)} .dim{color:var(--dim)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .stat{background:#04130e;border:1px solid #0e241c;border-radius:10px;padding:14px;text-align:center}
+  .sv{font-size:26px;font-weight:700} .sk{color:var(--dim);font-size:11px;letter-spacing:.1em;margin-top:4px}
+  .bar{height:8px;background:#0e241c;border-radius:6px;overflow:hidden;margin-top:14px}
+  .bar i{display:block;height:100%;background:var(--green)}
+  .foot{color:var(--dim);font-size:11px;text-align:center;margin-top:16px}
+  a{color:var(--green)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="top"><b>TODAY</b><span class="reset" id="reset">resets daily</span></div>
+  <div class="hero">
+    <div class="hlab">TODAY'S REALIZED PnL · SOL</div>
+    <div class="big dim" id="pnl">—</div>
+  </div>
+  <div class="grid">
+    <div class="stat"><div class="sv" id="wins">—</div><div class="sk">WINS</div></div>
+    <div class="stat"><div class="sv" id="losses">—</div><div class="sk">LOSSES</div></div>
+  </div>
+  <div class="stat" style="margin-top:12px"><div class="sv" id="wr">—</div><div class="sk">WIN RATE (TODAY)</div>
+    <div class="bar"><i id="wrbar" style="width:0%"></i></div></div>
+  <div class="foot">live · auto-refresh · <a href="dashboard.html">← full dashboard</a> · <span id="stamp">—</span></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const fsol=v=>(v==null||isNaN(v))?"—":((v>0?"+":"")+(+v).toFixed(4));
+const cls=v=>v>0?"up":(v<0?"down":"dim");
+const ago=t=>{const s=Math.max(0,Math.floor(Date.now()/1000)-t);return s<60?s+"s":s<3600?Math.floor(s/60)+"m":Math.floor(s/3600)+"h";};
+function render(s){
+  const p=s.pnl||{}, cfg=s.config||{};
+  const today=p.today_realized||0;
+  $("pnl").textContent=fsol(today); $("pnl").className="big "+cls(today);
+  const w=p.daily_wins||0, l=p.daily_losses||0, t=w+l;
+  $("wins").textContent=w; $("wins").className="sv up";
+  $("losses").textContent=l; $("losses").className="sv down";
+  const wr=t?(w/t*100):0;
+  $("wr").textContent=t?wr.toFixed(0)+"% ("+w+"/"+t+")":"—";
+  $("wrbar").style.width=wr+"%";
+  const off=(cfg.daily_reset_utc_offset_hours!=null)?cfg.daily_reset_utc_offset_hours:0;
+  $("reset").textContent="resets 00:00 UTC"+(off>=0?"+":"")+off;
+  $("stamp").textContent="updated "+ago(s.updated||0)+" ago";
+}
+async function poll(){
+  try{ const r=await fetch("momentum_status.json?_="+Date.now(),{cache:"no-store"}); if(r.ok) render(await r.json()); }
+  catch(e){ $("stamp").textContent="no data"; }
+}
+poll(); setInterval(poll,1000);
+</script>
+</body>
+</html>

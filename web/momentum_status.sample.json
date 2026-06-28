@@ -9,7 +9,9 @@
     "buys": 14,
     "sells": 19,
     "wins": 41,
-    "losses": 92
+    "losses": 92,
+    "daily_wins": 6,
+    "daily_losses": 4
   },
   "capital": {
     "deployed_sol": 0.66,
@@ -44,7 +46,8 @@
     "watch_autobuy": false,
     "watch_score_min": 70,
     "kelly_sizing": true,
-    "kelly_max_fraction": 0.25
+    "kelly_max_fraction": 0.25,
+    "daily_reset_utc_offset_hours": 7
   },
   "positions": [
     {

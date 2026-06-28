@@ -148,6 +148,7 @@
       <div class="ph"><span class="x">P / L</span><span class="c" id="modec">dry</span></div>
       <div class="kv"><span class="k">session realized</span><span class="v" id="pnlSession">—</span></div>
       <div class="kv"><span class="k">today realized</span><span class="v" id="pnlToday">—</span></div>
+      <div class="kv"><span class="k">today wins <a href="daily.html" target="_blank" rel="noopener" class="lnk" title="open today's stats in a new tab">↗</a></span><span class="v" id="dailyWL">—</span></div>
       <div class="kv"><span class="k">buys / sells</span><span class="v" id="bs">—</span></div>
       <div class="kv"><span class="k">win rate <span class="dim">(session)</span></span><span class="v" id="winrate">—</span></div>
       <div class="bar" id="winbar"><i style="width:0%"></i></div>
@@ -375,6 +376,9 @@ function render(snap){
   const sess=p.session_realized||0;
   $("pnlSession").innerHTML=`<span class="${cls(sess)}">${fmtSol(sess)}</span>`;
   $("pnlToday").innerHTML=`<span class="${cls(p.today_realized||0)}">${fmtSol(p.today_realized||0)}</span>`;
+  // today's W/L resets at the configured day boundary (e.g. 00:00 WIB) — see MOMENTUM_DAILY_RESET_UTC_OFFSET_HOURS
+  const dw=p.daily_wins||0, dl=p.daily_losses||0, dt=dw+dl;
+  $("dailyWL").innerHTML = dt? `<span class="up">${dw}</span> / <span class="down">${dl}</span> <span class="dim">(${(dw/dt*100).toFixed(0)}%)</span>` : `<span class="dim">0 / 0</span>`;
   $("bs").textContent=`${p.buys||0} / ${p.sells||0}`;
   $("heroBig").textContent=fmtSol(sess); $("heroBig").className="big "+cls(sess);
   const pd=peakDD();
@@ -542,7 +546,7 @@ async function poll(){
     $("conn").textContent="no data"; $("led").className="led stale";
   }
 }
-poll(); setInterval(poll,1500);
+poll(); setInterval(poll,1000);  // 1s — positions/mcap move as fast as the bot writes the snapshot
 
 // ---- MARKET WATCH (whole-market Birdeye scanner) — polled INDEPENDENTLY of the sniper
 // status, since it's a separate isolated process writing its own market_watch.json. ----
