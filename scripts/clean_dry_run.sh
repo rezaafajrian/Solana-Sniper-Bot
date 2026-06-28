@@ -26,6 +26,10 @@ export MONITORING_MODE=momentum
 export MOMENTUM_DRY_RUN=true
 export MOMENTUM_LIVE_CONFIRM=false
 export MOMENTUM_FEED=ws            # websocket feed (logsSubscribe on RPC_WSS) — no paid Yellowstone gRPC needed
+# A dry run exists to gather the FULL outcome distribution — it must not halt-truncate on a
+# normal losing streak (a ~40% win-rate strategy hits 6-in-a-row constantly). Widen the
+# consecutive-loss breaker so the paper window runs uninterrupted. (Live keeps a tight breaker.)
+export MOMENTUM_MAX_CONSECUTIVE_LOSSES="${MOMENTUM_MAX_CONSECUTIVE_LOSSES:-30}"
 
 FRESH_MEMORY=false
 [ "$1" = "--fresh-memory" ] && FRESH_MEMORY=true

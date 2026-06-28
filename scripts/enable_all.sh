@@ -51,7 +51,7 @@ set_kv MOMENTUM_BUY_COST_FRACTION  0.015
 
 # --- BREAKER: wide enough that a normal losing streak doesn't truncate the window ---
 set_kv MOMENTUM_DAILY_LOSS_LIMIT_SOL    0.5
-set_kv MOMENTUM_MAX_CONSECUTIVE_LOSSES  15
+set_kv MOMENTUM_MAX_CONSECUTIVE_LOSSES  30   # wide so a dry run gathers the full distribution, never halt-truncates
 
 chmod 600 .env
 
