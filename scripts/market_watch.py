@@ -93,9 +93,25 @@ MIN_LIQ_MC    = envf("MARKET_MIN_LIQ_MC", 0.03)        # liquidity >= 3% of mcap
 MAX_DD_24H    = envf("MARKET_MAX_DD_24H", -60)         # skip if already down >60% in 24h (dying)
 MAX_PUMP_24H  = envf("MARKET_MAX_PUMP_24H", 100)       # ABOVE this it ALREADY RAN → study, don't watch
 HISTORY_HOURS = envf("MARKET_HISTORY_HOURS", 6)        # how long to keep per-token snapshots
+
+# SAFE MODE — "safe tokens, no rug worry" preset. Trades depth + crowd + steadiness for
+# multiples: deep liquidity, thousands of holders, real volume, no blow-off. These are
+# established names (1.3–3x, not 100x) — the base-hits sleeve, not the moonshot hunt.
+# Needs holder data, so it forces a little enrichment (more CU). Toggle: MARKET_SAFE_MODE=true
+SAFE_MODE = env("MARKET_SAFE_MODE", "false").lower() == "true"
+if SAFE_MODE:
+    MIN_LIQ_USD  = envf("MARKET_SAFE_MIN_LIQ_USD", 150000)   # deep, hard to rug, easy to exit
+    MIN_VOL_USD  = envf("MARKET_SAFE_MIN_VOL_USD", 250000)   # real, sustained turnover
+    MIN_HOLDERS  = envf("MARKET_SAFE_MIN_HOLDERS", 1500)     # an established crowd
+    MIN_MC_USD   = envf("MARKET_SAFE_MIN_MC_USD", 500000)    # not a micro-cap
+    MIN_LIQ_MC   = envf("MARKET_SAFE_MIN_LIQ_MC", 0.06)      # extra exit-liquidity cushion
+    MAX_PUMP_24H = envf("MARKET_SAFE_MAX_PUMP_24H", 40)      # steady uptrend, not a blow-off
+    MAX_DD_24H   = envf("MARKET_SAFE_MAX_DD_24H", -25)       # not even mildly bleeding
 ALERT_SCORE   = envf("MARKET_ALERT_SCORE", 70)         # Telegram alert threshold
 SCAN_LIMIT    = int(envf("MARKET_SCAN_LIMIT", 50))     # tokens per list call (some plans cap at 50)
 ENRICH_TOP    = int(envf("MARKET_ENRICH_TOP", 0))      # per-token overview calls (0 = rely on list; saves CU)
+if SAFE_MODE:
+    ENRICH_TOP = max(ENRICH_TOP, int(envf("MARKET_SAFE_ENRICH_TOP", 15)))  # safety needs holder data
 RATE_DELAY    = envf("MARKET_RATE_DELAY", 1.2)         # min seconds between Birdeye calls (free tier ~1 rps)
 INTERVAL      = int(envf("MARKET_INTERVAL_SECS", 0))   # 0 = AUTO-pace from the CU budget (recommended)
 ALERT_COOLDOWN = int(envf("MARKET_ALERT_COOLDOWN_SECS", 3600))  # per-token re-alert gap
@@ -117,6 +133,8 @@ BUDGET_FILE   = "market_watch_budget.json"             # {month, cu_used} — pe
 #   • recent_listing_time       = freshly listed (catch them young)
 # On a paid plan, widen for max recall by adding: volume_24h_usd,price_change_24h_percent,liquidity
 SORTS = [s.strip() for s in env("MARKET_SORTS", "volume_24h_change_percent,recent_listing_time").split(",") if s.strip()]
+if SAFE_MODE and not env("MARKET_SORTS"):
+    SORTS = ["volume_24h_usd", "liquidity"]   # established names: top volume + deepest liquidity
 
 
 def telegram(text):
@@ -522,8 +540,8 @@ def mock():
     """Offline self-test: prove we WATCH the early accumulator, STUDY the already-ran, and
     cut the rug + the dying token — with no network."""
     print("  MOCK: early-runner detection on synthetic market data (no network)…")
-    EARLY = {"address": "EarlyAccum1111111111111111111111111111111", "symbol": "EARLY", "liquidity": 80000,
-             "v24hUSD": 900000, "v1hUSD": 180000, "mc": 600000, "holder": 900,
+    EARLY = {"address": "EarlyAccum1111111111111111111111111111111", "symbol": "EARLY", "liquidity": 200000,
+             "v24hUSD": 900000, "v1hUSD": 180000, "mc": 800000, "holder": 2000,
              "priceChange1hPercent": 6, "priceChange24hPercent": 18}   # flat-ish price, volume SURGING
     RAN   = {"address": "AlreadyRan2222222222222222222222222222222", "symbol": "RAN", "liquidity": 240000,
              "v24hUSD": 30000000, "v1hUSD": 500000, "mc": 1200000, "holder": 3300,

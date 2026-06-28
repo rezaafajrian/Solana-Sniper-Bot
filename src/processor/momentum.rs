@@ -781,14 +781,14 @@ impl MomentumConfig {
                 .unwrap_or(true),
             leader_track_top_n: env_usize("MOMENTUM_LEADER_TRACK_TOP_N", 5),
             leader_dump_sol: env_f64("MOMENTUM_LEADER_DUMP_SOL", 1.0),
-            leader_dump_fraction: env_f64("MOMENTUM_LEADER_DUMP_FRACTION", 1.0).clamp(0.0, 1.0),
+            leader_dump_fraction: env_f64("MOMENTUM_LEADER_DUMP_FRACTION", 0.6).clamp(0.0, 1.0),
             slow_rug_sol: env_f64("MOMENTUM_SLOW_RUG_SOL", 0.0),
 
             trail_enabled: std::env::var("MOMENTUM_TRAIL_ENABLED")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
             trail_activate_pct: env_f64("MOMENTUM_TRAIL_ACTIVATE_PCT", 50.0),
-            trail_giveback_frac: env_f64("MOMENTUM_TRAIL_GIVEBACK_FRAC", 0.35).clamp(0.05, 0.95),
+            trail_giveback_frac: env_f64("MOMENTUM_TRAIL_GIVEBACK_FRAC", 0.45).clamp(0.05, 0.95),
 
             conviction_sizing: std::env::var("MOMENTUM_CONVICTION_SIZING")
                 .map(|v| v.to_lowercase() == "true")

@@ -23,6 +23,7 @@
 #   ./scripts/install_autonomy.sh                      # schedule nightly research
 #   ./scripts/install_autonomy.sh --with-bot           # ALSO install the always-on bot service
 #   ./scripts/install_autonomy.sh --with-market-watch  # ALSO run the whole-market Birdeye watch (isolated)
+#   ./scripts/install_autonomy.sh --with-smart-money   # ALSO run the Helius smart-money watcher (needs a public URL)
 #   ./scripts/install_autonomy.sh --at 03:30           # nightly run time (default 09:00, local tz)
 #   ./scripts/install_autonomy.sh --uninstall          # remove everything this installed
 # ============================================================================
@@ -35,12 +36,14 @@ BIN="$REPO/target/release/solana-vntr-sniper"
 AT="09:00"
 WITH_BOT=false
 WITH_MARKET=false
+WITH_SMART=false
 UNINSTALL=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-bot)          WITH_BOT=true ;;
     --with-market-watch) WITH_MARKET=true ;;
+    --with-smart-money)  WITH_SMART=true ;;
     --uninstall)         UNINSTALL=true ;;
     --at)         AT="${2:-09:00}"; shift ;;
     --at=*)       AT="${1#--at=}" ;;
@@ -93,8 +96,9 @@ if [ "$MODE" = "system" ] || [ "$MODE" = "user" ]; then
     SC disable --now momentum-research.timer 2>/dev/null || true
     SC disable --now momentum-bot.service 2>/dev/null || true
     SC disable --now momentum-market-watch.service 2>/dev/null || true
+    SC disable --now momentum-smart-money.service 2>/dev/null || true
     rm -f "$UNIT_DIR/momentum-research.service" "$UNIT_DIR/momentum-research.timer"
-    rm -f "$UNIT_DIR/momentum-bot.service" "$UNIT_DIR/momentum-market-watch.service"
+    rm -f "$UNIT_DIR/momentum-bot.service" "$UNIT_DIR/momentum-market-watch.service" "$UNIT_DIR/momentum-smart-money.service"
     SC daemon-reload 2>/dev/null || true
     echo "✅ removed systemd units ($MODE)."
     exit 0
@@ -201,10 +205,39 @@ WantedBy=$([ "$MODE" = system ] && echo multi-user.target || echo default.target
 EOF
   fi
 
+  # --- optional: smart-money watcher (Helius webhooks) — follow proven wallets market-wide ---
+  if $WITH_SMART; then
+    grep -qE '^HELIUS_API_KEY=.+' "$REPO/.env" 2>/dev/null || echo "  ⚠️  HELIUS_API_KEY not set in .env — smart-money watch needs it (helius.dev)."
+    grep -qE '^SMART_MONEY_WEBHOOK_URL=.+' "$REPO/.env" 2>/dev/null || echo "  ⚠️  SMART_MONEY_WEBHOOK_URL not set — Helius POSTs here; needs a PUBLIC url (VPS IP or a tunnel)."
+    cat > "$UNIT_DIR/momentum-smart-money.service" <<EOF
+[Unit]
+Description=Solana smart-money watcher (Helius webhooks, isolated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+$USER_LINE
+WorkingDirectory=$REPO
+ExecStart=/usr/bin/env python3 $REPO/scripts/smart_money_watch.py --serve
+Restart=always
+RestartSec=15
+SyslogIdentifier=smart-money
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$REPO
+
+[Install]
+WantedBy=$([ "$MODE" = system ] && echo multi-user.target || echo default.target)
+EOF
+  fi
+
   SC daemon-reload
   SC enable --now momentum-research.timer
   $WITH_BOT && SC enable --now momentum-bot.service || true
   $WITH_MARKET && SC enable --now momentum-market-watch.service || true
+  $WITH_SMART && SC enable --now momentum-smart-money.service || true
 
   # for user-mode: make it run even when logged out
   if [ "$MODE" = "user" ] && have loginctl; then
