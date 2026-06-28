@@ -805,6 +805,60 @@ def main():
         }.get(k)
         if env:
             config_lines.append(f"{env}={cut:.2f}   # OOS-validated EV lift +{lift:.3f}/token on {k}")
+    # ---- 15. Sizing calibration: derive the adaptive sizer's params from REALITY ----
+    # The adaptive/Kelly sizer maps conviction -> win probability over [p_floor, p_ceiling]
+    # and bets against a payoff b. Those must NOT be static guesses. Here we measure what
+    # low- vs high-conviction tokens ACTUALLY win, and what the realized payoff is, then
+    # recommend the data-honest values — and flag if the live mapping is over-confident.
+    section("15. SIZING CALIBRATION (is the model's probability honest?)")
+    conf_rows = [(f(r, "confidence"), r) for r in rows if not math.isnan(f(r, "confidence"))]
+    P_FLOOR_CUR, P_CEIL_CUR = 0.35, 0.80   # current bot defaults, for the over/under-confidence check
+    if len(conf_rows) < 30:
+        print(f"  not enough labeled tokens with a confidence value yet ({len(conf_rows)}); need ~30+.")
+    else:
+        cs = sorted(c for c, _ in conf_rows)
+        lo_cut, hi_cut = cs[len(cs)//3], cs[2*len(cs)//3]
+        bins = {"low": [], "mid": [], "high": []}
+        for c, r in conf_rows:
+            bins["low" if c <= lo_cut else ("high" if c >= hi_cut else "mid")].append(r)
+        def winrate(rs):
+            w = sum(1 for r in rs if is_winner(r)); l = sum(1 for r in rs if is_loser(r))
+            return (w / (w + l) if (w + l) else float("nan")), (w + l)
+        print(f"  {'conviction bin':16}{'n':>6}{'pred p':>9}{'actual p':>10}{'error':>9}")
+        cal_err = []
+        actual = {}
+        for name in ("low", "mid", "high"):
+            wr_b, n = winrate(bins[name])
+            cmean = mean([f(r, "confidence") for r in bins[name]])
+            # the live mapping clamps conviction to ~[0,1] before interpolating p
+            pred = P_FLOOR_CUR + (P_CEIL_CUR - P_FLOOR_CUR) * min(max(cmean, 0.0), 1.0)
+            actual[name] = wr_b
+            if not math.isnan(wr_b):
+                cal_err.append(abs(pred - wr_b))
+                print(f"  {name:16}{n:>6}{pred:>9.0%}{wr_b:>10.0%}{(pred-wr_b):>+9.0%}")
+        # data-honest endpoints: what the lowest- and highest-conviction tokens really win
+        lo_wr, hi_wr = actual.get("low"), actual.get("high")
+        if lo_wr is not None and hi_wr is not None and not (math.isnan(lo_wr) or math.isnan(hi_wr)):
+            mce = mean(cal_err) if cal_err else float("nan")
+            verdict = ("✓ well-calibrated" if mce < 0.10 else
+                       ("⚠️ over-confident — shrink the band" if (P_CEIL_CUR - hi_wr) > 0.10 else "⚠️ mis-calibrated"))
+            print(f"  mean calibration error {mce:.0%} → {verdict}")
+            if hi_wr > lo_wr:   # conviction orders outcomes the right way → safe to recommend
+                pf, pc = max(lo_wr, 0.05), min(max(hi_wr, lo_wr + 0.05), 0.95)
+                config_lines.append(f"MOMENTUM_KELLY_P_FLOOR={pf:.2f}   # realized win rate of LOW-conviction tokens")
+                config_lines.append(f"MOMENTUM_KELLY_P_CEILING={pc:.2f}   # realized win rate of HIGH-conviction tokens")
+                if not math.isnan(payoff) and payoff > 0:
+                    config_lines.append(f"MOMENTUM_KELLY_PAYOFF_B={payoff:.2f}   # realized avg-win / avg-loss")
+                print(f"  → recommend p_floor {pf:.2f}, p_ceiling {pc:.2f}"
+                      + (f", payoff b {payoff:.2f}" if not math.isnan(payoff) else "")
+                      + " (these REPLACE the static defaults — the sizer's own self-learning step)")
+                synth["hypotheses"].append(
+                    f"Recalibrate sizer from data: P_FLOOR={pf:.2f}, P_CEILING={pc:.2f}"
+                    + (f", PAYOFF_B={payoff:.2f}" if not math.isnan(payoff) else "") + " (emit-config).")
+            else:
+                print("  conviction does NOT order outcomes yet (high ≤ low win rate) — "
+                      "don't trust the sizer's probability; investigate the signals before scaling.")
+
     if args.emit_config:
         section("CONFIG OVERRIDES (only out-of-sample-validated knobs)")
         if config_lines:
