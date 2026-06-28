@@ -20,7 +20,7 @@ Setup:
   python3 scripts/smart_money_watch.py --serve    # run the receiver (alerts on buys)
   python3 scripts/smart_money_watch.py --mock      # offline self-test (no network)
 """
-import os, sys, csv, json, math, argparse, urllib.request, datetime as dt
+import os, sys, csv, json, math, time, argparse, urllib.request, datetime as dt
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 REP = "momentum_wallet_rep.csv"
@@ -112,6 +112,57 @@ def helius_sync(wallets, key, webhook_url):
         return False
 
 
+def helius_recent_buys(wallet, key, since_sig):
+    """POLL a wallet's recent parsed transactions (Helius Enhanced Tx API) and return the
+    (mints_bought, newest_signature). Works WITHOUT a public URL — the laptop pulls, nothing
+    has to POST in — so this is the dry-run-friendly path."""
+    url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={key}&limit=15"
+    try:
+        txs = json.load(urllib.request.urlopen(urllib.request.Request(url), timeout=15))
+    except Exception:
+        return [], since_sig
+    if not isinstance(txs, list):
+        return [], since_sig
+    buys, newest = [], (txs[0].get("signature") if txs else since_sig)
+    for tx in txs:
+        if since_sig and tx.get("signature") == since_sig:
+            break  # reached the last batch we already processed
+        for tt in tx.get("tokenTransfers") or []:
+            if tt.get("toUserAccount") == wallet and tt.get("mint") and tt.get("mint") not in WSOL:
+                buys.append(tt.get("mint"))
+    return buys, newest
+
+
+def poll_loop(wallets, key, interval, top, rate):
+    """Dry-run-friendly smart-money watch: poll the top proven wallets for new buys and alert.
+    No public URL needed. Modest wallet set + pacing to respect the Helius free tier."""
+    sel = wallets[:top]
+    wmeta = {w["wallet"]: w for w in sel}
+    seen = {}
+    try:
+        seen = json.load(open("smart_money_seen.json"))
+    except Exception:
+        pass
+    print(f"  polling {len(sel)} proven wallets every {interval}s (dry-run mode, no public URL). Ctrl-C to stop.")
+    while True:
+        for w in sel:
+            buys, newsig = helius_recent_buys(w["wallet"], key, seen.get(w["wallet"]))
+            seen[w["wallet"]] = newsig
+            for mint in dict.fromkeys(buys):   # dedup, keep order
+                m = wmeta.get(w["wallet"], {})
+                msg = (f"🐋 SMART MONEY BUY\nwallet {w['wallet'][:10]}… (score {m.get('score','?')}, "
+                       f"avg ROI {m.get('avg_roi','?')}, {m.get('trades','?')} trades)\nbought {mint}\n"
+                       f"https://dexscreener.com/solana/{mint}")
+                print(f"  {dt.datetime.now():%H:%M:%S} 🐋 {w['wallet'][:8]} -> {mint[:12]}")
+                telegram(msg)
+            time.sleep(rate)
+        try:
+            json.dump(seen, open("smart_money_seen.json.tmp", "w")); os.replace("smart_money_seen.json.tmp", "smart_money_seen.json")
+        except OSError:
+            pass
+        time.sleep(interval)
+
+
 def detect_buys(txns, tracked):
     """From a Helius enhanced-tx payload, yield (wallet, mint) where a tracked wallet BOUGHT
     a (non-SOL) token. Pragmatic: tracked wallet is the recipient of a token transfer."""
@@ -153,9 +204,13 @@ def make_handler(tracked, wmeta):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sync", action="store_true", help="pick top wallets + register the Helius webhook")
-    ap.add_argument("--serve", action="store_true", help="run the receiver (alerts on buys)")
+    ap.add_argument("--serve", action="store_true", help="run the webhook receiver (needs a PUBLIC url)")
+    ap.add_argument("--poll", action="store_true", help="POLL wallets for buys — works on a laptop, no public url (dry-run friendly)")
     ap.add_argument("--mock", action="store_true", help="offline self-test")
     ap.add_argument("--top", type=int, default=100)
+    ap.add_argument("--poll-top", type=int, default=12, help="how many top wallets to poll (keep modest for the Helius free tier)")
+    ap.add_argument("--poll-interval", type=int, default=120, help="seconds between full polling rounds")
+    ap.add_argument("--poll-rate", type=float, default=1.5, help="seconds between per-wallet calls")
     ap.add_argument("--port", type=int, default=8899)
     args = ap.parse_args()
 
@@ -186,6 +241,16 @@ def main():
             return
         ok = helius_sync(wallets, key, url)
         print(f"  Helius webhook {'registered/updated ✅' if ok else 'FAILED'} for {len(wallets)} wallets → {url}")
+
+    if args.poll:
+        key = env("HELIUS_API_KEY")
+        if not key:
+            print("  set HELIUS_API_KEY (helius.dev, free) to poll. No public URL needed in poll mode.")
+            return
+        try:
+            poll_loop(wallets, key, args.poll_interval, args.poll_top, args.poll_rate)
+        except KeyboardInterrupt:
+            pass
 
     if args.serve:
         tracked = {w["wallet"] for w in wallets}

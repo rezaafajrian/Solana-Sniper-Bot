@@ -279,6 +279,92 @@ def fetch_overview(key, mint):
     return (d.get("data") or {}) if isinstance(d, dict) else {}
 
 
+RUGCHECK = "https://api.rugcheck.xyz/v1"
+
+
+def rugcheck(mint):
+    """FREE rug analysis (no API key) — the real rug-safety layer for post-bonded tokens.
+    Returns a rich dict, or None if unreachable. Fields are extracted defensively because the
+    report shape varies; gating is on explicit DANGER signals, never on a guessed number."""
+    try:
+        req = urllib.request.Request(f"{RUGCHECK}/tokens/{mint}/report",
+                                     headers={"accept": "application/json", "User-Agent": "market-watch"})
+        d = json.load(urllib.request.urlopen(req, timeout=12))
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    risks = d.get("risks") or []
+    names = [r.get("name", "") for r in risks if isinstance(r, dict)]
+    danger = [r.get("name", "") for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() == "danger"]
+    tok = d.get("token") or {}
+    mint_auth = tok.get("mintAuthority") or d.get("mintAuthority")
+    freeze_auth = tok.get("freezeAuthority") or d.get("freezeAuthority")
+    # LP locked %: look in markets[].lp, tolerant of spellings
+    lp_locked = None
+    for m in (d.get("markets") or []):
+        lp = (m or {}).get("lp") or {}
+        for k in ("lpLockedPct", "lp_locked_pct", "lpLocked"):
+            if lp.get(k) is not None:
+                try: lp_locked = float(lp[k]); break
+                except (TypeError, ValueError): pass
+        if lp_locked is not None:
+            break
+    top = d.get("topHolders") or d.get("top_holders") or []
+    top_pct = None
+    if top and isinstance(top[0], dict):
+        for k in ("pct", "percentage", "amountPct"):
+            if top[0].get(k) is not None:
+                try: top_pct = float(top[0][k]); break
+                except (TypeError, ValueError): pass
+    return {
+        "rugged": bool(d.get("rugged")),
+        "rug_score": d.get("score_normalised", d.get("score")),
+        "mint_revoked": (mint_auth in (None, "", "11111111111111111111111111111111")),
+        "freeze_revoked": (freeze_auth in (None, "", "11111111111111111111111111111111")),
+        "lp_locked_pct": lp_locked,
+        "top_holder_pct": top_pct,
+        "risks": names,
+        "danger": danger,
+    }
+
+
+# rug-safety thresholds (SAFE mode)
+SAFE_RUGCHECK   = env("MARKET_SAFE_RUGCHECK", "true").lower() == "true"
+SAFE_MIN_LP_LOCK = envf("MARKET_SAFE_MIN_LP_LOCKED_PCT", 50)   # require >= this % of LP locked/burned
+SAFE_MAX_TOP_HOLDER = envf("MARKET_SAFE_MAX_TOP_HOLDER_PCT", 20)  # top holder must own < this %
+SAFE_FAIL_CLOSED = env("MARKET_SAFE_RUGCHECK_FAILCLOSED", "false").lower() == "true"
+
+
+def rug_policy(r):
+    """PURE rug-safety policy on a rugcheck() dict (no I/O). Returns (ok, reason).
+    ok=False means REJECT — it can rug / honeypot / dump on you."""
+    if r is None:
+        return (not SAFE_FAIL_CLOSED), ("unverified" if SAFE_FAIL_CLOSED else "")
+    if r.get("rugged"):                          return False, "rugcheck: rugged"
+    if r.get("danger"):                          return False, f"danger: {r['danger'][0]}"
+    if not r.get("mint_revoked"):                return False, "mint authority active"
+    if not r.get("freeze_revoked"):              return False, "freeze authority active (honeypot risk)"
+    lp = r.get("lp_locked_pct")
+    if lp is not None and lp < SAFE_MIN_LP_LOCK: return False, f"LP only {lp:.0f}% locked"
+    th = r.get("top_holder_pct")
+    if th is not None and th > SAFE_MAX_TOP_HOLDER: return False, f"top holder owns {th:.0f}%"
+    return True, ""
+
+
+def rug_verdict(mint):
+    """Fetch RugCheck + apply the policy. Returns (ok, reason, info_dict) — info is always
+    returned for rich display."""
+    r = rugcheck(mint)
+    ok, reason = rug_policy(r)
+    if r is None:
+        return ok, reason, {"rug_check": "unverified"}
+    info = {"rug_check": "ok" if ok else "fail", "rug_score": r["rug_score"], "lp_locked_pct": r["lp_locked_pct"],
+            "top_holder_pct": r["top_holder_pct"], "mint_revoked": r["mint_revoked"],
+            "freeze_revoked": r["freeze_revoked"], "rug_risks": r["risks"][:6]}
+    return ok, reason, info
+
+
 # ---------------------------------------------------------------------------
 # per-token history → growth/acceleration (the real "about to run" signal)
 # ---------------------------------------------------------------------------
@@ -398,6 +484,7 @@ def scan(key):
     hist = load_history()
     now = int(time.time())
     watch, study = [], []
+    rug_rejected = 0
     for _, a, t in prelim[:ENRICH_TOP]:
         if g(t, "holder", "holders", "holder_count", default=-1) < 0:
             ov = fetch_overview(key, a)
@@ -406,6 +493,15 @@ def scan(key):
         ok, why = passes_filters(t)
         if not ok:
             continue
+        # RUG-SAFETY (SAFE mode): verify with RugCheck — reject honeypots, live mint/freeze
+        # authority, unlocked LP, whale-concentrated holders. Adds rich safety info to the row.
+        rug_info = {}
+        if SAFE_MODE and SAFE_RUGCHECK and not already_ran(t):
+            safe, reason, rug_info = rug_verdict(a)
+            time.sleep(0.4)  # be polite to the free RugCheck API
+            if not safe:
+                rug_rejected += 1
+                continue
         # record this scan's snapshot so we can measure holder/volume GROWTH over time
         arr = update_history(hist, a, {
             "ts": now,
@@ -413,12 +509,14 @@ def scan(key):
             "vol24": g(t, "v24hUSD", "volume_24h_usd", default=0.0),
             "mcap": g(t, "mc", "market_cap", "marketCap", default=0.0),
         }, now)
+        # liquidity-aware suggested risk levels for the future executor (rich info):
+        liq_now = g(t, "liquidity")
         row = {
             "mint": a,
             "symbol": t.get("symbol") or "",
             "name": t.get("name") or "",
             "score": score(t, arr, trank.get(a)),
-            "liquidity_usd": round(g(t, "liquidity"), 0),
+            "liquidity_usd": round(liq_now, 0),
             "volume24h_usd": round(g(t, "v24hUSD", "volume_24h_usd"), 0),
             "mcap_usd": round(g(t, "mc", "market_cap", "marketCap"), 0),
             "holders": int(g(t, "holder", "holders", "holder_count", default=0)),
@@ -426,9 +524,15 @@ def scan(key):
             "price_change_1h": round(g(t, "priceChange1hPercent", "price_change_1h_percent", default=0.0), 1),
             "price_change_24h": round(g(t, "priceChange24hPercent", "price_change_24h_percent", default=0.0), 1),
             "trending_rank": trank.get(a, None),
+            # suggested risk management (the executor will enforce these)
+            "suggested_sl_pct": -25,
+            "suggested_tp_pct": [50, 150, 400],
+            **rug_info,
         }
         # ALREADY RAN → study pile (learn the pattern). Still EARLY → the watch list.
         (study if already_ran(t) else watch).append(row)
+    if SAFE_MODE and SAFE_RUGCHECK:
+        print(f"  rug-safety: {rug_rejected} token(s) rejected by RugCheck (honeypot/authority/LP/holder risk)")
     # keep history only for tokens we still track, then persist
     save_json(HISTORY, {k: v for k, v in hist.items() if k in {r["mint"] for r in watch + study}})
     watch.sort(key=lambda x: x["score"], reverse=True)
@@ -572,7 +676,19 @@ def mock():
     assert not passes_filters(DEAD)[0], "dying token must be cut"
     # the holder-growth bonus must lift the early runner above a no-history version of itself
     assert score(EARLY, arr_early) > score(EARLY, []), "rising holders must raise the score"
+
+    # --- rug-safety policy (RugCheck) ---
+    clean = {"rugged": False, "danger": [], "mint_revoked": True, "freeze_revoked": True,
+             "lp_locked_pct": 100, "top_holder_pct": 5, "rug_score": 10, "risks": []}
+    assert rug_policy(clean)[0], "a clean, LP-locked, authority-revoked token must pass"
+    assert not rug_policy({**clean, "mint_revoked": False})[0], "live mint authority must be rejected"
+    assert not rug_policy({**clean, "freeze_revoked": False})[0], "live freeze authority (honeypot) must be rejected"
+    assert not rug_policy({**clean, "lp_locked_pct": 10})[0], "unlocked LP must be rejected"
+    assert not rug_policy({**clean, "top_holder_pct": 40})[0], "whale-concentrated holders must be rejected"
+    assert not rug_policy({**clean, "danger": ["Single holder ownership"]})[0], "a danger flag must be rejected"
+    assert not rug_policy({**clean, "rugged": True})[0], "a rugged token must be rejected"
     print("  ✅ WATCH the early accumulator · STUDY the already-ran · cut the rug & the dead.")
+    print("  ✅ rug-safety: passes clean tokens, rejects live-authority / unlocked-LP / whale / rugged.")
 
 
 def main():
