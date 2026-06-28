@@ -25,6 +25,7 @@ cd "$(dirname "$0")/.."
 export MONITORING_MODE=momentum
 export MOMENTUM_DRY_RUN=true
 export MOMENTUM_LIVE_CONFIRM=false
+export MOMENTUM_FEED=ws            # websocket feed (logsSubscribe on RPC_WSS) — no paid Yellowstone gRPC needed
 
 FRESH_MEMORY=false
 [ "$1" = "--fresh-memory" ] && FRESH_MEMORY=true
