@@ -18,10 +18,13 @@
 set -e
 cd "$(dirname "$0")/.."
 
-# FORCE momentum mode — this is the momentum dry-run launcher. Exporting it here overrides
-# any stale `export MONITORING_MODE=copy` left in your shell (dotenv can't override a shell
-# var, which is why the bot kept booting into copy-trading). Belt-and-suspenders with .env.
+# FORCE the critical flags — this is the momentum PAPER-TRADE launcher. Exporting them here
+# overrides any stale `export MONITORING_MODE=copy` / `MOMENTUM_DRY_RUN=false` left in your
+# shell (dotenv can't override a shell var — that's why the bot kept booting into copy-trading
+# and then refusing as "LIVE"). This makes the dry run bulletproof: momentum + paper, always.
 export MONITORING_MODE=momentum
+export MOMENTUM_DRY_RUN=true
+export MOMENTUM_LIVE_CONFIRM=false
 
 FRESH_MEMORY=false
 [ "$1" = "--fresh-memory" ] && FRESH_MEMORY=true
