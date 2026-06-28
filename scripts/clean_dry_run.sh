@@ -18,6 +18,11 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# FORCE momentum mode — this is the momentum dry-run launcher. Exporting it here overrides
+# any stale `export MONITORING_MODE=copy` left in your shell (dotenv can't override a shell
+# var, which is why the bot kept booting into copy-trading). Belt-and-suspenders with .env.
+export MONITORING_MODE=momentum
+
 FRESH_MEMORY=false
 [ "$1" = "--fresh-memory" ] && FRESH_MEMORY=true
 
