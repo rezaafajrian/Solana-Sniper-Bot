@@ -38,6 +38,13 @@ set_kv MOMENTUM_WATCH_MIN_LIQ_SOL  2
 set_kv MOMENTUM_WATCH_MIN_VOL_SOL  1
 set_kv MOMENTUM_WATCH_WHALE_SOL    2
 
+# --- MARKET WATCH: SAFE mode (post-bonded graduates, RugCheck rug-verified) ---
+set_kv MARKET_SAFE_MODE            true
+
+# --- RUNNER CAPTURE: keep 40% riding the trail (already the code default; pinned here) ---
+set_kv MOMENTUM_LEADER_DUMP_FRACTION 0.6
+set_kv MOMENTUM_TRAIL_GIVEBACK_FRAC  0.45
+
 # --- HONEST COST: realistic round-trip so the dry-run PnL means something ---
 set_kv MOMENTUM_SIM_COST_FRACTION  0.03
 set_kv MOMENTUM_BUY_COST_FRACTION  0.015
@@ -60,7 +67,8 @@ echo
 ok(){ grep -qE "^$1=.+" .env; }
 ok RPC_WSS        && echo "  RPC ✓"            || echo "  ❌ RPC_WSS missing — the sniper needs it (setup_env.sh)"
 ok PRIVATE_KEY    && echo "  wallet ✓"          || echo "  ❌ PRIVATE_KEY missing — throwaway wallet (setup_env.sh)"
-ok BIRDEYE_API_KEY&& echo "  🌐 market watch ✓" || echo "  ⚠️  market watch OFF — add BIRDEYE_API_KEY for the whole-market radar"
+ok BIRDEYE_API_KEY&& echo "  🌐 market watch (SAFE/post-bonded, RugCheck) ✓" || echo "  ⚠️  market watch OFF — add BIRDEYE_API_KEY for the whole-market radar"
+ok HELIUS_API_KEY && echo "  🐋 smart-money poll ✓" || echo "  (optional) HELIUS_API_KEY for the smart-money watcher (poll mode, no public url needed)"
 ok TELEGRAM_BOT_TOKEN && echo "  📲 telegram alerts ✓" || echo "  (optional) TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID for phone alerts"
 ok GMGN_API_KEY   && echo "  GMGN security veto ✓" || echo "  (optional) GMGN_API_KEY for the honeypot/security veto"
 echo
