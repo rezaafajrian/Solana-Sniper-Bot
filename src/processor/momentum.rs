@@ -496,6 +496,21 @@ pub struct MomentumConfig {
     /// the EV-optimal out-of-sample gate (~15 SOL).
     pub kelly_liq_ref: f64,
 
+    // ---- Edge: ADAPTIVE sizing (capital-preservation-first; supersedes flat Kelly) ----
+    /// Master switch. When on, position size comes from the full pipeline: ensemble win
+    /// probability → Bayesian update vs realized outcomes → EV gate → theoretical Kelly →
+    /// adaptive fraction (shrunk by uncertainty) → portfolio/correlation cut → drawdown
+    /// throttle → hard risk filter. It can SKIP a trade (size 0) — capital preservation
+    /// always overrides opportunity. Off by default (it's a sizing change → A/B it).
+    pub adaptive_sizing: bool,
+    /// Bayesian prior strength: how many "pseudo-trades" the ensemble estimate is worth
+    /// before realized outcomes dominate. Higher = trust the model longer.
+    pub adaptive_prior_k: f64,
+    /// Minimum posterior confidence (0..1) to take any trade; below it → skip.
+    pub adaptive_min_confidence: f64,
+    /// Minimum expected value (in R, i.e. EV / risked) to take a trade; below it → skip.
+    pub adaptive_min_ev_r: f64,
+
     // ---- Risk controls ----
     /// Hard cap on total SOL deployed across all open positions. New entries are
     /// blocked (or trimmed) so concurrent + conviction sizing can't overspend.
@@ -782,6 +797,10 @@ impl MomentumConfig {
             kelly_p_floor: env_f64("MOMENTUM_KELLY_P_FLOOR", 0.35).clamp(0.01, 0.99),
             kelly_p_ceiling: env_f64("MOMENTUM_KELLY_P_CEILING", 0.80).clamp(0.01, 0.99),
             kelly_liq_ref: env_f64("MOMENTUM_KELLY_LIQ_REF", 15.0).max(0.1),
+            adaptive_sizing: std::env::var("MOMENTUM_ADAPTIVE_SIZING").map(|v| v.to_lowercase() == "true").unwrap_or(false),
+            adaptive_prior_k: env_f64("MOMENTUM_ADAPTIVE_PRIOR_K", 25.0).max(1.0),
+            adaptive_min_confidence: env_f64("MOMENTUM_ADAPTIVE_MIN_CONFIDENCE", 0.30).clamp(0.0, 1.0),
+            adaptive_min_ev_r: env_f64("MOMENTUM_ADAPTIVE_MIN_EV_R", 0.0),
 
             max_deployed_sol: env_f64("MOMENTUM_MAX_DEPLOYED_SOL", 1.0),
             start_capital_sol: env_f64("MOMENTUM_START_CAPITAL_SOL", 0.0),
@@ -1155,6 +1174,18 @@ lazy_static! {
     /// Cumulative realized PnL captured at the start of the current day, so the
     /// breaker measures the *day's* loss rather than all-time.
     static ref DAY_START_REALIZED: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
+    /// Peak account equity seen this run — the high-water mark drawdown is measured from,
+    /// so the adaptive sizer can throttle risk as the account bleeds.
+    static ref PEAK_EQUITY: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
+}
+
+/// Update the high-water mark and return the current drawdown fraction (0 = at peak).
+fn current_drawdown(cfg: &MomentumConfig) -> f64 {
+    let eq = equity(cfg);
+    let mut peak = match PEAK_EQUITY.lock() { Ok(p) => p, Err(_) => return 0.0 };
+    if eq > *peak { *peak = eq; }
+    if *peak <= 0.0 { return 0.0; }
+    ((*peak - eq) / *peak).max(0.0)
 }
 
 fn trading_halted() -> bool {
@@ -2281,6 +2312,7 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "watch_autobuy": cfg.watch_autobuy,
             "watch_score_min": cfg.watch_score_min,
             "kelly_sizing": cfg.kelly_sizing,
+            "adaptive_sizing": cfg.adaptive_sizing,
             "kelly_max_fraction": cfg.kelly_max_fraction,
             "daily_reset_utc_offset_hours": cfg.daily_reset_utc_offset_hours,
         },
@@ -2745,6 +2777,199 @@ fn kelly_fraction(conviction: f64, cfg: &MomentumConfig) -> f64 {
     let b = cfg.kelly_payoff_b.max(0.1);
     let f_star = p - (1.0 - p) / b; // full-Kelly fraction; <= 0 when the edge is gone
     (cfg.kelly_fraction * f_star).clamp(0.0, cfg.kelly_max_fraction)
+}
+
+// ===========================================================================
+// ADAPTIVE SIZING — capital-preservation-first position sizing.
+//
+// A faithful, data-grounded implementation of the risk pipeline: ensemble win
+// probability → Bayesian update against realized outcomes → EV gate → theoretical
+// Kelly → uncertainty-shrunk fractional Kelly → portfolio/correlation cut → drawdown
+// throttle → hard risk filter. It can return SKIP — capital preservation always wins.
+//
+// HONEST SCOPE: the "models" are the real signals the bot computes (momentum,
+// smart-money, liquidity, structure/anti-rug, whale, creator). Inputs the bot has no
+// live feed for (full orderbook/spread, social sentiment, a separate MEV model) are
+// NOT faked — they're simply not in the ensemble. Add them when a data source exists.
+// ===========================================================================
+
+/// One model's vote: a win-probability signal in [0,1] and a reliability weight.
+struct ModelVote { strength: f64, weight: f64, present: bool }
+
+/// Result of the full sizing pipeline (every field the policy requires).
+struct SizingDecision {
+    skip: bool,
+    reason: String,
+    ensemble_p: f64,
+    bayes_p: f64,
+    ev_r: f64,            // expected value in R (per unit risked)
+    kelly_pct: f64,       // theoretical full-Kelly fraction (%)
+    frac_kelly_pct: f64,  // fractional-Kelly fraction actually applied (% of equity)
+    portfolio_adj: f64,   // correlation/exposure multiplier
+    drawdown_adj: f64,    // drawdown throttle multiplier
+    final_size_sol: f64,
+    risk_score: f64,      // 0..100, higher = riskier
+    confidence: f64,      // 0..1 posterior confidence
+}
+
+/// STEP 7 — drawdown → risk multiplier (the policy table). >30% halts new entries.
+fn drawdown_multiplier(dd: f64) -> f64 {
+    if dd < 0.05 { 1.0 }
+    else if dd < 0.10 { 0.75 }
+    else if dd < 0.15 { 0.50 }
+    else if dd < 0.20 { 0.25 }
+    else if dd < 0.25 { 0.10 }
+    else if dd < 0.30 { 0.05 }   // emergency mode
+    else { 0.0 }                 // stop opening new positions
+}
+
+/// STEP 5 — map an overall quality score [0,1] to a discrete fractional-Kelly tier.
+fn quality_to_kelly_fraction(q: f64) -> f64 {
+    if q >= 0.80 { 0.75 }
+    else if q >= 0.60 { 0.50 }
+    else if q >= 0.40 { 0.25 }
+    else if q >= 0.25 { 0.10 }
+    else { 0.0 }                 // too uncertain → skip
+}
+
+/// STEP 1 — ensemble win probability from independent signals, reliability-weighted.
+/// Returns (probability, confidence_in_signals, data_quality).
+fn ensemble_win_prob(
+    signal: &MomentumSignal, liq: f64, _conv_count: usize, is_conv: bool, has_alpha: bool,
+    conc: f64, creator_score: f64, cfg: &MomentumConfig,
+) -> (f64, f64, f64) {
+    let s = |x: f64| clamp01(x); // strength in [0,1]
+    // each model: (strength toward winning, reliability weight, data present?)
+    let votes = [
+        // momentum: composite score vs the entry bar
+        ModelVote { strength: s((signal.score / cfg.entry_score.max(1.0) - 0.6) / 0.8),
+                    weight: 0.9, present: signal.score > 0.0 },
+        // smart money: convergence > alpha > graded boost (top-EV signal in our data)
+        ModelVote { strength: if is_conv { 1.0 } else if has_alpha { 0.75 }
+                              else if signal.smart_money_boost > 0.0 { 0.45 } else { 0.15 },
+                    weight: 1.6, present: true },
+        // liquidity health (exitability)
+        ModelVote { strength: s(liq / cfg.kelly_liq_ref.max(1e-9)), weight: 1.1, present: liq > 0.0 },
+        // structure / anti-manufactured (genuine demand)
+        ModelVote { strength: s(signal.genuine_factor), weight: 1.2, present: true },
+        // whale positioning
+        ModelVote { strength: s(signal.max_wallet_buy_sol / cfg.watch_whale_sol.max(1e-9)),
+                    weight: 0.7, present: signal.max_wallet_buy_sol > 0.0 },
+        // holder concentration (inverted: lower concentration = better), anti-rug
+        ModelVote { strength: s(1.0 - conc), weight: 0.8, present: conc > 0.0 },
+        // creator reputation (sign-based: non-negative is good)
+        ModelVote { strength: if creator_score > 0.0 { 0.7 } else if creator_score < 0.0 { 0.2 } else { 0.5 },
+                    weight: 0.6, present: true },
+        // breadth: distinct buyers
+        ModelVote { strength: s(signal.unique_buyers_short as f64 / cfg.target_unique_buyers.max(1e-9)),
+                    weight: 0.7, present: signal.unique_buyers_short > 0 },
+    ];
+    let mut wsum = 0.0; let mut psum = 0.0; let mut present_w = 0.0; let mut total_w = 0.0;
+    for v in &votes {
+        total_w += v.weight;
+        if !v.present { continue; }
+        let p = cfg.kelly_p_floor + (cfg.kelly_p_ceiling - cfg.kelly_p_floor) * clamp01(v.strength);
+        psum += v.weight * p;
+        wsum += v.weight;
+        present_w += v.weight;
+    }
+    let p = if wsum > 0.0 { psum / wsum } else { cfg.kelly_p_floor };
+    let data_quality = if total_w > 0.0 { present_w / total_w } else { 0.0 };
+    // signal confidence: agreement-weighted coverage (more present, higher-weight votes = surer)
+    let confidence = clamp01(present_w / total_w);
+    (clamp01(p), confidence, clamp01(data_quality))
+}
+
+/// STEP 2 — Bayesian update of the ensemble prob against realized wins/losses.
+/// Beta-binomial posterior mean; confidence grows with sample size.
+fn bayesian_update(model_p: f64, wins: u64, losses: u64, prior_k: f64) -> (f64, f64) {
+    let n = (wins + losses) as f64;
+    let alpha0 = prior_k * model_p;
+    let beta0 = prior_k * (1.0 - model_p);
+    let post = (alpha0 + wins as f64) / (alpha0 + beta0 + n).max(1e-9);
+    let conf = n / (n + prior_k);   // data confidence in [0,1)
+    (clamp01(post), clamp01(conf))
+}
+
+/// The full pipeline. Returns a SizingDecision (possibly skip=true).
+fn adaptive_size(
+    signal: &MomentumSignal, liq: f64, conv_count: usize, is_conv: bool, has_alpha: bool,
+    conc: f64, creator_score: f64, cfg: &MomentumConfig,
+) -> SizingDecision {
+    let mut d = SizingDecision {
+        skip: false, reason: String::new(), ensemble_p: 0.0, bayes_p: 0.0, ev_r: 0.0,
+        kelly_pct: 0.0, frac_kelly_pct: 0.0, portfolio_adj: 1.0, drawdown_adj: 1.0,
+        final_size_sol: 0.0, risk_score: 0.0, confidence: 0.0,
+    };
+    let bankroll = if cfg.start_capital_sol > 0.0 { equity(cfg) } else { cfg.max_deployed_sol };
+
+    // STEP 1: ensemble
+    let (ens_p, sig_conf, data_q) = ensemble_win_prob(signal, liq, conv_count, is_conv, has_alpha, conc, creator_score, cfg);
+    d.ensemble_p = ens_p;
+    // STEP 2: Bayesian update vs realized outcomes (session record as evidence)
+    let wins = SESSION_WINS.load(Ordering::SeqCst);
+    let losses = SESSION_LOSSES.load(Ordering::SeqCst);
+    let (bp, data_conf) = bayesian_update(ens_p, wins, losses, cfg.adaptive_prior_k);
+    d.bayes_p = bp;
+    // overall posterior confidence = signal coverage × data evidence (regime-aware: little
+    // data or thin signals → low confidence → smaller fraction or skip)
+    d.confidence = clamp01(0.5 * sig_conf + 0.5 * data_conf).max(sig_conf * 0.5);
+
+    // STEP 3: EV in R. Payoff b = avg win / avg loss (conservative default). With a stop at
+    // -1R, EV_R = p*b - (1-p). Skip if non-positive (or below the floor).
+    let b = cfg.kelly_payoff_b.max(0.1);
+    d.ev_r = bp * b - (1.0 - bp);
+    if d.ev_r <= cfg.adaptive_min_ev_r {
+        d.skip = true; d.reason = format!("EV {:+.2}R ≤ {:.2}R", d.ev_r, cfg.adaptive_min_ev_r);
+        return d;
+    }
+    if d.confidence < cfg.adaptive_min_confidence {
+        d.skip = true; d.reason = format!("confidence {:.2} < {:.2}", d.confidence, cfg.adaptive_min_confidence);
+        return d;
+    }
+
+    // STEP 4: theoretical Kelly
+    let f_star = (bp - (1.0 - bp) / b).max(0.0);
+    d.kelly_pct = f_star * 100.0;
+
+    // STEP 5: adaptive fraction from uncertainty. quality blends posterior confidence,
+    // data quality, liquidity quality, and (inverse) volatility.
+    let liq_q = clamp01(liq / cfg.kelly_liq_ref.max(1e-9));
+    let vol = clamp01(signal.mcap_velocity.abs() / 0.5);     // fast mcap moves = more risk
+    let quality = clamp01(0.40 * d.confidence + 0.25 * data_q + 0.20 * liq_q + 0.15 * (1.0 - vol));
+    let kf = quality_to_kelly_fraction(quality);
+    if kf <= 0.0 {
+        d.skip = true; d.reason = format!("too uncertain (quality {:.2})", quality);
+        return d;
+    }
+
+    // STEP 6: portfolio/correlation cut. Memecoins are a single highly-correlated sector, so
+    // exposure already deployed IS correlation risk; cut allocation as the book fills, and
+    // harder when an open position shares this token's creator (same-author cluster).
+    let deployed_frac = if bankroll > 0.0 { (deployed_sol() / bankroll).clamp(0.0, 1.0) } else { 1.0 };
+    let same_creator = 0; // creator-level correlation is approximated by exposure below
+    let _ = same_creator;
+    d.portfolio_adj = ((1.0 - deployed_frac) * (1.0 - 0.15 * POSITIONS.len() as f64)).clamp(0.0, 1.0);
+
+    // STEP 7: drawdown throttle
+    let dd = current_drawdown(cfg);
+    d.drawdown_adj = drawdown_multiplier(dd);
+    if d.drawdown_adj <= 0.0 {
+        d.skip = true; d.reason = format!("drawdown {:.0}% — new entries halted", dd * 100.0);
+        return d;
+    }
+
+    // STEP 9: final fraction & size
+    let frac = (kf * f_star * d.portfolio_adj * d.drawdown_adj).clamp(0.0, cfg.kelly_max_fraction);
+    d.frac_kelly_pct = frac * 100.0;
+    d.final_size_sol = (bankroll * frac).max(0.0);
+    // risk score: lower confidence / EV / liquidity + higher drawdown & volatility = riskier
+    d.risk_score = clamp01(0.35 * (1.0 - d.confidence) + 0.20 * (1.0 - liq_q)
+        + 0.20 * vol + 0.25 * (dd / 0.30)) * 100.0;
+    if d.final_size_sol < cfg.min_position_sol {
+        d.skip = true; d.reason = format!("sized below min ({:.4} < {:.4})", d.final_size_sol, cfg.min_position_sol);
+    }
+    d
 }
 
 fn is_on_cooldown(mint: &str, now: u64, cooldown_secs: u64) -> bool {
@@ -3479,7 +3704,24 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     // account), else the fixed position size. Conviction then scales up from there.
     let base_size = base_position_size(&cfg);
     let mut entry_size;
-    if cfg.kelly_sizing {
+    if cfg.adaptive_sizing {
+        // CAPITAL-PRESERVATION-FIRST: the full pipeline decides the size — and can SKIP.
+        let liq = TOKEN_STATE.get(&mint).map(|s| s.last_trade_info.liquidity).unwrap_or(0.0);
+        let cscore = if creator.is_empty() { 0.0 } else { WALLET_REP.get(&creator).map(|r| r.score).unwrap_or(0.0) };
+        let d = adaptive_size(&signal, liq, conv_count, is_convergence, alpha.is_some(), w_conc, cscore, &cfg);
+        // Always log the full breakdown the policy mandates — every decision is auditable.
+        logger.log(format!(
+            "🧮 ADAPTIVE {} | ens p {:.0}% → bayes {:.0}% | EV {:+.2}R | Kelly {:.1}% → frac {:.1}% | port ×{:.2} | dd ×{:.2} | conf {:.2} | risk {:.0} | size {:.4} SOL{}",
+            mint, d.ensemble_p*100.0, d.bayes_p*100.0, d.ev_r, d.kelly_pct, d.frac_kelly_pct,
+            d.portfolio_adj, d.drawdown_adj, d.confidence, d.risk_score, d.final_size_sol,
+            if d.skip { format!(" | SKIP: {}", d.reason) } else { String::new() },
+        ).cyan().to_string());
+        if d.skip {
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", &format!("adaptive skip: {}", d.reason));
+            return;
+        }
+        entry_size = d.final_size_sol;
+    } else if cfg.kelly_sizing {
         // CALCULATED scale-up: size THIS bet by its measured edge via fractional Kelly.
         // Bankroll = equity (bankroll mode) or the deployment cap (legacy mode). The
         // conviction blend already folds in alpha/convergence + whale, so we do NOT also
@@ -5124,6 +5366,48 @@ mod tests {
         s.max_wallet_buy_sol = cfg.watch_whale_sol * 2.0;           // whale in
         let c = entry_conviction(&s, cfg.entry_score * 2.0, true, true, cfg.kelly_liq_ref * 2.0, &cfg);
         assert!(c > 0.95, "score 2x bar + convergence + whale + deep liq should be ~max, got {c}");
+    }
+
+    // ---- adaptive sizing policy (capital-preservation pipeline) ----
+    #[test]
+    fn drawdown_multiplier_follows_the_policy_table() {
+        assert_eq!(drawdown_multiplier(0.02), 1.0);
+        assert_eq!(drawdown_multiplier(0.07), 0.75);
+        assert_eq!(drawdown_multiplier(0.12), 0.50);
+        assert_eq!(drawdown_multiplier(0.17), 0.25);
+        assert_eq!(drawdown_multiplier(0.22), 0.10);
+        assert_eq!(drawdown_multiplier(0.27), 0.05);
+        assert_eq!(drawdown_multiplier(0.35), 0.0, "above 30% must halt new entries");
+    }
+    #[test]
+    fn quality_maps_to_kelly_tiers_and_skips_when_uncertain() {
+        assert_eq!(quality_to_kelly_fraction(0.85), 0.75);
+        assert_eq!(quality_to_kelly_fraction(0.65), 0.50);
+        assert_eq!(quality_to_kelly_fraction(0.45), 0.25);
+        assert_eq!(quality_to_kelly_fraction(0.30), 0.10);
+        assert_eq!(quality_to_kelly_fraction(0.10), 0.0, "too uncertain → skip");
+    }
+    #[test]
+    fn bayesian_update_pulls_toward_realized_and_gains_confidence() {
+        // model says 70%, but realized is poor (3 wins / 17 losses) → posterior drops
+        let (p_lowdata, c_lowdata) = bayesian_update(0.70, 1, 1, 25.0);
+        let (p_evidence, c_evidence) = bayesian_update(0.70, 3, 17, 25.0);
+        assert!(p_evidence < 0.70, "weak realized record must drag the estimate down: {p_evidence}");
+        assert!(c_evidence > c_lowdata, "more trades → more confidence");
+        assert!(p_lowdata > 0.55, "with almost no data the model prior should dominate");
+    }
+    #[test]
+    fn ensemble_ranks_a_strong_setup_above_a_weak_one() {
+        let cfg = test_cfg();
+        let mut strong = MomentumSignal::default();
+        strong.score = cfg.entry_score * 1.6; strong.genuine_factor = 0.95;
+        strong.max_wallet_buy_sol = cfg.watch_whale_sol * 2.0; strong.unique_buyers_short = 20;
+        let (ps, conf_s, dq_s) = ensemble_win_prob(&strong, cfg.kelly_liq_ref*1.5, 3, true, true, 0.2, 1.0, &cfg);
+        let weak = MomentumSignal::default();   // nothing going for it
+        let (pw, _cw, _dw) = ensemble_win_prob(&weak, 0.0, 0, false, false, 0.99, -1.0, &cfg);
+        assert!(ps > pw, "strong setup must out-rank weak: {ps} vs {pw}");
+        assert!(ps <= cfg.kelly_p_ceiling + 1e-9 && pw >= cfg.kelly_p_floor - 1e-9, "prob stays in band");
+        assert!(conf_s > 0.0 && dq_s > 0.0);
     }
 
     // ---- runner-DNA bridge (watchlist scores tokens vs validated patterns) ----

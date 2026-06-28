@@ -426,9 +426,11 @@ function render(snap){
 
   // config
   $("cfgScore").textContent=cfg.entry_score ?? "—";
-  $("cfgSize").innerHTML = cfg.kelly_sizing
-    ? `<span class="up">Kelly</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
-    : (cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—");
+  $("cfgSize").innerHTML = cfg.adaptive_sizing
+    ? `<span class="up">Adaptive</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
+    : (cfg.kelly_sizing
+      ? `<span class="up">Kelly</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
+      : (cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—"));
   $("cfgStop").textContent=(cfg.hard_stop_pct!=null?cfg.hard_stop_pct+"%":"—");
   $("cfgLoss").textContent=(cfg.daily_loss_limit_sol!=null?cfg.daily_loss_limit_sol+" SOL":"—");
   $("cfgAlpha").innerHTML = cfg.alpha_follow? `<span class="up">ON</span> · rep≥${cfg.alpha_rep_min}/${cfg.alpha_min_samples}` : `<span class="dim">off</span>`;
