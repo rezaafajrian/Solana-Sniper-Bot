@@ -111,10 +111,12 @@ RESERVE_FRAC  = envf("MARKET_BUDGET_RESERVE", 0.10)    # keep this fraction of b
 USE_TRENDING  = env("MARKET_USE_TRENDING", "false").lower() == "true"  # +1 call/scan; off by default to save CU
 BUDGET_FILE   = "market_watch_budget.json"             # {month, cu_used} — persists across restarts
 # COVERAGE vs COST. Each sort × page is a Birdeye call that costs compute units (CU). The free
-# plan's monthly CU runs out fast, so the DEFAULT is frugal: 1 sort (volume), 1 page. On a paid
-# plan, widen it back out for maximum recall by setting MARKET_SORTS to the full list:
-#   volume_24h_usd,price_change_24h_percent,volume_24h_change_percent,recent_listing_time,liquidity
-SORTS = [s.strip() for s in env("MARKET_SORTS", "volume_24h_usd").split(",") if s.strip()]
+# plan's monthly CU runs out fast, so the DEFAULT is frugal — but it scans the EARLY-signal
+# dimensions, not top absolute volume (which is just already-pumped tokens that go to STUDY):
+#   • volume_24h_change_percent = volume RISING (accumulation starting — the early tell)
+#   • recent_listing_time       = freshly listed (catch them young)
+# On a paid plan, widen for max recall by adding: volume_24h_usd,price_change_24h_percent,liquidity
+SORTS = [s.strip() for s in env("MARKET_SORTS", "volume_24h_change_percent,recent_listing_time").split(",") if s.strip()]
 
 
 def telegram(text):
