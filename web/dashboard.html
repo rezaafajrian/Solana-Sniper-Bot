@@ -178,6 +178,8 @@
       <div class="ph"><span class="x">CONFIG</span></div>
       <div class="kv"><span class="k">entry score ≥</span><span class="v" id="cfgScore">—</span></div>
       <div class="kv"><span class="k">sizing</span><span class="v" id="cfgSize">—</span></div>
+      <div class="kv"><span class="k">win-prob (p)</span><span class="v" id="cfgProb">—</span></div>
+      <div class="kv"><span class="k">drawdown · throttle</span><span class="v" id="cfgDD">—</span></div>
       <div class="kv"><span class="k">hard stop</span><span class="v down" id="cfgStop">—</span></div>
       <div class="kv"><span class="k">daily loss limit</span><span class="v" id="cfgLoss">—</span></div>
       <div class="kv"><span class="k">alpha-follow</span><span class="v" id="cfgAlpha">—</span></div>
@@ -426,11 +428,23 @@ function render(snap){
 
   // config
   $("cfgScore").textContent=cfg.entry_score ?? "—";
+  const sz=snap.sizing||{};
   $("cfgSize").innerHTML = cfg.adaptive_sizing
     ? `<span class="up">Adaptive</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
     : (cfg.kelly_sizing
       ? `<span class="up">Kelly</span> · ≤${((cfg.kelly_max_fraction||0)*100).toFixed(0)}% eq`
       : (cfg.position_size_sol!=null?cfg.position_size_sol+" SOL":"—"));
+  // sizer win-prob band + payoff, and whether it's calibrated from data or static defaults
+  if(sz.p_floor!=null){
+    const cal = sz.calibrated ? `<span class="up" title="calibrated from learn.py outcomes">✓ data</span>` : `<span class="dim" title="static defaults until learn.py calibrates">defaults</span>`;
+    $("cfgProb").innerHTML=`${(sz.p_floor*100).toFixed(0)}→${(sz.p_ceiling*100).toFixed(0)}% · b ${(+sz.payoff_b||0).toFixed(1)}x · ${cal}`;
+  } else $("cfgProb").textContent="—";
+  // drawdown from the bot's equity high-water mark + the risk throttle it triggers
+  if(sz.drawdown_pct!=null){
+    const dd=+sz.drawdown_pct||0, th=+sz.drawdown_throttle||1;
+    const thcol = th>=1?"up":(th>=0.5?"am":"down");
+    $("cfgDD").innerHTML=`<span class="${dd>0?'down':'dim'}">${dd.toFixed(1)}%</span> · <span class="${thcol}">${(th*100).toFixed(0)}% size</span>`;
+  } else $("cfgDD").textContent="—";
   $("cfgStop").textContent=(cfg.hard_stop_pct!=null?cfg.hard_stop_pct+"%":"—");
   $("cfgLoss").textContent=(cfg.daily_loss_limit_sol!=null?cfg.daily_loss_limit_sol+" SOL":"—");
   $("cfgAlpha").innerHTML = cfg.alpha_follow? `<span class="up">ON</span> · rep≥${cfg.alpha_rep_min}/${cfg.alpha_min_samples}` : `<span class="dim">off</span>`;
@@ -562,8 +576,12 @@ function renderMarket(m){
     const pc1=+w.price_change_1h||0, pc24=+w.price_change_24h||0;
     const sym = w.symbol? `<b>${w.symbol}</b> ` : "";
     const hg = +w.holder_growth_hr||0;
+    // rug-safety badge (SAFE mode + RugCheck): 🛡 verified-safe, ⚠ unverified
+    let safe = "";
+    if(w.rug_check==="ok"){ const lp = w.lp_locked_pct!=null?` LP ${(+w.lp_locked_pct).toFixed(0)}%`:""; safe = `<span class="up" title="RugCheck: mint/freeze revoked, LP locked${lp}">🛡 </span>`; }
+    else if(w.rug_check==="unverified"){ safe = `<span class="am" title="RugCheck couldn't verify">⚠ </span>`; }
     const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${sym}${tokenCell(w.mint)}</td>`+
+    tr.innerHTML=`<td>${safe}${sym}${tokenCell(w.mint)}</td>`+
       `<td class="${scol}">${sc.toFixed(0)}</td>`+
       `<td class="dim">${(+w.holders||0).toLocaleString()}</td>`+
       `<td class="${hg>0?'up':'dim'}" title="holder growth per hour — the accumulation tell">${hg>0?"+":""}${hg.toFixed(0)}%</td>`+

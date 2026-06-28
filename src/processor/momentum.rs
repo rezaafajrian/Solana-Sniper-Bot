@@ -2330,6 +2330,18 @@ fn write_status_snapshot(cfg: &MomentumConfig) {
             "adaptive_sizing": cfg.adaptive_sizing,
             "kelly_max_fraction": cfg.kelly_max_fraction,
             "daily_reset_utc_offset_hours": cfg.daily_reset_utc_offset_hours,
+            "max_consecutive_losses": cfg.max_consecutive_losses,
+        },
+        // Live sizing/risk state — what the (adaptive) sizer is actually using right now.
+        "sizing": {
+            "mode": if cfg.adaptive_sizing { "adaptive" } else if cfg.kelly_sizing { "kelly" } else { "flat" },
+            "calibrated": sizing_cal().is_some(),
+            "p_floor": eff_p_floor(cfg),
+            "p_ceiling": eff_p_ceiling(cfg),
+            "payoff_b": eff_payoff_b(cfg),
+            "max_fraction": cfg.kelly_max_fraction,
+            "drawdown_pct": current_drawdown(cfg) * 100.0,
+            "drawdown_throttle": drawdown_multiplier(current_drawdown(cfg)),
         },
         "positions": positions,
         "feed": feed,

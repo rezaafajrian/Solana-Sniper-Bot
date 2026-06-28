@@ -45,9 +45,21 @@
     "watch_enabled": true,
     "watch_autobuy": false,
     "watch_score_min": 70,
-    "kelly_sizing": true,
+    "kelly_sizing": false,
+    "adaptive_sizing": true,
     "kelly_max_fraction": 0.25,
-    "daily_reset_utc_offset_hours": 7
+    "daily_reset_utc_offset_hours": 7,
+    "max_consecutive_losses": 30
+  },
+  "sizing": {
+    "mode": "adaptive",
+    "calibrated": true,
+    "p_floor": 0.31,
+    "p_ceiling": 0.74,
+    "payoff_b": 2.6,
+    "max_fraction": 0.25,
+    "drawdown_pct": 4.2,
+    "drawdown_throttle": 1.0
   },
   "positions": [
     {
