@@ -431,6 +431,11 @@ pub struct MomentumConfig {
     pub creator_min_trades: u32,
     /// Veto a creator whose decaying realized PnL/token is at or below this (SOL).
     pub creator_avoid_pnl: f64,
+    /// Edge gate: reject entries where the CREATOR has bought more than this much of their
+    /// own token (SOL) — bundled/self-pumped tokens. 0 = off. Our OOS data: creator_buy
+    /// <= 0.03 won 88% (z=9.2) vs 44% baseline, but it's a HIGH-PRECISION/LOW-RECALL filter
+    /// (~1.7% of tokens), so it's off by default — A/B it deliberately.
+    pub max_creator_buy_sol: f64,
     /// Penalize entries whose feature pattern (signal type, conviction, mcap, score
     /// band) has been losing — the bot learns which kinds of tokens burn it.
     pub pattern_avoid: bool,
@@ -769,8 +774,9 @@ impl MomentumConfig {
             pump_alert_min_signals: env_usize("MOMENTUM_PUMP_ALERT_MIN_SIGNALS", 2),
             pump_alert_cooldown_secs: env_u64("MOMENTUM_PUMP_ALERT_COOLDOWN_SECS", 1800),
             creator_avoid: std::env::var("MOMENTUM_CREATOR_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
-            creator_min_trades: env_u64("MOMENTUM_CREATOR_MIN_TRADES", 2) as u32,
+            creator_min_trades: env_u64("MOMENTUM_CREATOR_MIN_TRADES", 5) as u32,
             creator_avoid_pnl: env_f64("MOMENTUM_CREATOR_AVOID_PNL", -0.02),
+            max_creator_buy_sol: env_f64("MOMENTUM_MAX_CREATOR_BUY_SOL", 0.0),
             pattern_avoid: std::env::var("MOMENTUM_PATTERN_AVOID").map(|v| v.to_lowercase() != "false").unwrap_or(true),
             pattern_min_samples: env_u64("MOMENTUM_PATTERN_MIN_SAMPLES", 20) as u32,
             pattern_penalty_max: env_f64("MOMENTUM_PATTERN_PENALTY_MAX", 25.0),
@@ -938,6 +944,12 @@ impl MomentumConfig {
             if self.creator_avoid { "on" } else { "off" }, self.creator_avoid_pnl, self.creator_min_trades,
             if self.pattern_avoid { "on" } else { "off" }, self.pattern_penalty_max, self.pattern_min_samples,
         ));
+        if self.max_creator_buy_sol > 0.0 {
+            logger.log(format!(
+                "🚫 Creator self-buy gate ON: reject if creator bought > {:.3} SOL of their own token (OOS 88%-win edge)",
+                self.max_creator_buy_sol,
+            ).cyan().to_string());
+        }
         if self.watch_enabled {
             logger.log(format!(
                 "👁  Ones to Watch: composite >= {:.0} (structure {:.0}% + convergence {:.0}%) -> {}",
@@ -3680,6 +3692,16 @@ async fn try_enter(parsed: TradeInfoFromToken, signal: MomentumSignal, cfg: Arc<
     if effective_score < cfg.entry_score && !watch_buy {
         record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT", "score below entry bar");
         return;
+    }
+    // (A) Creator self-buy gate (OOS edge: creator_buy <= 0.03 SOL → 88% win, z=9.2). Reject
+    // tokens the creator is pumping themselves (bundled/fake demand). Off unless configured.
+    if cfg.max_creator_buy_sol > 0.0 && !watch_buy {
+        let cbuy = if cfg.watch_enabled { w_cbuy } else { concentration_metrics(&parsed, &mint, &cfg).2 };
+        if cbuy > cfg.max_creator_buy_sol {
+            record_decision(&parsed, &signal, &cfg, effective_score, signal_type, "REJECT",
+                &format!("creator self-buying ({:.3} > {:.3} SOL)", cbuy, cfg.max_creator_buy_sol));
+            return;
+        }
     }
     // Base-momentum floor: a boost (KOL/alpha/GMGN) can't drag in a token that has
     // no real momentum of its own. Require genuine strength AND the signal.
