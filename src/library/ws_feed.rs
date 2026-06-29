@@ -60,7 +60,10 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
         }
         match connect_async(&ws_url).await {
             Ok((mut stream, _)) => {
-                backoff = 1;
+                // NOTE: backoff is reset to 1 only once the subscribe is *confirmed*
+                // (below), not merely when the socket opens. On a rate-limited plan the
+                // socket connects fine but the subscribe can be throttled (-32005); we
+                // want those rejections to back off gradually, not hammer in a 1s loop.
                 if stream.send(Message::Text(subscribe_msg())).await.is_err() {
                     logger.log("ws: failed to send blockSubscribe".red().to_string());
                     continue;
@@ -83,7 +86,28 @@ pub async fn run(ws_url: String, tx: mpsc::Sender<FeedItem>, logger: Logger) {
                             if !logged_first {
                                 logged_first = true;
                                 let head: String = text.chars().take(400).collect();
-                                logger.log(format!("ws first message: {}", head).cyan().to_string());
+                                // The first message is the subscribe ack: {"result":<subId>}
+                                // on success, {"error":{...}} on rejection. A rejection (e.g.
+                                // -32005 "exceeded RPS limit", common on free tiers) means the
+                                // server will NEVER send notifications on this socket — so we
+                                // must reconnect + resubscribe, not sit on a dead stream.
+                                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                                    if let Some(err) = v.get("error") {
+                                        let retry = err.get("data")
+                                            .and_then(|d| d.get("try_again_in"))
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("");
+                                        logger.log(format!(
+                                            "ws: subscribe rejected: {} {} — retrying in {}s",
+                                            err, retry, backoff
+                                        ).red().to_string());
+                                        break; // → reconnect + resubscribe after backoff
+                                    }
+                                    // Confirmed subscription: now it's safe to fast-reconnect.
+                                    backoff = 1;
+                                    logger.log(format!("ws: subscription confirmed: {}", head).green().to_string());
+                                }
+                                continue; // the ack itself carries no pump.fun logs
                             }
                             if let Ok(v) = serde_json::from_str::<Value>(&text) {
                                 let _ = &logged_shape; // (block-shape debug no longer used with logs)

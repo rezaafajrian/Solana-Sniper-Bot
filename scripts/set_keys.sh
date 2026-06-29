@@ -17,9 +17,23 @@ ENV_FILE="$ROOT/.env"
 set_kv() {
   local key="$1" val="$2" tmp
   tmp="$(mktemp)"
-  # Drop any existing (even commented/duplicate) definitions of this key.
-  grep -vE "^[[:space:]]*#?[[:space:]]*${key}=" "$ENV_FILE" > "$tmp" || true
-  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  # Replace the key IN PLACE if it already exists (preserves its line position so
+  # it never gets buried below a malformed line, which halts dotenv parsing).
+  # Only append at the end when the key is genuinely new.
+  if grep -qE "^[[:space:]]*#?[[:space:]]*${key}=" "$ENV_FILE"; then
+    awk -v k="$key" -v v="$val" '
+      !done && $0 ~ "^[[:space:]]*#?[[:space:]]*" k "=" { print k "=" v; done=1; next }
+      { print }
+    ' "$ENV_FILE" > "$tmp"
+    # Drop any further duplicate definitions after the first.
+    awk -v k="$key" '
+      $0 ~ "^[[:space:]]*#?[[:space:]]*" k "=" { if (seen++) next }
+      { print }
+    ' "$tmp" > "${tmp}.2" && mv "${tmp}.2" "$tmp"
+  else
+    cp "$ENV_FILE" "$tmp"
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  fi
   mv "$tmp" "$ENV_FILE"
   echo "  ✓ ${key} set"
 }
