@@ -42,4 +42,6 @@ echo "   (Ctrl-C to stop)"
 COPYPID=$!
 trap "kill $COPYPID 2>/dev/null" EXIT
 cd web
-python3 -m http.server "$PORT"
+# Bind IPv4 (0.0.0.0) explicitly. Default can bind IPv6-only on macOS, which phones on the
+# LAN (IPv4 192.168.x.x) can't reach — that shows up as "connection failed" on the phone.
+python3 -m http.server "$PORT" --bind 0.0.0.0
