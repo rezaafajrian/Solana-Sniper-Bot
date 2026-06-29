@@ -15,7 +15,10 @@ lazy_static! {
 }
 
 const BLOCKHASH_STALENESS_THRESHOLD: Duration = Duration::from_secs(10);
-const UPDATE_INTERVAL: Duration = Duration::from_millis(300);
+// Default 2s: blockhashes stay valid ~60s and the staleness threshold is 10s, so refreshing
+// every 2s is plenty — and ~7x lighter on the RPC than the old 300ms, which hammered free
+// endpoints into 429s. Tune with RPC_BLOCKHASH_REFRESH_MS (raise it if you still see 429s).
+const UPDATE_INTERVAL: Duration = Duration::from_millis(2000);
 
 pub struct BlockhashProcessor {
     rpc_client: Arc<RpcClient>,
@@ -38,6 +41,12 @@ impl BlockhashProcessor {
         // Clone necessary components for the background task
         let rpc_client = self.rpc_client.clone();
         let logger = self.logger.clone();
+        // Env-tunable refresh interval (RPC_BLOCKHASH_REFRESH_MS); default 2s. Raise it if your
+        // RPC still returns 429 (e.g. 5000 on a busy free tier).
+        let interval = std::env::var("RPC_BLOCKHASH_REFRESH_MS").ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|ms| Duration::from_millis(ms.max(200)))
+            .unwrap_or(UPDATE_INTERVAL);
 
         tokio::spawn(async move {
             loop {
@@ -58,7 +67,7 @@ impl BlockhashProcessor {
                     }
                 }
 
-                tokio::time::sleep(UPDATE_INTERVAL).await;
+                tokio::time::sleep(interval).await;
             }
         });
 
