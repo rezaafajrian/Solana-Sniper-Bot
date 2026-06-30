@@ -1,0 +1,177 @@
+{
+  "month_label": "JUNE 2026",
+  "year": 2026,
+  "month": 6,
+  "first_weekday": 0,
+  "days_in_month": 30,
+  "total_sol": 73.829313,
+  "closes": 3687,
+  "green_days": 25,
+  "red_days": 5,
+  "win_rate_pct": 83.33,
+  "max_abs": 20.60997,
+  "best_day": {
+    "day": 28,
+    "pnl_sol": 20.60997
+  },
+  "worst_day": {
+    "day": 17,
+    "pnl_sol": -7.260975
+  },
+  "days": [
+    {
+      "day": 1,
+      "pnl_sol": 0.62802,
+      "closes": 90
+    },
+    {
+      "day": 2,
+      "pnl_sol": -0.397035,
+      "closes": 135
+    },
+    {
+      "day": 3,
+      "pnl_sol": 0.465045,
+      "closes": 129
+    },
+    {
+      "day": 4,
+      "pnl_sol": 0.252016,
+      "closes": 76
+    },
+    {
+      "day": 5,
+      "pnl_sol": 0.12198,
+      "closes": 107
+    },
+    {
+      "day": 6,
+      "pnl_sol": 0.289041,
+      "closes": 177
+    },
+    {
+      "day": 7,
+      "pnl_sol": 0.664039,
+      "closes": 137
+    },
+    {
+      "day": 8,
+      "pnl_sol": 2.03304,
+      "closes": 120
+    },
+    {
+      "day": 9,
+      "pnl_sol": 1.54504,
+      "closes": 140
+    },
+    {
+      "day": 10,
+      "pnl_sol": -0.570036,
+      "closes": 134
+    },
+    {
+      "day": 11,
+      "pnl_sol": 1.53102,
+      "closes": 68
+    },
+    {
+      "day": 12,
+      "pnl_sol": 1.277936,
+      "closes": 137
+    },
+    {
+      "day": 13,
+      "pnl_sol": 1.486021,
+      "closes": 61
+    },
+    {
+      "day": 14,
+      "pnl_sol": 4.29,
+      "closes": 176
+    },
+    {
+      "day": 15,
+      "pnl_sol": 12.310071,
+      "closes": 167
+    },
+    {
+      "day": 16,
+      "pnl_sol": 1.10304,
+      "closes": 120
+    },
+    {
+      "day": 17,
+      "pnl_sol": -7.260975,
+      "closes": 93
+    },
+    {
+      "day": 18,
+      "pnl_sol": 6.46698,
+      "closes": 130
+    },
+    {
+      "day": 19,
+      "pnl_sol": 3.666978,
+      "closes": 89
+    },
+    {
+      "day": 20,
+      "pnl_sol": -3.977988,
+      "closes": 84
+    },
+    {
+      "day": 21,
+      "pnl_sol": 4.247026,
+      "closes": 151
+    },
+    {
+      "day": 22,
+      "pnl_sol": 1.98504,
+      "closes": 120
+    },
+    {
+      "day": 23,
+      "pnl_sol": 4.610976,
+      "closes": 129
+    },
+    {
+      "day": 24,
+      "pnl_sol": 0.404975,
+      "closes": 167
+    },
+    {
+      "day": 25,
+      "pnl_sol": 0.01404,
+      "closes": 130
+    },
+    {
+      "day": 26,
+      "pnl_sol": 3.483,
+      "closes": 120
+    },
+    {
+      "day": 27,
+      "pnl_sol": 6.29398,
+      "closes": 110
+    },
+    {
+      "day": 28,
+      "pnl_sol": 20.60997,
+      "closes": 141
+    },
+    {
+      "day": 29,
+      "pnl_sol": -1.78194,
+      "closes": 170
+    },
+    {
+      "day": 30,
+      "pnl_sol": 8.038013,
+      "closes": 79
+    }
+  ],
+  "tz": "GMT+7",
+  "tz_offset_hours": 7.0,
+  "updated_utc": "2026-06-30 10:32 UTC",
+  "latest_trade_local": "2026-06-30 10:39"
+}

@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Daily Wins · Solana bot</title>
+<style>
+  :root{
+    --green:#1dff9b; --red:#ff4d6a; --bg:#04100c; --panel:#071712;
+    --dim:#5a8475; --ink:#dff5ec; --line:#0e241c;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:100vh}
+  .wrap{max-width:980px;margin:0 auto;padding:16px}
+  .card{background:linear-gradient(160deg,#0a1f17,#061410 60%);border:1px solid var(--line);
+    border-radius:18px;padding:20px 20px 16px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+  /* header */
+  .head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  .title{font-size:30px;font-weight:800;letter-spacing:.02em;line-height:1}
+  .title .boat{filter:saturate(1.2)}
+  .sub{color:var(--dim);font-size:13px;margin-top:6px}
+  .totwrap{text-align:right;margin-left:auto}
+  .total{font-size:40px;font-weight:800;line-height:1}
+  .breakdown{font-size:13px;margin-top:6px}
+  .breakdown .g{color:var(--green)} .breakdown .r{color:var(--red)} .breakdown .d{color:var(--dim)}
+  .up{color:var(--green)} .down{color:var(--red)} .flat{color:var(--dim)}
+  /* weekday row */
+  .dow{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin:18px 0 8px}
+  .dow span{color:var(--dim);font-size:11px;letter-spacing:.14em;text-align:left;padding-left:4px}
+  /* calendar */
+  .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+  .cell{position:relative;border-radius:10px;border:1px solid rgba(255,255,255,.04);
+    min-height:74px;padding:8px 9px;background:#08160f;overflow:hidden}
+  .cell.empty{background:transparent;border-color:transparent}
+  .cell .dnum{font-size:12px;color:rgba(255,255,255,.55);font-weight:600}
+  .cell .pnl{position:absolute;right:9px;bottom:7px;font-size:14px;font-weight:800;
+    text-shadow:0 1px 2px rgba(0,0,0,.5)}
+  .cell.win .dnum,.cell.loss .dnum{color:rgba(255,255,255,.85)}
+  .cell.today{outline:2px solid var(--green);outline-offset:-2px}
+  /* footer */
+  .legend{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:11px;margin-top:16px;flex-wrap:wrap}
+  .legend .sw{width:16px;height:12px;border-radius:3px;display:inline-block}
+  .chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  .chip{background:#04130e;border:1px solid var(--line);border-radius:9px;padding:8px 12px;font-size:12px}
+  .chip b{font-weight:800}
+  .foot{display:flex;justify-content:space-between;gap:10px;color:var(--dim);font-size:11px;margin-top:16px;flex-wrap:wrap}
+  a{color:var(--green);text-decoration:none}
+  .muted{opacity:.0}
+  @media(max-width:560px){
+    .title{font-size:24px} .total{font-size:32px}
+    .cell{min-height:58px;padding:6px 7px} .cell .pnl{font-size:12px;right:7px;bottom:6px}
+    .dow span{font-size:9px;letter-spacing:.08em}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <div>
+        <div class="title"><span class="boat">🚤</span> <span id="month">—</span></div>
+        <div class="sub">Realized PnL · <span id="closes">0</span> closes</div>
+      </div>
+      <div class="totwrap">
+        <div class="total flat" id="total">—</div>
+        <div class="breakdown" id="breakdown"><span class="d">—</span></div>
+      </div>
+    </div>
+
+    <div class="dow"><span>SUN</span><span>MON</span><span>TUE</span><span>WED</span><span>THU</span><span>FRI</span><span>SAT</span></div>
+    <div class="cal" id="cal"></div>
+
+    <div class="chips" id="chips"></div>
+    <div class="legend">
+      <span>less</span>
+      <span class="sw" style="background:#08160f"></span>
+      <span class="sw" id="lg1"></span><span class="sw" id="lg2"></span>
+      <span class="sw" id="lg3"></span><span class="sw" id="lg4"></span>
+      <span>more · green = up · <i class="down" style="font-style:normal">maroon = down</i></span>
+    </div>
+    <div class="foot">
+      <span>live · auto-refresh · <a href="dashboard.html">← full dashboard</a> · <a href="daily.html">today →</a></span>
+      <span><span id="stamp">—</span> · days in <span id="tz">GMT+7</span></span>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+
+// Compact SOL formatter: +2.06K / +0.452 / −0.0731
+function fmt(v){
+  if(v==null||isNaN(v)) return "—";
+  const s=v>0?"+":(v<0?"−":""), a=Math.abs(v);
+  let n;
+  if(a>=1000) n=(a/1000).toFixed(2)+"K";
+  else if(a>=100) n=a.toFixed(1);
+  else if(a>=1) n=a.toFixed(2);
+  else if(a>=0.01) n=a.toFixed(3);
+  else n=a.toFixed(4);
+  return s+n;
+}
+const cls=v=>v>0?"up":(v<0?"down":"flat");
+
+// Heatmap colour: intensity 0..1 (sqrt-scaled for spread). Green up, maroon down.
+function colour(pnl,maxAbs){
+  if(!pnl) return "#08160f";
+  const t=Math.min(1, Math.sqrt(Math.abs(pnl)/(maxAbs||1)));
+  if(pnl>0){ const L=13+32*t; return `hsl(157 68% ${L}%)`; }
+  const L=15+27*t; return `hsl(352 58% ${L}%)`;
+}
+
+function render(d){
+  $("month").textContent=d.month_label||"—";
+  $("closes").textContent=(d.closes||0).toLocaleString();
+  $("total").textContent=fmt(d.total_sol)+" SOL";
+  $("total").className="total "+cls(d.total_sol);
+  const g=d.green_days||0, r=d.red_days||0;
+  $("breakdown").innerHTML=
+    `<span class="g">${g} green</span> <span class="d">·</span> `+
+    `<span class="r">${r} red</span> <span class="d">·</span> `+
+    `<span class="${cls(d.total_sol)}">${(d.win_rate_pct||0).toFixed(2)}% win</span>`;
+  $("tz").textContent=d.tz||"GMT+7";
+  $("stamp").textContent=d.updated_utc||"—";
+
+  // legend swatches
+  const mx=d.max_abs||1;
+  $("lg1").style.background=colour(mx*0.15,mx);
+  $("lg2").style.background=colour(mx*0.45,mx);
+  $("lg3").style.background=colour(mx*0.75,mx);
+  $("lg4").style.background=colour(mx,mx);
+
+  // map days -> {pnl,closes}
+  const by={};
+  (d.days||[]).forEach(x=>by[x.day]={pnl:x.pnl_sol,closes:x.closes});
+
+  // today's day-of-month, only if we're viewing the current month (in the bot tz)
+  const off=(d.tz_offset_hours!=null)?d.tz_offset_hours:7;
+  const loc=new Date(Date.now()+(off*3600 - new Date().getTimezoneOffset()*-60)*1000);
+  // (display-only highlight; aggregation already buckets in bot tz)
+  const nowLoc=new Date(Date.now()+ (off*60+ new Date().getTimezoneOffset())*60000);
+  const isThisMonth=(nowLoc.getFullYear()===d.year && (nowLoc.getMonth()+1)===d.month);
+  const todayDom=isThisMonth?nowLoc.getDate():-1;
+
+  const cal=$("cal"); cal.innerHTML="";
+  // leading blanks: monthrange weekday is 0=Mon..6=Sun; SUN-first grid index=(w+1)%7
+  const lead=((d.first_weekday||0)+1)%7;
+  for(let i=0;i<lead;i++){const e=document.createElement("div");e.className="cell empty";cal.appendChild(e);}
+  for(let day=1; day<=(d.days_in_month||30); day++){
+    const c=document.createElement("div"); c.className="cell";
+    const rec=by[day];
+    if(rec){
+      const pnl=rec.pnl;
+      c.classList.add(pnl>0?"win":(pnl<0?"loss":"flat"));
+      c.style.background=colour(pnl,mx);
+      c.innerHTML=`<div class="dnum">${day}</div>`+
+        `<div class="pnl ${pnl>0?'up':(pnl<0?'down':'flat')}" `+
+        `style="color:${pnl?'#fff':''}">${fmt(pnl)}</div>`+
+        `<div class="pnl muted">${rec.closes}</div>`;
+      c.title=`${d.month_label} ${day} — ${fmt(pnl)} SOL · ${rec.closes} closes`;
+    }else{
+      c.innerHTML=`<div class="dnum">${day}</div>`;
+    }
+    if(day===todayDom) c.classList.add("today");
+    cal.appendChild(c);
+  }
+
+  // best / worst chips
+  const chips=$("chips"); chips.innerHTML="";
+  if(d.best_day) chips.innerHTML+=
+    `<div class="chip">🟢 best · <b>${d.month_label.split(' ')[0].slice(0,3)} ${d.best_day.day}</b> `+
+    `<span class="up">${fmt(d.best_day.pnl_sol)} SOL</span></div>`;
+  if(d.worst_day && d.worst_day.pnl_sol<0) chips.innerHTML+=
+    `<div class="chip">🔴 worst · <b>${d.month_label.split(' ')[0].slice(0,3)} ${d.worst_day.day}</b> `+
+    `<span class="down">${fmt(d.worst_day.pnl_sol)} SOL</span></div>`;
+}
+
+async function tick(){
+  try{
+    const r=await fetch("monthly_pnl.json?ts="+Date.now(),{cache:"no-store"});
+    if(r.ok) render(await r.json());
+  }catch(e){/* keep last render */}
+}
+tick(); setInterval(tick, 15000);
+</script>
+</body>
+</html>

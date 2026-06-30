@@ -31,16 +31,27 @@ else
   echo "ℹ️  No live momentum_status.json yet — showing the sample. Start the bot to go live."
 fi
 
+# Daily-wins calendar (month.html): aggregate momentum_trades.csv → monthly_pnl.json.
+AGGPID=""
+if command -v python3 >/dev/null 2>&1 && [ -f scripts/monthly_pnl.py ]; then
+  python3 scripts/monthly_pnl.py --watch 15 >/dev/null 2>&1 &
+  AGGPID=$!
+fi
+# Seed the calendar with the bundled sample until the aggregator writes a live file.
+[ -f monthly_pnl.json ] || [ -f web/monthly_pnl.json ] || cp web/monthly_pnl.sample.json web/monthly_pnl.json 2>/dev/null || true
+
 echo "🌐 Dashboard:  http://localhost:${PORT}/dashboard.html"
+echo "🗓️  Daily wins: http://localhost:${PORT}/month.html"
 echo "   (Ctrl-C to stop)"
-# Keep web/momentum_status.json (+ the isolated market_watch.json) fresh as they update.
+# Keep web/*.json (status, market watch, monthly calendar) fresh as they update.
 ( while true; do
     if [ -f momentum_status.json ]; then cp -f momentum_status.json web/momentum_status.json 2>/dev/null || true; fi
     if [ -f market_watch.json ]; then cp -f market_watch.json web/market_watch.json 2>/dev/null || true; fi
+    if [ -f monthly_pnl.json ]; then cp -f monthly_pnl.json web/monthly_pnl.json 2>/dev/null || true; fi
     sleep 2
   done ) &
 COPYPID=$!
-trap "kill $COPYPID 2>/dev/null" EXIT
+trap "kill $COPYPID $AGGPID 2>/dev/null" EXIT
 cd web
 # Bind IPv4 (0.0.0.0) explicitly. Default can bind IPv6-only on macOS, which phones on the
 # LAN (IPv4 192.168.x.x) can't reach — that shows up as "connection failed" on the phone.

@@ -36,6 +36,9 @@ momentum_wallet_rep.csv.tmp
 kol_wallets.txt
 momentum_status.json
 web/momentum_status.json
+monthly_pnl.json
+monthly_pnl.json.tmp
+web/monthly_pnl.json
 momentum_positions.json
 momentum_positions.json.tmp
 momentum_decisions.csv
